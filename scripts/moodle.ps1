@@ -262,6 +262,12 @@ function Assert-AllowedGitConfigEntries {
         }
         $expectedValues = @($Allowed[$entry.Key])
         $actualValues = @($entry.Values)
+        if ($entry.Key -in @('core.filemode', 'core.symlinks', 'core.ignorecase', 'core.precomposeunicode')) {
+            if ($actualValues.Count -ne 1 -or $actualValues[0] -notin $expectedValues) {
+                Fail "Refusing unexpected value for Git $Scope config key $($entry.Key) in $Repository."
+            }
+            continue
+        }
         if ($actualValues.Count -ne $expectedValues.Count) {
             Fail "Refusing unexpected value count for Git $Scope config key $($entry.Key) in $Repository."
         }
@@ -372,12 +378,12 @@ function Assert-SafeGitControlState {
     $localEntries = @(Get-GitConfigEntries -Repository $Repository -GitPath $GitPath -Scope '--local')
     $allowedLocal = @{
         'core.repositoryformatversion' = @('0')
-        'core.filemode' = @('false')
+        'core.filemode' = @('true', 'false')
         'core.bare' = @('false')
         'core.logallrefupdates' = @('true')
-        'core.symlinks' = @('false')
-        'core.ignorecase' = @('true')
-        'core.precomposeunicode' = @('true')
+        'core.symlinks' = @('true', 'false')
+        'core.ignorecase' = @('true', 'false')
+        'core.precomposeunicode' = @('true', 'false')
         'remote.origin.url' = @($ExpectedOrigin)
         'remote.origin.fetch' = @('+refs/heads/*:refs/remotes/origin/*')
         'branch.main.remote' = @('origin')
