@@ -685,6 +685,8 @@ function Get-MoodleDockerEnvironment {
         'MOODLE_DOCKER_DB' = 'pgsql'
         'COMPOSE_PROJECT_NAME' = $ProjectName
         'MOODLE_DOCKER_WEB_PORT' = $WebPort
+        'MOODLE_DOCKER_WEB_HOST' = '127.0.0.1'
+        'MSYS2_ARG_CONV_EXCL' = '/var/www/html'
     }
 }
 
@@ -714,7 +716,14 @@ function Invoke-MoodleDocker {
     foreach ($argument in $Arguments) {
         $command += ' ' + (ConvertTo-BashLiteral -Value $argument)
     }
-    $output = & $bash -lc $command
+    $previousOutputEncoding = $global:OutputEncoding
+    try {
+        $global:OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $output = $command | & $bash -ls
+    }
+    finally {
+        $global:OutputEncoding = $previousOutputEncoding
+    }
     if ($LASTEXITCODE -ne 0) {
         Fail "moodle-docker-compose command failed with exit code $LASTEXITCODE."
     }
@@ -828,17 +837,12 @@ function Install-Site {
 
 function Set-MoodleConfiguration {
     param([Parameter(Mandatory = $true)]$Layout)
-    $settings = @(
-        @('enablewebservices', '1')
-    )
-    foreach ($setting in $settings) {
-        Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', "$($Layout.CoreCliRoot)/admin/cli/cfg.php", "--name=$($setting[0])", "--set=$($setting[1])") | Out-Null
-    }
+    Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', "$($Layout.CoreCliRoot)/admin/cli/cfg.php", '--name=enablewebservices', '--set=1') | Out-Null
 }
 
 function Enable-MoodleMobileService {
     param([Parameter(Mandatory = $true)]$Layout)
-    $activation = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; \core\session\manager::set_user(get_admin()); require_once(`$CFG->libdir . '/adminlib.php'); `$setting = admin_get_root()->locate('enablemobilewebservice'); if (!(`$setting instanceof admin_setting_enablemobileservice)) { throw new moodle_exception('mobile setting is unavailable'); } `$error = `$setting->write_setting(1); if (`$error !== '') { throw new moodle_exception(`$error); } `$manager = new webservice(); `$service = `$manager->get_external_service_by_shortname(MOODLE_OFFICIAL_MOBILE_SERVICE); `$protocols = (string)get_config('core', 'webserviceprotocols'); `$role = `$DB->get_record('role', array('shortname' => 'user'), '*', MUST_EXIST); `$context = context_system::instance(); `$restallowed = `$DB->record_exists('role_capabilities', array('roleid' => `$role->id, 'contextid' => `$context->id, 'capability' => 'webservice/rest:use', 'permission' => CAP_ALLOW)); if (!`$service || !`$service->enabled || strpos(`$protocols, 'rest') === false || !`$restallowed) { throw new moodle_exception('mobile REST service activation verification failed'); } echo 'mobile-service-ready';"
+    $activation = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; \core\session\manager::set_user(get_admin()); require_once(`$CFG->libdir . '/adminlib.php'); `$setting = new admin_setting_enablemobileservice('enablemobilewebservice', '', '', 0); `$error = `$setting->write_setting(1); if (`$error !== '') { throw new moodle_exception(`$error); } `$manager = new webservice(); `$service = `$manager->get_external_service_by_shortname(MOODLE_OFFICIAL_MOBILE_SERVICE); `$protocols = (string)get_config('core', 'webserviceprotocols'); `$role = `$DB->get_record('role', array('shortname' => 'user'), '*', MUST_EXIST); `$context = context_system::instance(); `$restallowed = `$DB->record_exists('role_capabilities', array('roleid' => `$role->id, 'contextid' => `$context->id, 'capability' => 'webservice/rest:use', 'permission' => CAP_ALLOW)); if (!`$service || !`$service->enabled || strpos(`$protocols, 'rest') === false || !`$restallowed) { throw new moodle_exception('mobile REST service activation verification failed'); } echo 'mobile-service-ready';"
     $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', $activation)
     if (($result -join "`n").Trim() -ne 'mobile-service-ready') {
         Fail 'Moodle mobile service activation did not verify successfully.'

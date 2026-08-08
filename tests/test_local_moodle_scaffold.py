@@ -1,3 +1,5 @@
+import base64
+import json
 import re
 import shutil
 import subprocess
@@ -64,7 +66,105 @@ def test_script_uses_official_wrapper_with_loopback_postgresql_environment() -> 
     assert "COMPOSE_PROJECT_NAME' = $ProjectName" in script
     assert "$ProjectName = 'moddle_autotask_moodle'" in script
     assert "$WebPort = '127.0.0.1:8000'" in script
+    assert "$WebBaseUrl = 'http://127.0.0.1:8000'" in script
+    assert "MOODLE_DOCKER_WEB_HOST' = '127.0.0.1'" in script
     assert "Git Bash was not found" in script
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None
+    or not Path(r"C:\Program Files\Git\bin\bash.exe").is_file(),
+    reason="Windows PowerShell and Git Bash are required",
+)
+def test_moodle_docker_preserves_sql_and_container_paths_through_windows_powershell(
+    tmp_path: Path,
+) -> None:
+    docker_root = tmp_path / "móódle-漢字"
+    moodle_root = tmp_path / "moodle"
+    wrapper = docker_root / "bin" / "moodle-docker-compose"
+    host_compose = docker_root / "base.yml"
+    wrapper.parent.mkdir(parents=True)
+    moodle_root.mkdir()
+    host_compose.write_text("services: {}\n", encoding="utf-8")
+    wrapper.write_text(
+        "#!/usr/bin/env bash\nexec docker.exe \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    prefix = read(SCRIPT).split("\nswitch ($Action) {", maxsplit=1)[0]
+    driver = tmp_path / "preserve-sql-quotes.ps1"
+    query = "SELECT CASE WHEN to_regclass('public.m_config') IS NULL THEN 'absent' ELSE 'table-present' END;"
+    container_cli = "/var/www/html/áé漢字/admin/cli/install_database.php"
+    unicode_value = "--label=áé漢字"
+    driver.write_text(
+        prefix
+        + f"\n$RepoRoot = '{tmp_path.as_posix()}'\n"
+        + f"$RuntimeRoot = '{(tmp_path / 'runtime').as_posix()}'\n"
+        + f"$MoodleRoot = '{moodle_root.as_posix()}'\n"
+        + f"$MoodleDockerRoot = '{docker_root.as_posix()}'\n"
+        + "function Assert-NoMoodleDockerLocalOverride {}\n"
+        + "function Assert-MoodleDockerWrapperTrust { param($Wrapper, [switch]$RequireMoodleSource) }\n"
+        + "Add-Type -TypeDefinition @'\n"
+        + "using System;\n"
+        + "using System.Text;\n"
+        + "public static class FakeDocker {\n"
+        + "    public static void Main(string[] arguments) {\n"
+        + "        Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(\"MOODLE_DOCKER_WEB_HOST=\" + Environment.GetEnvironmentVariable(\"MOODLE_DOCKER_WEB_HOST\"))));\n"
+        + "        Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(\"MOODLE_DOCKER_WEB_PORT=\" + Environment.GetEnvironmentVariable(\"MOODLE_DOCKER_WEB_PORT\"))));\n"
+        + "        foreach (string argument in arguments) {\n"
+        + "            Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(argument)));\n"
+        + "        }\n"
+        + "    }\n"
+        + "}\n"
+        + "'@ -OutputAssembly '"
+        + f"{(tmp_path / 'docker.exe').as_posix()}"
+        + "' -OutputType ConsoleApplication\n"
+        + f"$env:PATH = '{tmp_path.as_posix()};' + $env:PATH\n"
+        + f"$query = \"{query}\"\n"
+        + f"$containerCli = '{container_cli}'\n"
+        + f"$unicodeValue = '{unicode_value}'\n"
+        + f"$hostCompose = ConvertTo-BashPath -Path '{host_compose.as_posix()}'\n"
+        + "$initialOutputEncoding = $global:OutputEncoding\n"
+        + "$output = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerCli, $unicodeValue, '-f', $hostCompose, '-tAc', $query)\n"
+        + "if (-not [object]::ReferenceEquals($global:OutputEncoding, $initialOutputEncoding)) { throw 'Invoke-MoodleDocker changed global OutputEncoding.' }\n"
+        + "$output | ConvertTo-Json -Compress\n",
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(driver),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    captured = [base64.b64decode(value).decode("utf-8") for value in json.loads(result.stdout)]
+    assert captured[:2] == [
+        "MOODLE_DOCKER_WEB_HOST=127.0.0.1",
+        "MOODLE_DOCKER_WEB_PORT=127.0.0.1:8000",
+    ]
+    arguments = captured[2:]
+    assert arguments[:6] == [
+        "exec",
+        "-T",
+        "webserver",
+        "php",
+        container_cli,
+        unicode_value,
+    ]
+    assert arguments[6] == "-f"
+    assert Path(arguments[7]).resolve() == host_compose.resolve()
+    assert arguments[8:] == [
+        "-tAc",
+        query,
+    ]
 
 
 def test_script_keeps_credentials_and_token_in_runtime() -> None:
@@ -254,17 +354,65 @@ def test_cfg_writes_web_services_only_and_mobile_uses_setting_semantics() -> Non
     activation = script.split("function Enable-MoodleMobileService", maxsplit=1)[1].split(
         "function Get-FixtureState", maxsplit=1
     )[0]
-    assert "admin_setting_enablemobileservice" in activation
+    assert "new admin_setting_enablemobileservice('enablemobilewebservice', '', '', 0)" in activation
+    assert "admin_get_root" not in activation
+    assert ".locate(" not in activation
     assert "write_setting(1)" in activation
     assert "\\core\\session\\manager::set_user(get_admin());" in activation
     assert activation.index("\\core\\session\\manager::set_user(get_admin());") < activation.index(
-        "admin_get_root()"
+        "new admin_setting_enablemobileservice"
     )
     assert "`$USER = get_admin();" not in activation
     assert "MOODLE_OFFICIAL_MOBILE_SERVICE" in activation
     assert "webserviceprotocols" in activation
     assert "webservice/rest:use" in activation
+    assert "mobile REST service activation verification failed" in activation
     assert "mobile-service-ready" in activation
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_set_moodle_configuration_invokes_cfg_once_with_exact_arguments(
+    tmp_path: Path,
+) -> None:
+    script = read(SCRIPT)
+    configuration = script[
+        script.index("function Set-MoodleConfiguration") : script.index(
+            "function Enable-MoodleMobileService"
+        )
+    ]
+    driver = tmp_path / "set-moodle-configuration.ps1"
+    driver.write_text(
+        configuration
+        + "\n$script:invocations = @()\n"
+        + "function Invoke-MoodleDocker { param([string[]]$Arguments) $script:invocations += ,@($Arguments) }\n"
+        + "$layout = [PSCustomObject]@{ CoreCliRoot = '/var/www/html' }\n"
+        + "Set-MoodleConfiguration -Layout $layout\n"
+        + "if ($script:invocations.Count -ne 1) { exit 1 }\n"
+        + "$script:invocations[0] | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        "exec",
+        "-T",
+        "webserver",
+        "php",
+        "/var/www/html/admin/cli/cfg.php",
+        "--name=enablewebservices",
+        "--set=1",
+    ]
 
 
 def test_down_and_up_preserve_existing_containers() -> None:
