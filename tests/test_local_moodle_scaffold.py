@@ -1079,7 +1079,8 @@ def test_status_rejects_ignored_payloads_and_active_hooks_before_docker(tmp_path
         modified_config = status()
         config_output = modified_config.stdout + modified_config.stderr
         assert modified_config.returncode != 0
-        assert "does not exactly match pinned config.docker-template.php" in config_output
+        assert "does not exactly match pinned" in config_output
+        assert "config.docker-template.php" in config_output
         assert "Docker daemon" not in config_output
 
         config.write_text("<?php // pinned template\n", encoding="utf-8")
