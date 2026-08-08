@@ -22,3 +22,9 @@ python -m pytest -q
 
 See [architecture documentation](docs/architecture.md), [contributing guidance](CONTRIBUTING.md),
 and [security policy](SECURITY.md).
+
+## Local Moodle integration environment
+
+The development-only Moodle integration stack is documented in
+[docs/local-moodle.md](docs/local-moodle.md). It uses pinned official Moodle sources, PostgreSQL,
+and binds HTTP only to `127.0.0.1:8000`.
