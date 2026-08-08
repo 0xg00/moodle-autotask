@@ -49,14 +49,54 @@ if ($Action -eq 'Bootstrap') {
     $Versions = Read-MoodleVersions -Path $VersionsPath
 }
 $ProjectName = 'moddle_autotask_moodle'
-$WebPort = '127.0.0.1:8000'
-$WebBaseUrl = 'http://127.0.0.1:8000'
 $script:GitBashPath = $null
 
 function Fail {
     param([Parameter(Mandatory = $true)][string]$Message)
     throw $Message
 }
+
+function Get-MoodleBindIp {
+    $candidate = [string]$env:MOODLE_AUTOTASK_BIND_IP
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        return '127.0.0.1'
+    }
+    if ($candidate -ne $candidate.Trim() -or $candidate -notmatch '^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$') {
+        Fail 'MOODLE_AUTOTASK_BIND_IP must be a canonical dotted-quad IPv4 address without whitespace or leading zeroes.'
+    }
+    $octets = @($candidate.Split('.') | ForEach-Object { [int]$_ })
+    if (@($octets | Where-Object { $_ -gt 255 }).Count -ne 0) {
+        Fail 'MOODLE_AUTOTASK_BIND_IP must be a canonical dotted-quad IPv4 address.'
+    }
+    $isLoopback = $candidate -eq '127.0.0.1'
+    $isRfc1918 = $octets[0] -eq 10 -or
+        ($octets[0] -eq 172 -and $octets[1] -ge 16 -and $octets[1] -le 31) -or
+        ($octets[0] -eq 192 -and $octets[1] -eq 168)
+    $isTailscale = $octets[0] -eq 100 -and $octets[1] -ge 64 -and $octets[1] -le 127
+    if (-not ($isLoopback -or $isRfc1918 -or $isTailscale)) {
+        Fail 'MOODLE_AUTOTASK_BIND_IP must be 127.0.0.1, RFC1918 private IPv4, or Tailscale 100.64.0.0/10.'
+    }
+    if ($isLoopback) {
+        return $candidate
+    }
+    try {
+        $assigned = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop)
+    } catch {
+        Fail 'Could not inspect local IPv4 addresses with Get-NetIPAddress; refusing a non-loopback bind.'
+    }
+    $matches = @($assigned | Where-Object { [string]$_.IPAddress -eq $candidate })
+    if ($matches.Count -eq 0) {
+        Fail 'MOODLE_AUTOTASK_BIND_IP is not currently assigned to this Windows host.'
+    }
+    if ($isTailscale -and @($matches | Where-Object { [string]$_.InterfaceAlias -ieq 'Tailscale' }).Count -eq 0) {
+        Fail 'Tailscale 100.64.0.0/10 binds require MOODLE_AUTOTASK_BIND_IP on the Tailscale interface.'
+    }
+    return $candidate
+}
+
+$BindIp = Get-MoodleBindIp
+$WebPort = "${BindIp}:8000"
+$WebBaseUrl = "http://${BindIp}:8000"
 
 function Assert-PathNotReparsePoint {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -163,7 +203,7 @@ function ConvertTo-BashPath {
     return ($output | Select-Object -First 1).Trim()
 }
 
-function Assert-DockerDaemon {
+function Get-DockerCli {
     $docker = Get-Command 'docker.exe' -ErrorAction SilentlyContinue
     if ($null -eq $docker) {
         $docker = Get-Command 'docker' -ErrorAction SilentlyContinue
@@ -171,6 +211,11 @@ function Assert-DockerDaemon {
     if ($null -eq $docker) {
         Fail 'Docker CLI was not found. Install Docker Desktop and ensure docker is on PATH.'
     }
+    return $docker
+}
+
+function Assert-DockerDaemon {
+    $docker = Get-DockerCli
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $docker.Source
     $startInfo.Arguments = 'info --format "{{.ServerVersion}}"'
@@ -685,7 +730,7 @@ function Get-MoodleDockerEnvironment {
         'MOODLE_DOCKER_DB' = 'pgsql'
         'COMPOSE_PROJECT_NAME' = $ProjectName
         'MOODLE_DOCKER_WEB_PORT' = $WebPort
-        'MOODLE_DOCKER_WEB_HOST' = '127.0.0.1'
+        'MOODLE_DOCKER_WEB_HOST' = $BindIp
         'MSYS2_ARG_CONV_EXCL' = '/var/www/html'
     }
 }
@@ -755,6 +800,7 @@ function Write-ImageEvidence {
 
 function Create-Stack {
     Invoke-MoodleDocker -Arguments @('up', '-d') | Write-Output
+    Set-MoodleContainerRestartPolicy
     Invoke-MoodleDockerWaitForDb | Out-Null
     Write-ImageEvidence
 }
@@ -764,11 +810,45 @@ function Test-StackContainersExist {
     return -not [string]::IsNullOrWhiteSpace(($containers -join "`n"))
 }
 
+function Set-MoodleContainerRestartPolicy {
+    $containerIds = @(
+        Invoke-MoodleDocker -Arguments @('ps', '--all', '--quiet') |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($containerIds.Count -eq 0) {
+        Fail 'The Moodle Compose project did not report any container IDs for restart-policy configuration.'
+    }
+    foreach ($containerId in $containerIds) {
+        if ($containerId -notmatch '^[a-fA-F0-9]{12,64}$') {
+            Fail 'The Moodle Compose project returned a malformed Docker container ID.'
+        }
+    }
+    $docker = Get-DockerCli
+    foreach ($containerId in $containerIds) {
+        & $docker.Source @('update', '--restart', 'unless-stopped', $containerId) | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Fail 'Could not apply Docker restart policy to a Moodle project container.'
+        }
+    }
+    foreach ($containerId in $containerIds) {
+        $policyOutput = @(& $docker.Source @('inspect', '--format', '{{.HostConfig.RestartPolicy.Name}}', $containerId))
+        $policy = ($policyOutput -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) {
+            Fail 'Could not verify Docker restart policy for a Moodle project container.'
+        }
+        if ($policy -ne 'unless-stopped') {
+            Fail 'A Moodle project container does not have the required unless-stopped restart policy.'
+        }
+    }
+}
+
 function Resume-Stack {
     if (-not (Test-StackContainersExist)) {
         Fail 'Local Moodle containers do not exist. Run Bootstrap to create the site before using Up.'
     }
-    Invoke-MoodleDocker -Arguments @('start') | Write-Output
+    Invoke-MoodleDocker -Arguments @('up', '-d') | Write-Output
+    Set-MoodleContainerRestartPolicy
     Invoke-MoodleDockerWaitForDb | Out-Null
     Write-ImageEvidence
 }
@@ -941,7 +1021,7 @@ function Invoke-Smoke {
     $baseUrl = [string]$tokenData.baseUrl
     $allowedBaseUrls = @($WebBaseUrl, "$WebBaseUrl/public")
     if ($baseUrl -notin $allowedBaseUrls) {
-        Fail 'Persisted Moodle token base URL is not an allowed local loopback endpoint. Run Bootstrap again.'
+        Fail 'Persisted Moodle token base URL is not an allowed configured local endpoint. Run Bootstrap again.'
     }
     $siteInfo = Invoke-MoodleRest -BaseUrl $baseUrl -Token $tokenData.token -Function 'core_webservice_get_site_info'
     if ($null -eq $siteInfo.userid) {

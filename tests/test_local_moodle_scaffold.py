@@ -59,16 +59,89 @@ def test_script_limits_runtime_and_reset_targets() -> None:
     assert "if (-not $Force)" in script
 
 
-def test_script_uses_official_wrapper_with_loopback_postgresql_environment() -> None:
+def test_script_uses_official_wrapper_with_validated_private_postgresql_environment() -> None:
     script = read(SCRIPT)
     assert "./bin/moodle-docker-compose" in script
     assert "MOODLE_DOCKER_DB' = 'pgsql'" in script
     assert "COMPOSE_PROJECT_NAME' = $ProjectName" in script
     assert "$ProjectName = 'moddle_autotask_moodle'" in script
-    assert "$WebPort = '127.0.0.1:8000'" in script
-    assert "$WebBaseUrl = 'http://127.0.0.1:8000'" in script
-    assert "MOODLE_DOCKER_WEB_HOST' = '127.0.0.1'" in script
+    assert "MOODLE_AUTOTASK_BIND_IP" in script
+    assert "return '127.0.0.1'" in script
+    assert '$WebPort = "${BindIp}:8000"' in script
+    assert '$WebBaseUrl = "http://${BindIp}:8000"' in script
+    assert "MOODLE_DOCKER_WEB_HOST' = $BindIp" in script
     assert "Git Bash was not found" in script
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_bind_ip_validation_allows_only_local_private_or_tailscale_addresses(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    script = read(SCRIPT)
+    validation = script[
+        script.index("function Get-MoodleBindIp") : script.index("$BindIp = Get-MoodleBindIp")
+    ]
+    driver = tmp_path / "bind-ip-validation.ps1"
+    driver.write_text(
+        "function Fail { param([string]$Message) throw $Message }\n"
+        + validation
+        + "\nfunction Get-NetIPAddress { param($AddressFamily, $ErrorAction) $script:assigned }\n"
+        + "function Invoke-BindValidation {\n"
+        + "    param([string]$Candidate, [object[]]$Assigned)\n"
+        + "    $env:MOODLE_AUTOTASK_BIND_IP = $Candidate\n"
+        + "    $script:assigned = @($Assigned)\n"
+        + "    try { [PSCustomObject]@{ candidate = $Candidate; value = Get-MoodleBindIp; "
+        + "error = $null } }\n"
+        + "    catch { [PSCustomObject]@{ candidate = $Candidate; value = $null; "
+        + "error = $_.Exception.Message } }\n"
+        + "}\n"
+        + "$ethernet = [PSCustomObject]@{ IPAddress = '10.0.0.20'; InterfaceAlias = 'Ethernet' }\n"
+        + "$rfc172 = [PSCustomObject]@{ IPAddress = '172.16.0.20'; InterfaceAlias = 'Ethernet' }\n"
+        + "$rfc192 = [PSCustomObject]@{ IPAddress = '192.168.1.20'; InterfaceAlias = 'Ethernet' }\n"
+        + "$tailscale = [PSCustomObject]@{ IPAddress = '100.64.0.20'; "
+        + "InterfaceAlias = 'TAILSCALE' }\n"
+        + "$wrongTailscale = [PSCustomObject]@{ IPAddress = '100.64.0.20'; "
+        + "InterfaceAlias = 'Ethernet' }\n"
+        + "$results = @(\n"
+        + "    Invoke-BindValidation '' @();\n"
+        + "    Invoke-BindValidation '10.0.0.20' @($ethernet);\n"
+        + "    Invoke-BindValidation '172.16.0.20' @($rfc172);\n"
+        + "    Invoke-BindValidation '192.168.1.20' @($rfc192);\n"
+        + "    Invoke-BindValidation '100.64.0.20' @($tailscale);\n"
+        + "    Invoke-BindValidation '8.8.8.8' @();\n"
+        + "    Invoke-BindValidation '0.0.0.0' @();\n"
+        + "    Invoke-BindValidation '010.0.0.20' @($ethernet);\n"
+        + "    Invoke-BindValidation '10.0.0.21' @($ethernet);\n"
+        + "    Invoke-BindValidation '100.64.0.20' @($wrongTailscale)\n"
+        + ")\n$results | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    results = json.loads(result.stdout)
+    assert [entry["value"] for entry in results[:5]] == [
+        "127.0.0.1",
+        "10.0.0.20",
+        "172.16.0.20",
+        "192.168.1.20",
+        "100.64.0.20",
+    ]
+    assert "RFC1918 private IPv4" in results[5]["error"]
+    assert "RFC1918 private IPv4" in results[6]["error"]
+    assert "canonical dotted-quad" in results[7]["error"]
+    assert "not currently assigned" in results[8]["error"]
+    assert "Tailscale interface" in results[9]["error"]
 
 
 @pytest.mark.skipif(
@@ -453,10 +526,56 @@ def test_down_and_up_preserve_existing_containers() -> None:
     assert "Invoke-MoodleDocker -Arguments @('stop')" in down_case
     assert "down" not in down_case
     assert "Resume-Stack" in up_case
-    assert "Invoke-MoodleDocker -Arguments @('start')" in script
+    assert "Invoke-MoodleDocker -Arguments @('up', '-d')" in script
+    assert "Invoke-MoodleDocker -Arguments @('start')" not in script
+    assert "Set-MoodleContainerRestartPolicy" in script
     assert "Test-StackContainersExist" in script
     assert "Run Bootstrap to create the site" in script
     assert "down', '--volumes', '--remove-orphans'" in script
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_restart_policy_rejects_empty_or_malformed_compose_container_ids(tmp_path: Path) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    script = read(SCRIPT)
+    policy = script[
+        script.index("function Set-MoodleContainerRestartPolicy") : script.index(
+            "function Resume-Stack"
+        )
+    ]
+    driver = tmp_path / "restart-policy-validation.ps1"
+    driver.write_text(
+        "function Fail { param([string]$Message) throw $Message }\n"
+        + policy
+        + "\nfunction Invoke-MoodleDocker { param([string[]]$Arguments) $script:containerIds }\n"
+        + "$errors = @()\n"
+        + "$script:containerIds = @()\n"
+        + "try { Set-MoodleContainerRestartPolicy } catch { $errors += $_.Exception.Message }\n"
+        + "$script:containerIds = @('not-a-container-id')\n"
+        + "try { Set-MoodleContainerRestartPolicy } catch { $errors += $_.Exception.Message }\n"
+        + "$errors | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        "The Moodle Compose project did not report any container IDs for restart-policy "
+        "configuration.",
+        "The Moodle Compose project returned a malformed Docker container ID.",
+    ]
+    assert "@('update', '--restart', 'unless-stopped', $containerId)" in policy
+    assert "@('inspect', '--format', '{{.HostConfig.RestartPolicy.Name}}', $containerId)" in policy
+    assert "$policy -ne 'unless-stopped'" in policy
 
 
 def test_source_integrity_rejects_dirty_runtime_sources() -> None:
@@ -1512,7 +1631,7 @@ def test_smoke_rejects_non_loopback_persisted_token_before_http(tmp_path: Path) 
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
-    assert "not an allowed local loopback endpoint" in result.stdout
+    assert "not an allowed configured local endpoint" in result.stdout
     assert not marker.exists()
 
 
@@ -1534,5 +1653,24 @@ def test_documentation_explains_development_only_image_evidence_and_pins() -> No
     assert "development-only" in docs
     assert "127.0.0.1:8000" in docs
     assert "not claimed to be bit-for-bit" in docs
+
+
+def test_documentation_explains_safe_private_bind_revert_firewall_and_persistence() -> None:
+    docs = read(DOCS)
+    readme = read(ROOT / "README.md")
+    for text in (
+        "MOODLE_AUTOTASK_BIND_IP",
+        "Remove-Item Env:MOODLE_AUTOTASK_BIND_IP",
+        "Run `Bootstrap` or `Up`",
+        "unless-stopped",
+        "Docker Desktop must itself be configured to start automatically",
+        "-RemoteAddress '100.64.0.0/10'",
+        "-LocalPort 8000",
+        "-InterfaceAlias Tailscale",
+        "<TAILSCALE_LOCAL_IPV4>",
+    ):
+        assert text in docs
+    assert "validated private/Tailscale opt-in" in readme
+    assert "MOODLE_AUTOTASK_BIND_IP = '<TAILSCALE_LOCAL_IPV4>'" in docs
     assert ".runtime/moodle-images.json" in docs
     assert "https://github.com/moodlehq/moodle-docker" in docs

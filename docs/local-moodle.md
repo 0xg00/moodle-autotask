@@ -1,8 +1,9 @@
 # Local Moodle integration environment
 
 This is a development-only Moodle instance for adapter integration tests. It must never be
-exposed publicly: its HTTP listener is deliberately bound to `127.0.0.1:8000`, and developer
-debugging is enabled only in this local instance.
+exposed publicly: its HTTP listener defaults to `127.0.0.1:8000`; a validated private/Tailscale
+bind is available only through the explicit opt-in described below. Developer debugging is enabled
+only in this local instance.
 
 ## Prerequisites
 
@@ -109,6 +110,45 @@ not add local Compose overrides to this reproducible test environment.
 existing containers, waits for PostgreSQL, and refreshes image evidence; it fails with a Bootstrap
 instruction if no local containers exist. Only `Reset -Force` destroys volumes.
 
+## Optional private or Tailscale bind
+
+The default is still loopback-only: `127.0.0.1:8000`. To opt in for a private Windows address or
+Tailscale, set the process environment variable before running the script. Use a placeholder or
+your own currently assigned address; do not commit a personal address.
+
+```powershell
+$env:MOODLE_AUTOTASK_BIND_IP = '<TAILSCALE_LOCAL_IPV4>'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Up
+```
+
+The script accepts only canonical dotted-quad IPv4: exactly `127.0.0.1`, RFC1918 (`10/8`,
+`172.16/12`, or `192.168/16`), or Tailscale CGNAT (`100.64/10`). Non-loopback values must be
+currently assigned by Windows; a CGNAT address must be assigned to the `Tailscale` interface.
+Hostnames, wildcards, public addresses, IPv6, leading-zero forms, and unassigned addresses fail
+closed. The one validated value controls the Compose bind, Moodle `wwwroot`, token endpoints, and
+Smoke allowlist. Run `Bootstrap` or `Up` after adding, removing, or changing it so Compose uses
+`up -d` to reconcile the stored port binding.
+
+To return to loopback in the current shell, remove the process override and reconcile again:
+
+```powershell
+Remove-Item Env:MOODLE_AUTOTASK_BIND_IP
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Up
+```
+
+For a Tailscale-only host firewall rule, review and adapt this example before running it. It limits
+TCP/8000 to the local Tailscale address and remote Tailscale CGNAT range; it does not create a LAN
+or public rule:
+
+```powershell
+New-NetFirewallRule -DisplayName 'Moodle Tailscale 8000' -Direction Inbound -Action Allow -Protocol TCP -LocalAddress '<TAILSCALE_LOCAL_IPV4>' -RemoteAddress '100.64.0.0/10' -LocalPort 8000 -InterfaceAlias Tailscale
+```
+
+After each `Bootstrap` or `Up`, the script sets and verifies `unless-stopped` for every project
+container. This lets containers restart after the Docker daemon returns, but `Down` remains an
+intentional stop. Docker Desktop must itself be configured to start automatically and its daemon
+must be running; the script neither changes Docker Desktop settings nor starts it.
+
 ## Smoke contract
 
 The inline Moodle CLI seed uses supported core/course/manual-enrolment APIs to create `student1`,
@@ -122,4 +162,5 @@ The token endpoint and REST root are selected from the validated local endpoint 
 than assuming an obsolete pre-5.2 path. See Moodle's [web-service documentation](https://moodledev.io/docs/4.5/apis/subsystems/external) and
 [mobile-service setting guidance](https://docs.moodle.org/500/en/Moodle_app_FAQ).
 Before Smoke sends HTTP using the persisted token, it requires the saved base URL to be exactly
-`http://127.0.0.1:8000` or `http://127.0.0.1:8000/public`.
+one configured, validated endpoint candidate. The default candidates remain
+`http://127.0.0.1:8000` and `http://127.0.0.1:8000/public`.
