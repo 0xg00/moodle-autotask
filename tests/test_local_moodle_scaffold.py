@@ -93,7 +93,10 @@ def test_moodle_docker_preserves_sql_and_container_paths_through_windows_powersh
     wrapper.chmod(0o755)
     prefix = read(SCRIPT).split("\nswitch ($Action) {", maxsplit=1)[0]
     driver = tmp_path / "preserve-sql-quotes.ps1"
-    query = "SELECT CASE WHEN to_regclass('public.m_config') IS NULL THEN 'absent' ELSE 'table-present' END;"
+    query = (
+        "SELECT CASE WHEN to_regclass('public.m_config') IS NULL "
+        "THEN 'absent' ELSE 'table-present' END;"
+    )
     container_cli = "/var/www/html/áé漢字/admin/cli/install_database.php"
     unicode_value = "--label=áé漢字"
     driver.write_text(
@@ -103,16 +106,30 @@ def test_moodle_docker_preserves_sql_and_container_paths_through_windows_powersh
         + f"$MoodleRoot = '{moodle_root.as_posix()}'\n"
         + f"$MoodleDockerRoot = '{docker_root.as_posix()}'\n"
         + "function Assert-NoMoodleDockerLocalOverride {}\n"
-        + "function Assert-MoodleDockerWrapperTrust { param($Wrapper, [switch]$RequireMoodleSource) }\n"
+        + (
+            "function Assert-MoodleDockerWrapperTrust { param($Wrapper, "
+            "[switch]$RequireMoodleSource) }\n"
+        )
         + "Add-Type -TypeDefinition @'\n"
         + "using System;\n"
         + "using System.Text;\n"
         + "public static class FakeDocker {\n"
         + "    public static void Main(string[] arguments) {\n"
-        + "        Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(\"MOODLE_DOCKER_WEB_HOST=\" + Environment.GetEnvironmentVariable(\"MOODLE_DOCKER_WEB_HOST\"))));\n"
-        + "        Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(\"MOODLE_DOCKER_WEB_PORT=\" + Environment.GetEnvironmentVariable(\"MOODLE_DOCKER_WEB_PORT\"))));\n"
+        + (
+            "        Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes("
+            "\"MOODLE_DOCKER_WEB_HOST=\" + Environment.GetEnvironmentVariable("
+            "\"MOODLE_DOCKER_WEB_HOST\"))));\n"
+        )
+        + (
+            "        Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes("
+            "\"MOODLE_DOCKER_WEB_PORT=\" + Environment.GetEnvironmentVariable("
+            "\"MOODLE_DOCKER_WEB_PORT\"))));\n"
+        )
         + "        foreach (string argument in arguments) {\n"
-        + "            Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(argument)));\n"
+        + (
+            "            Console.WriteLine(Convert.ToBase64String("
+            "Encoding.UTF8.GetBytes(argument)));\n"
+        )
         + "        }\n"
         + "    }\n"
         + "}\n"
@@ -125,8 +142,16 @@ def test_moodle_docker_preserves_sql_and_container_paths_through_windows_powersh
         + f"$unicodeValue = '{unicode_value}'\n"
         + f"$hostCompose = ConvertTo-BashPath -Path '{host_compose.as_posix()}'\n"
         + "$initialOutputEncoding = $global:OutputEncoding\n"
-        + "$output = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerCli, $unicodeValue, '-f', $hostCompose, '-tAc', $query)\n"
-        + "if (-not [object]::ReferenceEquals($global:OutputEncoding, $initialOutputEncoding)) { throw 'Invoke-MoodleDocker changed global OutputEncoding.' }\n"
+        + (
+            "$output = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', "
+            "'php', $containerCli, $unicodeValue, '-f', $hostCompose, '-tAc', "
+            "$query)\n"
+        )
+        + (
+            "if (-not [object]::ReferenceEquals($global:OutputEncoding, "
+            "$initialOutputEncoding)) { throw 'Invoke-MoodleDocker changed global "
+            "OutputEncoding.' }\n"
+        )
         + "$output | ConvertTo-Json -Compress\n",
         encoding="utf-8-sig",
     )
@@ -354,7 +379,10 @@ def test_cfg_writes_web_services_only_and_mobile_uses_setting_semantics() -> Non
     activation = script.split("function Enable-MoodleMobileService", maxsplit=1)[1].split(
         "function Get-FixtureState", maxsplit=1
     )[0]
-    assert "new admin_setting_enablemobileservice('enablemobilewebservice', '', '', 0)" in activation
+    assert (
+        "new admin_setting_enablemobileservice('enablemobilewebservice', '', '', 0)"
+        in activation
+    )
     assert "admin_get_root" not in activation
     assert ".locate(" not in activation
     assert "write_setting(1)" in activation
@@ -387,7 +415,10 @@ def test_set_moodle_configuration_invokes_cfg_once_with_exact_arguments(
     driver.write_text(
         configuration
         + "\n$script:invocations = @()\n"
-        + "function Invoke-MoodleDocker { param([string[]]$Arguments) $script:invocations += ,@($Arguments) }\n"
+        + (
+            "function Invoke-MoodleDocker { param([string[]]$Arguments) "
+            "$script:invocations += ,@($Arguments) }\n"
+        )
         + "$layout = [PSCustomObject]@{ CoreCliRoot = '/var/www/html' }\n"
         + "Set-MoodleConfiguration -Layout $layout\n"
         + "if ($script:invocations.Count -ne 1) { exit 1 }\n"
