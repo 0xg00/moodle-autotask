@@ -76,9 +76,20 @@ an incomplete database is reported instead of treated as empty. A crash during d
 or fixture creation is fail-closed: inspect it or run `Reset -Force`; the script does not resume a
 partially-created database or fixture.
 
+The seeded assignment has the exact intro attachment `autotask-brief.txt` with 76 bytes and SHA-256
+`beec33f762521fcc5976c5dd799348d888014d988dd335e91c7e195ed811f11c`. A missing attachment with
+the old empty or current expected intro is a safe legacy upgrade. Any existing attachment with
+different bytes, size, hash, or intro is partial and requires `Reset -Force`; Bootstrap never
+overwrites it.
+
 It creates only ignored `.runtime/moodle*` paths. `.runtime/moodle-secrets.json` holds generated
 admin and student passwords, while `.runtime/moodle-token.json` holds the mobile token. Neither is
 printed. Do not put school, production, or personal credentials in this environment.
+
+Bootstrap removes inherited ACLs from `.runtime` and grants secret access only to the current
+Windows user, `SYSTEM`, and Administrators. If that ACL operation cannot be applied, Bootstrap
+fails before writing secrets or a token. Keep the connector's acknowledgement database in a
+similarly private directory.
 
 To remove the local sources, database data, generated configuration, evidence, secrets, and token,
 explicitly opt in:
@@ -164,3 +175,23 @@ than assuming an obsolete pre-5.2 path. See Moodle's [web-service documentation]
 Before Smoke sends HTTP using the persisted token, it requires the saved base URL to be exactly
 one configured, validated endpoint candidate. The default candidates remain
 `http://127.0.0.1:8000` and `http://127.0.0.1:8000/public`.
+
+## Connector CLI
+
+The Python connector uses Moodle's official mobile REST API, never scraping or browser automation.
+For external Moodle, configure a public canonical HTTPS URL. Plain HTTP is accepted only for a
+literal loopback, RFC1918, or Tailscale IPv4 local endpoint. The token is supplied from the local
+file produced by Bootstrap (or the two environment variables), never as a command-line argument.
+
+```powershell
+moodle-autotask-moodle scan --token-file .runtime/moodle-token.json --state .runtime/moodle-state.sqlite3
+moodle-autotask-moodle acknowledge --state .runtime/moodle-state.sqlite3 --task-key '<task-key>' --revision-digest '<revision-digest>'
+moodle-autotask-moodle download --token-file .runtime/moodle-token.json --task-key '<task-key>' --attachment-key '<attachment-key>' --output-directory .runtime/downloads
+```
+
+`scan` is at-least-once: it may return the same candidate until its exact task key and revision are
+acknowledged. Downstream notification needs its own idempotent outbox or lease semantics. Download
+selection uses keys returned by `scan`, not URLs. Transfers reject redirects, non-pluginfile URLs,
+unsafe filenames, and size mismatches; the mobile token is appended only after URL validation.
+The default attachment cap is 16 GiB (hard maximum 64 GiB), so plan local disk capacity before
+selecting OVA images; callers may lower the limit but it is always enforced while streaming.

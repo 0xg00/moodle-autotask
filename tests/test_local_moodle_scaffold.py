@@ -433,11 +433,42 @@ def test_fixture_assignment_probe_is_scoped_to_the_asix_course() -> None:
 def test_fixture_state_is_exact_and_partial_fails_closed() -> None:
     script = read(SCRIPT)
     assert "function Get-FixtureState" in script
-    assert "@('absent', 'complete', 'partial')" in script
+    assert "@('absent', 'complete', 'legacy', 'partial')" in script
     assert "$state -eq 'partial'" in script
     assert "$state -eq 'absent'" in script
     assert "$state -ne 'complete'" in script
     assert "-match 'present'" not in script
+
+
+def test_fixture_attachment_probe_distinguishes_safe_legacy_from_partial_bytes() -> None:
+    script = read(SCRIPT)
+    probe = script.split("$attachmentProbe = ", maxsplit=1)[1].split(
+        "$attachmentResult", maxsplit=1
+    )[0]
+    assert "beec33f762521fcc5976c5dd799348d888014d988dd335e91c7e195ed811f11c" in probe
+    assert "(int)`$file->get_filesize() === 76" in probe
+    assert "hash('sha256', `$file->get_content()) === `$hash" in probe
+    assert "`$row->intro === '' || `$row->intro === `$intro" in probe
+    assert "? 'legacy' : 'partial'" in probe
+    assert "`$row->intro === `$intro && `$exactfile" in probe
+    assert "? 'complete' : 'partial'" in probe
+    assert "if ($attachmentState -notin @('complete', 'legacy', 'partial'))" in script
+    assert "$state = $attachmentState" in script
+
+
+def test_fixture_attachment_migration_refuses_existing_or_nonlegacy_fixture() -> None:
+    script = read(SCRIPT)
+    upgrade = script.split("function Ensure-FixtureAttachment", maxsplit=1)[1].split(
+        "function Invoke-MoodleRest", maxsplit=1
+    )[0]
+    assert (
+        "if (`$existing) { throw new moodle_exception('fixture attachment already exists'); }"
+        in upgrade
+    )
+    assert "if (`$row->intro !== '' && `$row->intro !== `$intro)" in upgrade
+    assert "fixture intro is not migratable" in upgrade
+    assert "create_file_from_string" in upgrade
+    assert "if ($state -in @('absent', 'legacy'))" in script
 
 
 def test_cfg_writes_web_services_only_and_mobile_uses_setting_semantics() -> None:

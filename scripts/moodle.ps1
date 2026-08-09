@@ -244,6 +244,36 @@ function Ensure-Directory {
     }
 }
 
+function Protect-RuntimeSecrets {
+    Ensure-Directory -Path $RuntimeRoot
+    Assert-SafeRuntimePaths
+    try {
+        $acl = Get-Acl -LiteralPath $RuntimeRoot
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) {
+            [void]$acl.RemoveAccessRuleAll($rule)
+        }
+        $identities = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+            (New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'),
+            (New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544')
+        )
+        foreach ($identity in $identities) {
+            $access = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $identity,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            [void]$acl.AddAccessRule($access)
+        }
+        Set-Acl -LiteralPath $RuntimeRoot -AclObject $acl
+    } catch {
+        Fail 'Could not apply restrictive ACLs to .runtime; refusing to write Moodle secrets.'
+    }
+}
+
 function Assert-Git {
     $git = Get-Command 'git.exe' -ErrorAction SilentlyContinue
     if ($null -eq $git) {
@@ -697,6 +727,7 @@ function New-LocalPassword {
 
 function Get-LocalSecrets {
     Ensure-Directory -Path $RuntimeRoot
+    Protect-RuntimeSecrets
     if (Test-Path -LiteralPath $SecretsPath -PathType Leaf) {
         return Get-Content -LiteralPath $SecretsPath -Raw | ConvertFrom-Json
     }
@@ -931,10 +962,20 @@ function Enable-MoodleMobileService {
 
 function Get-FixtureState {
     param([Parameter(Mandatory = $true)]$Layout)
+    # The legacy state extends the original @('absent', 'complete', 'partial') core probe.
     $probe = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; `$course = `$DB->get_record('course', array('shortname' => 'ASIX-LAB')); `$user = `$DB->get_record('user', array('username' => 'student1')); `$assignment = `$course ? `$DB->record_exists_sql(`"SELECT 1 FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id AND cm.course = a.course JOIN {modules} m ON m.id = cm.module WHERE a.course = ? AND a.name = ? AND cm.idnumber = ? AND m.name = 'assign'`", array(`$course->id, 'AutoTask assignment', 'autotask-assignment')) : false; `$relatedassignment = `$DB->record_exists_sql(`"SELECT 1 FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE (a.name = ? OR cm.idnumber = ?) AND m.name = 'assign'`", array('AutoTask assignment', 'autotask-assignment')); `$enrolled = (`$course && `$user) ? `$DB->record_exists_sql(`"SELECT 1 FROM {user_enrolments} ue JOIN {enrol} e ON e.id = ue.enrolid JOIN {role_assignments} ra ON ra.userid = ue.userid JOIN {role} r ON r.id = ra.roleid JOIN {context} ctx ON ctx.id = ra.contextid WHERE ue.userid = ? AND e.courseid = ? AND e.enrol = 'manual' AND r.shortname = 'student' AND ctx.contextlevel = ? AND ctx.instanceid = ?`", array(`$user->id, `$course->id, CONTEXT_COURSE, `$course->id)) : false; `$complete = (`$user && `$user->email === 'student1@example.test' && `$course && `$course->fullname === 'ASIX Lab' && `$assignment && `$enrolled); `$any = (`$user || `$course || `$relatedassignment || `$enrolled); echo (`$complete ? 'complete' : (`$any ? 'partial' : 'absent'));"
     $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', $probe)
     $state = ($result -join "`n").Trim()
-    if ($state -notin @('absent', 'complete', 'partial')) {
+    if ($state -eq 'complete') {
+        $attachmentProbe = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; global `$DB; `$intro = 'Read autotask-brief.txt before starting this deterministic local assignment.'; `$hash = 'beec33f762521fcc5976c5dd799348d888014d988dd335e91c7e195ed811f11c'; `$row = `$DB->get_record_sql(`"SELECT a.intro, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.name = ? AND cm.idnumber = ? AND m.name = 'assign'`", array('AutoTask assignment', 'autotask-assignment'), IGNORE_MISSING); if (!`$row) { echo 'partial'; } else { `$context = context_module::instance(`$row->cmid); `$file = get_file_storage()->get_file(`$context->id, 'mod_assign', 'introattachment', 0, '/', 'autotask-brief.txt'); if (!`$file) { echo ((`$row->intro === '' || `$row->intro === `$intro) ? 'legacy' : 'partial'); } else { `$exactfile = (int)`$file->get_filesize() === 76 && hash('sha256', `$file->get_content()) === `$hash; echo ((`$row->intro === `$intro && `$exactfile) ? 'complete' : 'partial'); } }"
+        $attachmentResult = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', $attachmentProbe)
+        $attachmentState = ($attachmentResult -join "`n").Trim()
+        if ($attachmentState -notin @('complete', 'legacy', 'partial')) {
+            Fail 'Could not determine local Moodle fixture attachment state.'
+        }
+        $state = $attachmentState
+    }
+    if ($state -notin @('absent', 'complete', 'legacy', 'partial')) {
         Fail 'Could not determine local Moodle fixture state.'
     }
     return $state
@@ -943,6 +984,8 @@ function Get-FixtureState {
 function Seed-Fixture {
     param([Parameter(Mandatory = $true)]$Layout, [Parameter(Mandatory = $true)]$Secrets)
     $state = Get-FixtureState -Layout $Layout
+    # Older fixture versions report `$state -eq 'legacy' and are upgraded in place.
+    # A pristine install follows the `$state -eq 'absent' creation path.
     if ($state -eq 'partial') {
         Fail 'Local Moodle fixture is partial; refusing to rerun the seed. Run Reset -Force.'
     }
@@ -953,14 +996,27 @@ function Seed-Fixture {
             Fail 'Moodle inline seed did not complete successfully.'
         }
         $state = Get-FixtureState -Layout $Layout
-        if ($state -ne 'complete') {
+        if ($state -notin @('complete', 'legacy')) {
             Fail 'Moodle seed did not produce the complete expected fixture. Run Reset -Force.'
         }
     }
+    if ($state -in @('absent', 'legacy')) {
+        Ensure-FixtureAttachment -Layout $Layout
+    }
+    $state = Get-FixtureState -Layout $Layout
     if ($state -ne 'complete') {
         Fail 'Could not verify complete Moodle fixture state. Run Reset -Force.'
     }
     Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', "$($Layout.CoreCliRoot)/admin/cli/reset_password.php", '--username=student1', "--password=$($Secrets.studentPassword)") | Out-Null
+}
+
+function Ensure-FixtureAttachment {
+    param([Parameter(Mandatory = $true)]$Layout)
+    $upgrade = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; global `$DB; `$row = `$DB->get_record_sql(`"SELECT a.*, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.name = ? AND cm.idnumber = ? AND m.name = 'assign'`", array('AutoTask assignment', 'autotask-assignment'), MUST_EXIST); `$intro = 'Read autotask-brief.txt before starting this deterministic local assignment.'; `$context = context_module::instance(`$row->cmid); `$storage = get_file_storage(); `$existing = `$storage->get_file(`$context->id, 'mod_assign', 'introattachment', 0, '/', 'autotask-brief.txt'); if (`$existing) { throw new moodle_exception('fixture attachment already exists'); } if (`$row->intro !== '' && `$row->intro !== `$intro) { throw new moodle_exception('fixture intro is not migratable'); } if (`$row->intro !== `$intro) { `$row->intro = `$intro; `$row->introformat = FORMAT_HTML; `$row->timemodified = time(); `$DB->update_record('assign', `$row); } `$record = (object)array('contextid' => `$context->id, 'component' => 'mod_assign', 'filearea' => 'introattachment', 'itemid' => 0, 'filepath' => '/', 'filename' => 'autotask-brief.txt', 'userid' => get_admin()->id); `$storage->create_file_from_string(`$record, 'AutoTask local fixture brief.`nUse the Moodle mobile API attachment metadata.'); echo 'fixture-attachment-ready';"
+    $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', $upgrade)
+    if (($result -join "`n").Trim() -ne 'fixture-attachment-ready') {
+        Fail 'Moodle fixture attachment upgrade did not complete successfully.'
+    }
 }
 
 function Invoke-MoodleRest {
@@ -998,6 +1054,7 @@ function Get-MoodleToken {
             continue
         }
         if ($null -ne $response -and ($response.PSObject.Properties.Name -contains 'token')) {
+            Protect-RuntimeSecrets
             Assert-SafeWriteTarget -Path $TokenPath
             [PSCustomObject]@{ token = $response.token; baseUrl = $baseUrl; obtainedAt = (Get-Date).ToUniversalTime().ToString('o') } |
                 ConvertTo-Json | Set-Content -LiteralPath $TokenPath -Encoding UTF8 -NoNewline

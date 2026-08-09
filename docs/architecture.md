@@ -18,6 +18,17 @@ and key before cleanup: a returned handle is torn down, while `None` definitivel
 lab exists and permits cleanup to complete. `TaskSubmitter` accepts an immutable `SubmissionIntent` only after the
 orchestrator validates a matching submit approval bound to that exact intent.
 
-No Moodle, AWS, KVM, Codex CLI, persistence, notification, credential, network, or deployment
-adapter exists in this milestone. Those integrations remain planned and must implement these ports
-without bypassing the approval and lifecycle controls.
+The Moodle adapter is a separate provider boundary and does not alter generic task ports. It uses
+the official mobile REST API only: it verifies `core_webservice_get_site_info`, enumerates
+`mod_assign_get_assignments`, and exposes immutable assignment snapshots. A site URL is trusted
+only after Moodle returns exactly the canonical configured URL and advertises the required mobile
+functions. Task, attachment, and revision identifiers are versioned SHA-256 values; revision input
+uses canonical JSON metadata, never tokens or stateful URLs.
+
+SQLite acknowledgement state is intentionally at-least-once. A scan reports NEW until a task has
+ever been acknowledged, UPDATED for a later revision, and omits the exact acknowledged revision.
+`acknowledge(task_key, revision_digest)` is exact, transactional, and idempotent. A later notifier
+needs its own idempotent outbox/lease semantics to avoid duplicate external notifications.
+
+The connector is read-only: AWS, notification delivery, scheduler execution, password login,
+scraping/browser automation, task execution, and Moodle submission remain outside this milestone.

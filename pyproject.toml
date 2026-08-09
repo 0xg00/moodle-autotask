@@ -12,6 +12,9 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "0xg00" }]
 dependencies = []
 
+[project.scripts]
+moodle-autotask-moodle = "moddle_autotask.adapters.moodle.cli:main"
+
 [project.optional-dependencies]
 dev = ["mypy>=1.10", "pytest>=8.0", "ruff>=0.5"]
 

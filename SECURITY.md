@@ -3,5 +3,10 @@
 This private-development project has no public support channel. Report suspected vulnerabilities
 privately to the maintainers; do not include secrets, credentials, or student data in reports.
 
-The current foundation intentionally has no credential handling or network integrations. Future
-adapters must keep provider credentials outside the domain and agent-runtime contracts.
+The Moodle connector accepts an opaque mobile-service token only from a local JSON token file or
+environment variables. Never pass tokens on a CLI command line, commit `.runtime`, or log token
+files/request URLs. State databases contain acknowledgement keys and revision hashes only.
+
+Use public HTTPS for real Moodle sites. HTTP is intentionally restricted to literal loopback,
+RFC1918, or Tailscale IPv4 endpoints for local development. Downloads reject redirects and URLs
+outside the verified site's exact `pluginfile.php` route.
