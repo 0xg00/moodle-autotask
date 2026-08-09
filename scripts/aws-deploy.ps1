@@ -22,6 +22,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$env:AWS_CLI_FILE_ENCODING = 'UTF-8'
+$env:AWS_CLI_OUTPUT_ENCODING = 'UTF-8'
+$env:AWS_PAGER = ''
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $runtimeRoot = Join-Path $repoRoot '.runtime\aws-deploy'

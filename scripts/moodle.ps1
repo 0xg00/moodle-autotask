@@ -1124,8 +1124,16 @@ function Get-MoodleToken {
         if ($null -ne $response -and ($response.PSObject.Properties.Name -contains 'token')) {
             Protect-RuntimeSecrets
             Assert-SafeWriteTarget -Path $TokenPath
-            [PSCustomObject]@{ token = $response.token; baseUrl = $baseUrl; obtainedAt = (Get-Date).ToUniversalTime().ToString('o') } |
-                ConvertTo-Json | Set-Content -LiteralPath $TokenPath -Encoding UTF8 -NoNewline
+            $tokenJson = [PSCustomObject]@{
+                token = $response.token
+                baseUrl = $baseUrl
+                obtainedAt = (Get-Date).ToUniversalTime().ToString('o')
+            } | ConvertTo-Json
+            [System.IO.File]::WriteAllText(
+                $TokenPath,
+                $tokenJson,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
             return Get-Content -LiteralPath $TokenPath -Raw | ConvertFrom-Json
         }
         if ($null -ne $response -and ($response.PSObject.Properties.Name -contains 'exception' -or $response.PSObject.Properties.Name -contains 'errorcode' -or $response.PSObject.Properties.Name -contains 'error')) {

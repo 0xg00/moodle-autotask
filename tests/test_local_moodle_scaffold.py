@@ -1891,6 +1891,43 @@ def test_smoke_rejects_non_loopback_persisted_token_before_http(tmp_path: Path) 
     assert not marker.exists()
 
 
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is not available",
+)
+def test_moodle_token_is_written_as_utf8_without_bom(tmp_path: Path) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    token_path = tmp_path / "moodle-token.json"
+    prefix = read(SCRIPT).split("\nswitch ($Action) {", maxsplit=1)[0]
+    driver = tmp_path / "token-encoding.ps1"
+    driver.write_text(
+        prefix
+        + f"\n$TokenPath = '{token_path.as_posix()}'\n"
+        + "function Protect-RuntimeSecrets {}\n"
+        + "function Assert-SafeWriteTarget { param([string]$Path) }\n"
+        + "function Invoke-RestMethod { return [PSCustomObject]@{ token = 'opaque' } }\n"
+        + "$layout = [PSCustomObject]@{ EndpointCandidates = @('http://127.0.0.1:8000') }\n"
+        + "$secrets = [PSCustomObject]@{ studentPassword = 'unused' }\n"
+        + "$result = Get-MoodleToken -Layout $layout -Secrets $secrets\n"
+        + "$bytes = [IO.File]::ReadAllBytes($TokenPath)\n"
+        + "if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and "
+        + "$bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { exit 2 }\n"
+        + "if ($result.token -ne 'opaque' -or "
+        + "$result.baseUrl -ne 'http://127.0.0.1:8000') { exit 3 }\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert token_path.read_bytes().startswith(b"{")
+
+
 def test_script_smokes_real_rest_discovery_contract() -> None:
     script = read(SCRIPT)
     for function in (

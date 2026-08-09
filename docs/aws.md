@@ -105,6 +105,7 @@ The secret value must be the complete JSON token file already accepted by the co
 pass a token literal on the command line:
 
 ```powershell
+$env:AWS_CLI_FILE_ENCODING = 'UTF-8'
 aws secretsmanager put-secret-value `
   --secret-id 'moodle-autotask/development/moodle-token' `
   --secret-string file://.runtime/moodle-token.json `

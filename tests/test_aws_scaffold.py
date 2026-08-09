@@ -91,6 +91,11 @@ def test_lab_instance_cannot_read_moodle_secret_or_provision_labs() -> None:
 def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     script = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
 
+    assert "$env:AWS_CLI_FILE_ENCODING = 'UTF-8'" in script
+    assert "$env:AWS_CLI_OUTPUT_ENCODING = 'UTF-8'" in script
+    assert script.index("$env:AWS_CLI_OUTPUT_ENCODING") < script.index(
+        "$script:awsCli = Resolve-AwsCli"
+    )
     assert "status', '--porcelain', '--untracked-files=all" in script
     assert "'pip', 'wheel'" in script
     assert "--no-deps" in script
