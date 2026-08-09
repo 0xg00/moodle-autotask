@@ -190,7 +190,25 @@ moodle-autotask-moodle download --token-file .runtime/moodle-token.json --task-k
 ```
 
 `scan` is at-least-once: it may return the same candidate until its exact task key and revision are
-acknowledged. Downstream notification needs its own idempotent outbox or lease semantics. Download
+acknowledged. The scheduler uses the same state database's durable v2 outbox: run
+`moodle-autotask-scheduler once --token-file .runtime/moodle-token.json --state .runtime/moodle-state.sqlite3 --request-timeout-seconds 60`
+for one immediate scan and drain, or `run` for an immediate cycle followed by a daily cycle
+(`--interval-seconds` defaults to `86400`, range `1` through `604800`). Press `Ctrl+C` to stop `run`
+cleanly. Both scheduler commands require `--token-file`; they never fall back to environment
+credentials. Both commands accept `--lease-seconds` (default `30`, range `6` through `3600`),
+`--batch-size` (default `20`, range `1` through `100`), `--retry-base-seconds` (default `5`, range
+`1` through `3600`), and `--retry-max-seconds` (default `3600`, range from the base through
+`86400`). `--request-timeout-seconds` controls each Moodle transport request (default `15`, range
+`1` through `120`); local Docker Desktop bind mounts can require `60` or `120`. The durable outbox
+has a fixed safety cap of `1000000` delivery attempts per event; it is
+not a command-line setting. A failed scan or delivery
+leaves events recoverable; `run` retries after the bounded retry-base delay, while successful cycles
+wait for the configured interval. Leases renew while a sink call is active; future sinks must return
+within their lease or renew it.
+
+Its only current sink is compact JSON on stdout for development/service logs, not Telegram/email/etc.
+Delivery is at-least-once and consumers deduplicate stable `event_id`; stdout is local transport only
+and neither a notification nor an automatic acknowledgement authorizes execution or submission. Download
 selection uses keys returned by `scan`, not URLs. Transfers reject redirects, non-pluginfile URLs,
 unsafe filenames, and size mismatches; the mobile token is appended only after URL validation.
 The default attachment cap is 16 GiB (hard maximum 64 GiB), so plan local disk capacity before

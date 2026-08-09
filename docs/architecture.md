@@ -28,7 +28,13 @@ uses canonical JSON metadata, never tokens or stateful URLs.
 SQLite acknowledgement state is intentionally at-least-once. A scan reports NEW until a task has
 ever been acknowledged, UPDATED for a later revision, and omits the exact acknowledged revision.
 `acknowledge(task_key, revision_digest)` is exact, transactional, and idempotent. A later notifier
-needs its own idempotent outbox/lease semantics to avoid duplicate external notifications.
+uses schema v2: a same-database durable outbox creates a stable event ID from the exact task and
+revision hashes, leases delivery with renewable ownership, and atomically records successful local
+delivery with the exact acknowledgement. It is honestly at-least-once: a crash after a sink side
+effect can repeat the same event ID, so consumers must deduplicate it. The local JSON stdout sink
+is an observable development/service-log sink, not Telegram/email/etc. Neither successful delivery
+nor manual acknowledgement is authorization to execute or submit work.
 
-The connector is read-only: AWS, notification delivery, scheduler execution, password login,
-scraping/browser automation, task execution, and Moodle submission remain outside this milestone.
+The connector remains read-only: AWS, password login, scraping/browser automation, task execution,
+and Moodle submission remain outside this milestone. The scheduler only performs local notification
+delivery through its stdout development/service-log sink.

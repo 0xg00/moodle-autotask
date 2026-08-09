@@ -6,7 +6,8 @@ Current functionality includes a narrow Moodle mobile-service connector: it veri
 site identity, enumerates assignments and official attachment metadata, records explicit local
 acknowledgements, and safely downloads selected plugin-file attachments. It does not submit work,
 use password login, scrape or automate a browser, provision AWS/KVM labs, invoke Codex, or notify
-anyone.
+anyone. The local scheduler emits compact JSON notification events to stdout as an observable
+development/service-log sink; it is not Telegram, email, or user approval to execute or submit work.
 
 Future adapters must preserve the capability-limited `AgentRuntime`, opaque `LabHandle`,
 idempotency-keyed lab operations, and dual approval checkpoints defined here.
