@@ -76,6 +76,18 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "moodle-agent must not belong to the application secret group" in (
         codex_installer_text
     )
+    assert "if ! command -v bwrap >/dev/null 2>&1; then" in codex_installer_text
+    assert "apt-get install -y --no-install-recommends bubblewrap" in codex_installer_text
+    assert 'bwrap_path="$(command -v bwrap)"' in codex_installer_text
+    assert 'test -x "$bwrap_path"' in codex_installer_text
+    bwrap_install = codex_installer_text.split(
+        "if ! command -v bwrap >/dev/null 2>&1; then", 1
+    )[1].split('bwrap_path="$(command -v bwrap)"', 1)[0]
+    assert "apt-get update" in bwrap_install
+    assert "apt-get install -y --no-install-recommends bubblewrap" in bwrap_install
+    assert codex_installer_text.index('test -x "$bwrap_path"') < codex_installer_text.index(
+        'ln -sfn "$install_target"'
+    )
     assert "--device-auth" in codex_login_text
     assert "User=moodle-agent" in codex_login_text
     assert "ReadWritePaths=/var/lib/moodle-agent" in codex_login_text

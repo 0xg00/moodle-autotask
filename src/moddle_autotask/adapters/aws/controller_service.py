@@ -357,6 +357,13 @@ if [ ! -f "$install_target" ] || \
     "$temporary_directory/$binary_name" "$install_target"
 fi
 echo "$binary_sha256  $install_target" | sha256sum --check --strict
+if ! command -v bwrap >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends bubblewrap
+fi
+bwrap_path="$(command -v bwrap)"
+test -x "$bwrap_path"
 ln -sfn "$install_target" /usr/local/bin/moodle-autotask-codex.next
 mv -Tf /usr/local/bin/moodle-autotask-codex.next \
   /usr/local/bin/moodle-autotask-codex

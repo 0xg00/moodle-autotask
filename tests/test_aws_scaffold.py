@@ -196,3 +196,15 @@ def test_telegram_secret_has_no_terraform_value_and_services_stay_disabled() -> 
     assert "moodle-autotask-telegram run" in cloud_init
     assert "--telegram-config-file" in cloud_init and "--approval-state" in cloud_init
     assert "systemctl enable --now moodle-autotask" not in cloud_init
+
+
+def test_controller_bootstrap_installs_bubblewrap() -> None:
+    cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(
+        encoding="utf-8"
+    )
+
+    assert "apt-get update" in cloud_init
+    assert "apt-get install -y bubblewrap " in cloud_init
+    assert cloud_init.index("apt-get update") < cloud_init.index(
+        "apt-get install -y bubblewrap "
+    )
