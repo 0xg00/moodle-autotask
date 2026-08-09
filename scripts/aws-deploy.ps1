@@ -16,6 +16,12 @@ param(
     [ValidatePattern('^[a-z0-9][a-z0-9-]{1,19}$')]
     [string]$Environment = 'development',
 
+    [ValidateSet('t3.large', 'm6i.large')]
+    [string]$LabInstanceType = 't3.large',
+
+    [ValidateRange(50, 500)]
+    [int]$LabRootVolumeSizeGiB = 80,
+
     [ValidatePattern('^$|^i-[0-9a-f]{8,17}$')]
     [string]$InstanceId = ''
 )
@@ -214,6 +220,8 @@ if ($Action -eq 'Status') {
         'printf "scheduler-active="; systemctl is-active moodle-autotask-scheduler.service 2>/dev/null || true',
         'printf "telegram-enabled="; systemctl is-enabled moodle-autotask-telegram.service 2>/dev/null || true',
         'printf "telegram-active="; systemctl is-active moodle-autotask-telegram.service 2>/dev/null || true',
+        'printf "worker-enabled="; systemctl is-enabled moodle-autotask-worker.service 2>/dev/null || true',
+        'printf "worker-active="; systemctl is-active moodle-autotask-worker.service 2>/dev/null || true',
         'printf "current-release="; readlink /opt/moodle-autotask/current 2>/dev/null || true'
     )
     exit 0
@@ -224,13 +232,15 @@ if ($Action -eq 'Activate') {
         'set -eu',
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-scheduler',
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-telegram',
+        'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-worker',
         'test -x /usr/local/sbin/moodle-autotask-refresh-config',
         '/usr/local/sbin/moodle-autotask-refresh-config',
         'systemctl daemon-reload',
-        'if ! systemctl enable moodle-autotask-scheduler.service moodle-autotask-telegram.service; then systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service || true; exit 1; fi',
-        'if ! systemctl start moodle-autotask-scheduler.service moodle-autotask-telegram.service; then systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service || true; systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service || true; exit 1; fi',
+        'if ! systemctl enable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service; then systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true; exit 1; fi',
+        'if ! systemctl start moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service; then systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true; systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true; exit 1; fi',
         'systemctl is-active --quiet moodle-autotask-scheduler.service',
         'systemctl is-active --quiet moodle-autotask-telegram.service',
+        'systemctl is-active --quiet moodle-autotask-worker.service',
         "echo 'activated-environment=$Environment'"
     )
     exit 0
@@ -239,8 +249,8 @@ if ($Action -eq 'Activate') {
 if ($Action -eq 'Deactivate') {
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Deactivate application services' -Commands @(
         'set -eu',
-        'systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service || true',
-        'systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service || true',
+        'systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true',
+        'systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true',
         'echo services-deactivated'
     )
     exit 0
@@ -259,6 +269,71 @@ $commitSha = (
 if ($commitSha -notmatch '^[0-9a-f]{40}$') {
     throw 'Git returned an invalid commit SHA.'
 }
+
+$namePrefix = "moodle-autotask-$Environment"
+$labSubnetResponse = Invoke-Aws -Arguments @(
+    'ec2', 'describe-subnets', '--filters',
+    "Name=tag:Name,Values=$namePrefix-lab", 'Name=state,Values=available',
+    '--query', 'Subnets[].SubnetId', '--output', 'json'
+)
+$labSubnetIds = @($labSubnetResponse | ConvertFrom-Json)
+if ($labSubnetIds.Count -ne 1 -or $labSubnetIds[0] -notmatch '^subnet-[0-9a-f]{8,17}$') {
+    throw 'Expected exactly one Moodle Autotask lab subnet.'
+}
+$labSecurityGroupResponse = Invoke-Aws -Arguments @(
+    'ec2', 'describe-security-groups', '--filters',
+    "Name=tag:Name,Values=$namePrefix-lab", '--query', 'SecurityGroups[].GroupId',
+    '--output', 'json'
+)
+$labSecurityGroupIds = @($labSecurityGroupResponse | ConvertFrom-Json)
+if (
+    $labSecurityGroupIds.Count -ne 1 -or
+    $labSecurityGroupIds[0] -notmatch '^sg-[0-9a-f]{8,17}$'
+) {
+    throw 'Expected exactly one Moodle Autotask lab security group.'
+}
+$labRoleArn = (
+    Invoke-Aws -Arguments @(
+        'iam', 'get-role', '--role-name', "$namePrefix-lab-provisioner",
+        '--query', 'Role.Arn', '--output', 'text'
+    )
+).Trim()
+if ($labRoleArn -notmatch '^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$') {
+    throw 'AWS returned an invalid lab provisioner role ARN.'
+}
+$labPolicyResponse = Invoke-Aws -Arguments @(
+    'iam', 'get-role-policy', '--role-name', "$namePrefix-lab-provisioner",
+    '--policy-name', "$namePrefix-lab-provisioner", '--query', 'PolicyDocument',
+    '--output', 'json'
+)
+$labPolicy = $labPolicyResponse | ConvertFrom-Json
+$approvedImageIds = @()
+foreach ($statement in @($labPolicy.Statement)) {
+    if ($statement.Sid -ne 'UseApprovedLaunchResources') {
+        continue
+    }
+    foreach ($resource in @($statement.Resource)) {
+        if ($resource -match ":ec2:${Region}::image/(ami-[0-9a-f]{8,17})$") {
+            $approvedImageIds += $Matches[1]
+        }
+    }
+}
+if ($approvedImageIds.Count -ne 1) {
+    throw 'Expected exactly one approved Windows AMI in the lab provisioner policy.'
+}
+$labImageId = [string]$approvedImageIds[0]
+$labInstanceProfileName = "$namePrefix-lab"
+$profileName = (
+    Invoke-Aws -Arguments @(
+        'iam', 'get-instance-profile', '--instance-profile-name', $labInstanceProfileName,
+        '--query', 'InstanceProfile.InstanceProfileName', '--output', 'text'
+    )
+).Trim()
+if ($profileName -ne $labInstanceProfileName) {
+    throw 'AWS returned an unexpected lab instance profile.'
+}
+$labSubnetId = [string]$labSubnetIds[0]
+$labSecurityGroupId = [string]$labSecurityGroupIds[0]
 
 $wheelRoot = Join-Path $runtimeRoot $commitSha
 if (-not (Test-Path -LiteralPath $wheelRoot)) {
@@ -295,14 +370,17 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     "'$releaseRoot/venv/bin/pip' install --disable-pip-version-check --no-deps '$remoteWheel'",
     "'$releaseRoot/venv/bin/moodle-autotask-scheduler' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-telegram' --help >/dev/null",
+    "'$releaseRoot/venv/bin/moodle-autotask-worker' --help >/dev/null",
     'scheduler_was_active=false; if systemctl is-active --quiet moodle-autotask-scheduler.service; then scheduler_was_active=true; systemctl stop moodle-autotask-scheduler.service; fi',
     'telegram_was_active=false; if systemctl is-active --quiet moodle-autotask-telegram.service; then telegram_was_active=true; systemctl stop moodle-autotask-telegram.service; fi',
+    'worker_was_active=false; if systemctl is-active --quiet moodle-autotask-worker.service; then worker_was_active=true; systemctl stop moodle-autotask-worker.service; fi',
     "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
     'mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current',
-    "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment'",
+    "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment' --provisioner-role-arn '$labRoleArn' --subnet-id '$labSubnetId' --security-group-id '$labSecurityGroupId' --instance-profile-name '$labInstanceProfileName' --image-id '$labImageId' --instance-type '$LabInstanceType' --root-volume-size-gib '$LabRootVolumeSizeGiB'",
     'systemctl daemon-reload',
     'if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service; fi',
     'if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service; fi',
+    'if [ "$worker_was_active" = true ]; then systemctl start moodle-autotask-worker.service; fi',
     "rm -f '$remoteWheel'",
     "echo 'deployed-commit=$commitSha'",
     "echo 'deployed-sha256=$wheelDigest'"

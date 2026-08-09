@@ -14,9 +14,6 @@ from typing import Protocol, cast
 from moddle_autotask.domain.models import LabHandle, LabProvisionRequest
 from moddle_autotask.ports.contracts import LabReadiness
 
-_APPROVED_AMI_PARAMETER = (
-    "/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base"
-)
 _APPROVED_INSTANCE_TYPES = frozenset({"t3.large", "m6i.large"})
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 _REGION_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-[0-9]$")
@@ -26,6 +23,7 @@ _ROLE_ARN_PATTERN = re.compile(
 _SUBNET_PATTERN = re.compile(r"^subnet-[0-9a-f]{8,17}$")
 _SECURITY_GROUP_PATTERN = re.compile(r"^sg-[0-9a-f]{8,17}$")
 _INSTANCE_PATTERN = re.compile(r"^i-[0-9a-f]{8,17}$")
+_IMAGE_PATTERN = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -52,16 +50,19 @@ class AwsCliJsonRunner:
             environment.pop("AWS_PROFILE", None)
             environment.pop("AWS_DEFAULT_PROFILE", None)
             environment.update(extra_environment)
-        completed = subprocess.run(
-            [self.executable, *arguments, "--no-cli-pager", "--output", "json"],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            timeout=self.timeout_seconds,
-            env=environment,
-        )
+        try:
+            completed = subprocess.run(
+                [self.executable, *arguments, "--no-cli-pager", "--output", "json"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=self.timeout_seconds,
+                env=environment,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AwsLabError("AWS CLI operation timed out") from error
         if completed.returncode != 0:
             raise AwsLabError(f"AWS CLI operation failed with exit code {completed.returncode}")
         try:
@@ -77,9 +78,9 @@ class AwsLabConfig:
     subnet_id: str
     security_group_id: str
     instance_profile_name: str
+    image_id: str
     project_name: str = "moodle-autotask"
     environment: str = "development"
-    image_parameter: str = _APPROVED_AMI_PARAMETER
     instance_type: str = "t3.large"
     root_volume_size_gib: int = 80
 
@@ -99,14 +100,13 @@ class AwsLabConfig:
                 _ID_PATTERN.fullmatch(self.instance_profile_name),
                 "invalid lab instance profile name",
             ),
+            (_IMAGE_PATTERN.fullmatch(self.image_id), "invalid approved image ID"),
             (_ID_PATTERN.fullmatch(self.project_name), "invalid project name"),
             (_ID_PATTERN.fullmatch(self.environment), "invalid environment name"),
         )
         for result, message in checks:
             if result is None:
                 raise ValueError(message)
-        if self.image_parameter != _APPROVED_AMI_PARAMETER:
-            raise ValueError("image parameter is not approved")
         if self.instance_type not in _APPROVED_INSTANCE_TYPES:
             raise ValueError("instance type is not approved")
         if not 50 <= self.root_volume_size_gib <= 500:
@@ -141,7 +141,7 @@ class AwsEc2LabProvider:
             return existing
 
         session = self._assume_role(provision_key)
-        image_id = self._resolve_image(session)
+        image_id = self._config.image_id
         tags = self._tags(request, provision_key)
         tag_specifications = json.dumps(
             [
@@ -325,21 +325,6 @@ class AwsEc2LabProvider:
             secret_access_key=self._required_string(credentials, "SecretAccessKey"),
             session_token=self._required_string(credentials, "SessionToken"),
         )
-
-    def _resolve_image(self, session: _Session) -> str:
-        response = self._aws(
-            session,
-            "ssm",
-            "get-parameter",
-            "--region",
-            self._config.region,
-            "--name",
-            self._config.image_parameter,
-        )
-        image_id = self._required_string(self._mapping_field(response, "Parameter"), "Value")
-        if re.fullmatch(r"ami-[0-9a-f]{8,17}", image_id) is None:
-            raise AwsLabError("approved image parameter returned an invalid AMI ID")
-        return image_id
 
     def _aws(self, session: _Session, *arguments: str) -> object:
         return self._runner.run_json(tuple(arguments), extra_environment=session.environment())

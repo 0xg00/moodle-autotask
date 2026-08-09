@@ -9,10 +9,23 @@ from pathlib import Path
 import pytest
 
 from moddle_autotask.adapters.aws.controller_service import (
+    ControllerLabConfig,
     ControllerServiceError,
     install_controller_services,
     main,
 )
+
+
+def _lab_config() -> ControllerLabConfig:
+    return ControllerLabConfig(
+        "arn:aws:iam::123456789012:role/moodle-autotask-development-lab-provisioner",
+        "subnet-0123456789abcdef0",
+        "sg-0123456789abcdef0",
+        "moodle-autotask-development-lab",
+        "ami-0123456789abcdef0",
+        "t3.large",
+        80,
+    )
 
 
 def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: Path) -> None:
@@ -60,6 +73,23 @@ def test_installer_is_idempotent_and_replaces_only_regular_targets(tmp_path: Pat
     install_controller_services(tmp_path, "eu-south-2", "development")
     assert scheduler.read_bytes() == original
     assert not tuple(scheduler.parent.glob(".moodle-autotask-*.service.*"))
+
+
+def test_installer_writes_hardened_worker_with_fixed_lab_configuration(
+    tmp_path: Path,
+) -> None:
+    install_controller_services(tmp_path, "eu-south-2", "development", _lab_config())
+    worker = tmp_path / "etc/systemd/system/moodle-autotask-worker.service"
+    text = worker.read_text(encoding="utf-8")
+    assert "moodle-autotask-worker run" in text
+    assert "--state /var/lib/moodle-autotask/approval.sqlite3" in text
+    assert "--provisioner-role-arn arn:aws:iam::123456789012:role/" in text
+    assert "--subnet-id subnet-0123456789abcdef0" in text
+    assert "--security-group-id sg-0123456789abcdef0" in text
+    assert "--instance-profile-name moodle-autotask-development-lab" in text
+    assert "--image-id ami-0123456789abcdef0" in text
+    assert "NoNewPrivileges=true" in text and "ProtectSystem=strict" in text
+    assert "ExecStartPre=" not in text
 
 
 def test_installer_rejects_symlink_target(tmp_path: Path) -> None:

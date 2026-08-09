@@ -93,11 +93,14 @@ size. Obtain the exact adapter configuration after apply:
 terraform -chdir=infra/aws/controller output -json
 ```
 
-`AwsEc2LabProvider` uses those outputs and the AWS CLI already installed on the controller. It
-assumes the lab provisioner for one hour, uses the request-derived SHA-256 as the EC2 client token,
-and verifies EC2 ownership tags plus Systems Manager readiness. There is no RDP listener. A future
-agent runtime will use audited Systems Manager commands after the existing start-work approval; the
-provider alone does not execute practice instructions.
+`AwsEc2LabProvider` uses the fixed launch values installed with the service and the AWS CLI already
+on the controller. Deployment reads the exact AMI authorized by the inline provisioner policy, so a
+moving public `latest` parameter cannot diverge from IAM. The provider assumes the lab provisioner
+for one hour, uses the request-derived SHA-256 as the EC2 client token,
+and verifies EC2 ownership tags plus Systems Manager readiness. There is no RDP listener. The
+approved-work service now calls this provider only after the exact Telegram approval, limits active
+non-central work to one lab, and tears a ready lab down after two hours. A future agent runtime will
+use audited Systems Manager commands; provisioning alone does not execute practice instructions.
 
 ## Store runtime secret values
 
@@ -131,7 +134,7 @@ aws secretsmanager put-secret-value `
 
 The controller role can read exactly these two secret ARNs. Terraform does not receive either value.
 
-The scheduler and outbound Telegram poller services are installed but remain disabled until a
+The scheduler, outbound Telegram poller, and approved-work services are installed but remain disabled until a
 reviewed application artifact and both valid secret values exist. This prevents a half-installed
 controller from polling Moodle or Telegram. The bootstrap pins AWS CLI v2 and verifies its archive
 against the committed SHA-256 before installation.
@@ -153,14 +156,14 @@ updates `/opt/moodle-autotask/current`. `Deploy` never enables either service:
 ```
 
 After both secret values exist, activation first refreshes and validates them, then enables and
-starts both units together. Any start failure stops and disables both. Deactivation is explicit:
+starts all three units together. Any start failure stops and disables all three. Deactivation is explicit:
 
 ```powershell
 .\scripts\aws-deploy.ps1 -Action Activate -AccountId '<AWS_ACCOUNT_ID>' -Profile 'moodle-autotask'
 .\scripts\aws-deploy.ps1 -Action Deactivate -AccountId '<AWS_ACCOUNT_ID>' -Profile 'moodle-autotask'
 ```
 
-Both units use outbound HTTPS only, run as the unprivileged `moodle-autotask` account, and share the
+All three units use outbound connections only, run as the unprivileged `moodle-autotask` account, and share the
 approval SQLite database. The root-only pre-start refresher serializes concurrent refreshes, validates
 both JSON shapes, writes mode-`0600` files atomically, and never places secret values on a command line.
 
@@ -183,7 +186,8 @@ aws ec2 describe-instances `
   --profile moodle-autotask
 ```
 
-Do not manually call `run-instances`. Telegram start decisions are now persisted for an exact Moodle
-revision, but no process consumes them to call this provider. The next application milestone wires
-that approved record to a durable workflow and adds audited Systems Manager execution and mandatory
-teardown.
+Do not manually call `run-instances`. Telegram start decisions are persisted for an exact Moodle
+revision and consumed through a transactional lease. Retries reuse the same EC2 client token; the
+worker waits for Systems Manager and schedules mandatory teardown after two hours. The next
+application milestone transfers the task inputs and runs the selected agent mode through audited
+Systems Manager commands.

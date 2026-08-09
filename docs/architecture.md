@@ -37,10 +37,14 @@ tokens across delivery retries, accepts decisions only from one configured user 
 `pending`, `approved`, or `ignored` against the exact task and revision in a separate SQLite state.
 Its durable update cursor makes callbacks idempotent across process restarts. Neither successful
 delivery nor manual acknowledgement is authorization to execute or submit work. A Telegram
-`approved` decision is durable input for the future execution workflow, not a direct cloud action.
+`approved` decision atomically creates a durable work item for the exact stored event. A leased
+worker deterministically selects `central`, `hybrid`, or `in_guest`. Non-central work calls the
+capability-limited AWS lab provider with a stable SHA-256 idempotency key, waits for EC2 plus SSM,
+and records the opaque handle. Only one non-central lab may be active; leases recover after crashes
+without changing the EC2 client token. Ready labs become cleanup work after two hours.
 
 The connector remains read-only: password login, scraping/browser automation, task execution, and
-Moodle submission remain outside this milestone. Telegram uses long polling over outbound HTTPS;
+Moodle submission and agent execution remain outside this milestone. Telegram uses long polling over outbound HTTPS;
 the controller exposes no webhook or inbound port. Bot credentials are read only from a protected
 file and never accepted as a command-line value or placed in callback data.
 

@@ -106,6 +106,17 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "'file://' + $parametersPath.Replace" in script
     assert "moodle-autotask-scheduler.service" in script
     assert "moodle-autotask-telegram.service" in script
+    assert "moodle-autotask-worker.service" in script
+    assert "moodle-autotask-worker' --help" in script
+    assert "'ec2', 'describe-subnets'" in script
+    assert "'ec2', 'describe-security-groups'" in script
+    assert "'iam', 'get-role'" in script
+    assert "'iam', 'get-role-policy'" in script
+    assert "'iam', 'get-instance-profile'" in script
+    assert "--provisioner-role-arn '$labRoleArn'" in script
+    assert "--subnet-id '$labSubnetId'" in script
+    assert "--security-group-id '$labSecurityGroupId'" in script
+    assert "--image-id '$labImageId'" in script
     assert "moodle-autotask-controller' install" in script
     assert "ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate')" in script
     deploy_commands = script.split("$gitStatus =", 1)[1]
@@ -118,6 +129,7 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     )
     assert "systemctl stop moodle-autotask-scheduler.service" in activation
     assert "systemctl disable moodle-autotask-scheduler.service" in activation
+    assert "systemctl is-active --quiet moodle-autotask-worker.service" in activation
     assert "--secret-string" not in script
 
 

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
-from moddle_autotask.adapters.aws.labs import AwsEc2LabProvider, AwsLabConfig, AwsLabError
+from moddle_autotask.adapters.aws.labs import (
+    AwsCliJsonRunner,
+    AwsEc2LabProvider,
+    AwsLabConfig,
+    AwsLabError,
+)
 from moddle_autotask.domain.models import (
     Digest,
     ExecutionMode,
@@ -109,6 +116,7 @@ def _config(**changes: object) -> AwsLabConfig:
         "subnet_id": "subnet-0123456789abcdef0",
         "security_group_id": "sg-0123456789abcdef0",
         "instance_profile_name": "moodle-autotask-development-lab",
+        "image_id": "ami-0123456789abcdef0",
     }
     values.update(changes)
     return AwsLabConfig(**values)  # type: ignore[arg-type]
@@ -131,7 +139,7 @@ def _request(*, task_id: str = "course:assignment:1") -> LabProvisionRequest:
         ("subnet_id", "subnet-user-controlled"),
         ("security_group_id", "sg-user-controlled"),
         ("instance_profile_name", "../../admin"),
-        ("image_parameter", "/attacker/ami"),
+        ("image_id", "ami-attacker-controlled"),
         ("instance_type", "p5.48xlarge"),
         ("root_volume_size_gib", 501),
     ],
@@ -152,6 +160,7 @@ def test_provision_uses_fixed_profile_hashed_identity_and_imdsv2() -> None:
         call for call in runner.calls if call[0][:2] == ("ec2", "run-instances")
     )
     assert run_call[run_call.index("--image-id") + 1] == "ami-0123456789abcdef0"
+    assert not any(call[0][:2] == ("ssm", "get-parameter") for call in runner.calls)
     assert run_call[run_call.index("--instance-type") + 1] == "t3.large"
     assert run_call[run_call.index("--subnet-id") + 1] == "subnet-0123456789abcdef0"
     assert run_call[run_call.index("--security-group-ids") + 1] == "sg-0123456789abcdef0"
@@ -259,3 +268,16 @@ def test_blank_idempotency_key_is_rejected_before_aws() -> None:
         provider.provision(_request(), idempotency_key=" ")
 
     assert runner.calls == []
+
+
+def test_cli_timeout_is_reported_without_command_or_environment_details() -> None:
+    with patch(
+        "moddle_autotask.adapters.aws.labs.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(["aws", "operation"], 1),
+    ):
+        with pytest.raises(AwsLabError, match="timed out") as captured:
+            AwsCliJsonRunner(timeout_seconds=1).run_json(
+                ("service", "operation"),
+                extra_environment={"AWS_SESSION_TOKEN": "SENTINEL_SECRET"},
+            )
+    assert "SENTINEL_SECRET" not in str(captured.value)

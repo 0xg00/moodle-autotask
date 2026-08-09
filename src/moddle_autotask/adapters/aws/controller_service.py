@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Never, cast
 
@@ -23,13 +24,29 @@ _ENVIRONMENT = re.compile(r"^[a-z0-9][a-z0-9-]{1,19}$")
 _PROJECT = "moodle-autotask"
 
 
+@dataclass(frozen=True, slots=True)
+class ControllerLabConfig:
+    provisioner_role_arn: str
+    subnet_id: str
+    security_group_id: str
+    instance_profile_name: str
+    image_id: str
+    instance_type: str
+    root_volume_size_gib: int
+
+
 class _SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> Never:
         del message
         self.exit(2, f"{self.prog}: error: invalid command arguments\n")
 
 
-def install_controller_services(root: Path, region: str, environment: str) -> None:
+def install_controller_services(
+    root: Path,
+    region: str,
+    environment: str,
+    lab_config: ControllerLabConfig | None = None,
+) -> None:
     if not isinstance(root, Path) or not root.is_absolute():
         raise ControllerServiceError("controller root is invalid")
     if not isinstance(region, str) or not _REGION.fullmatch(region):
@@ -47,6 +64,14 @@ def install_controller_services(root: Path, region: str, environment: str) -> No
         scheduler,
         0o644,
     )
+    if lab_config is not None:
+        worker = _worker_unit(region, environment, lab_config)
+        _write(
+            root,
+            Path("etc/systemd/system/moodle-autotask-worker.service"),
+            worker,
+            0o644,
+        )
     _write(
         root,
         Path("etc/systemd/system/moodle-autotask-telegram.service"),
@@ -60,6 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("install", nargs="?")
     parser.add_argument("--region", required=True)
     parser.add_argument("--environment", default="development")
+    parser.add_argument("--provisioner-role-arn", required=True)
+    parser.add_argument("--subnet-id", required=True)
+    parser.add_argument("--security-group-id", required=True)
+    parser.add_argument("--instance-profile-name", required=True)
+    parser.add_argument("--image-id", required=True)
+    parser.add_argument("--instance-type", default="t3.large")
+    parser.add_argument("--root-volume-size-gib", type=int, default=80)
     args = parser.parse_args(argv)
     if args.install != "install":
         parser.error("install command is required")
@@ -67,7 +99,16 @@ def main(argv: list[str] | None = None) -> int:
         effective_user_id = cast(Callable[[], int], getattr(os, "geteuid", lambda: -1))
         if os.name == "nt" or effective_user_id() != 0:
             raise ControllerServiceError("controller installation requires root on POSIX")
-        install_controller_services(Path("/"), args.region, args.environment)
+        config = ControllerLabConfig(
+            args.provisioner_role_arn,
+            args.subnet_id,
+            args.security_group_id,
+            args.instance_profile_name,
+            args.image_id,
+            args.instance_type,
+            args.root_volume_size_gib,
+        )
+        install_controller_services(Path("/"), args.region, args.environment, config)
         return 0
     except (OSError, RuntimeError, ValueError):
         print("controller service installation failed", file=sys.stderr)
@@ -285,6 +326,74 @@ def _telegram_unit() -> str:
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
             "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock",
+            "RestrictSUIDSGID=true",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        )
+    )
+
+
+def _worker_unit(
+    region: str, environment: str, config: ControllerLabConfig
+) -> str:
+    values = (
+        region,
+        environment,
+        config.provisioner_role_arn,
+        config.subnet_id,
+        config.security_group_id,
+        config.instance_profile_name,
+        config.image_id,
+        config.instance_type,
+    )
+    if any("\n" in value or "\r" in value or not value for value in values):
+        raise ControllerServiceError("worker configuration is invalid")
+    if not 50 <= config.root_volume_size_gib <= 500:
+        raise ControllerServiceError("worker volume size is invalid")
+    command = " ".join(
+        (
+            "/opt/moodle-autotask/current/venv/bin/moodle-autotask-worker",
+            "run",
+            "--state /var/lib/moodle-autotask/approval.sqlite3",
+            f"--region {shlex.quote(region)}",
+            f"--environment {shlex.quote(environment)}",
+            f"--provisioner-role-arn {shlex.quote(config.provisioner_role_arn)}",
+            f"--subnet-id {shlex.quote(config.subnet_id)}",
+            f"--security-group-id {shlex.quote(config.security_group_id)}",
+            f"--instance-profile-name {shlex.quote(config.instance_profile_name)}",
+            f"--image-id {shlex.quote(config.image_id)}",
+            f"--instance-type {shlex.quote(config.instance_type)}",
+            f"--root-volume-size-gib {config.root_volume_size_gib}",
+            "--interval-seconds 15",
+        )
+    )
+    return "\n".join(
+        (
+            "[Unit]",
+            "Description=Moodle Autotask approved-work lab worker",
+            "Wants=network-online.target",
+            "After=network-online.target moodle-autotask-telegram.service",
+            "",
+            "[Service]",
+            "Type=simple",
+            "User=moodle-autotask",
+            "Group=moodle-autotask",
+            "WorkingDirectory=/var/lib/moodle-autotask",
+            f"ExecStart={command}",
+            "Restart=on-failure",
+            "RestartSec=30",
+            "UMask=0077",
+            "NoNewPrivileges=true",
+            "PrivateDevices=true",
+            "PrivateTmp=true",
+            "ProtectControlGroups=true",
+            "ProtectHome=true",
+            "ProtectKernelModules=true",
+            "ProtectKernelTunables=true",
+            "ProtectSystem=strict",
+            "ReadWritePaths=/var/lib/moodle-autotask",
             "RestrictSUIDSGID=true",
             "",
             "[Install]",
