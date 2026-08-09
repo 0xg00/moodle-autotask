@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate', 'CodexLogin')]
+    [ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate', 'CodexLogin', 'CodexSmoke')]
     [string]$Action = 'Deploy',
 
     [Parameter(Mandatory)]
@@ -242,6 +242,22 @@ if ($Action -eq 'CodexLogin') {
         'invocation_id="$(systemctl show moodle-autotask-codex-login.service --property=InvocationID --value)"',
         'test "$invocation_id" != ""',
         'journalctl "_SYSTEMD_INVOCATION_ID=$invocation_id" --no-pager --output=cat'
+    )
+    exit 0
+}
+
+if ($Action -eq 'CodexSmoke') {
+    Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Verify isolated Codex authentication' -Commands @(
+        'set -eu',
+        'test "$(stat -c ''%U:%G:%a'' /var/lib/moodle-agent/.codex/auth.json)" = "moodle-agent:moodle-agent:600"',
+        '! id -nG moodle-agent | tr '' '' ''\n'' | grep -Fxq moodle-autotask',
+        'if runuser -u moodle-agent -- test -r /etc/moodle-autotask/moodle-token.json; then echo secret-boundary-failed; exit 1; fi',
+        'install -d -o moodle-agent -g moodle-agent -m 0700 /var/lib/moodle-agent/smoke',
+        'result="$(timeout 120s runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex exec --ephemeral --sandbox read-only --skip-git-repo-check --color never -C /var/lib/moodle-agent/smoke ''Reply with exactly: CODEX_SMOKE_OK'')"',
+        'test "$result" = "CODEX_SMOKE_OK"',
+        'echo codex-smoke=ok',
+        'echo auth-permissions=private',
+        'echo application-secrets=unreadable'
     )
     exit 0
 }

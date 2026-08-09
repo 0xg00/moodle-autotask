@@ -191,6 +191,16 @@ change, or a refresh failure. Never copy, print, commit, or place `auth.json` in
 `-Action Status` reports only `authenticated` or `unauthenticated`; it never returns tokens. The login
 unit is transient and cannot read the Moodle or Telegram secret directory.
 
+After linking, run the read-only live smoke test. It checks the cache ownership and mode, proves that
+`moodle-agent` cannot read the Moodle token, and makes one ephemeral Codex request:
+
+```powershell
+.\scripts\aws-deploy.ps1 `
+  -Action CodexSmoke `
+  -AccountId '<AWS_ACCOUNT_ID>' `
+  -Profile 'moodle-autotask'
+```
+
 ## Verify operations
 
 Wait until the instance appears as `Online` in Systems Manager, then use the output command:
