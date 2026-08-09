@@ -38,6 +38,9 @@ and [security policy](SECURITY.md).
 The development-only Moodle integration stack is documented in
 [docs/local-moodle.md](docs/local-moodle.md). It uses pinned official Moodle sources, PostgreSQL,
 and binds HTTP to `127.0.0.1:8000` by default, with an explicit validated private/Tailscale opt-in.
+Its deterministic fictitious ASIX catalog provides 12 assignments, varied deadlines, and safe
+sample attachments including a metadata-only `.ova`; development does not depend on active tasks
+or credentials from a real school Moodle.
 
 The connector uses Moodle's official mobile REST API, not scraping. It deliberately provides
 at-least-once candidates: acknowledge only after downstream delivery succeeds.

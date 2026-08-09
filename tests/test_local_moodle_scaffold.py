@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "moodle.ps1"
 VERSIONS = ROOT / "infra" / "moodle" / "versions.psd1"
 DOCS = ROOT / "docs" / "local-moodle.md"
+FIXTURE = ROOT / "infra" / "moodle" / "fixture.php"
 
 
 def read(path: Path) -> str:
@@ -35,7 +36,15 @@ def test_source_pins_are_exact() -> None:
 
 def test_script_has_required_actions_and_strict_mode() -> None:
     script = read(SCRIPT)
-    for action in ("Bootstrap", "Up", "Down", "Status", "Smoke", "Reset"):
+    for action in (
+        "Bootstrap",
+        "Up",
+        "Down",
+        "Status",
+        "Smoke",
+        "AdvanceFixture",
+        "Reset",
+    ):
         assert f"'{action}'" in script
     assert "Set-StrictMode -Version Latest" in script
     assert "$ErrorActionPreference = 'Stop'" in script
@@ -433,7 +442,7 @@ def test_fixture_assignment_probe_is_scoped_to_the_asix_course() -> None:
 def test_fixture_state_is_exact_and_partial_fails_closed() -> None:
     script = read(SCRIPT)
     assert "function Get-FixtureState" in script
-    assert "@('absent', 'complete', 'legacy', 'partial')" in script
+    assert "@('absent', 'complete', 'legacy', 'lost', 'partial')" in script
     assert "$state -eq 'partial'" in script
     assert "$state -eq 'absent'" in script
     assert "$state -ne 'complete'" in script
@@ -447,12 +456,14 @@ def test_fixture_attachment_probe_distinguishes_safe_legacy_from_partial_bytes()
     )[0]
     assert "beec33f762521fcc5976c5dd799348d888014d988dd335e91c7e195ed811f11c" in probe
     assert "(int)`$file->get_filesize() === 76" in probe
-    assert "hash('sha256', `$file->get_content()) === `$hash" in probe
+    assert "`$file->get_contenthash() === `$contenthash" in probe
+    assert "hash('sha256', `$content) === `$hash" in probe
     assert "`$row->intro === '' || `$row->intro === `$intro" in probe
     assert "? 'legacy' : 'partial'" in probe
-    assert "`$row->intro === `$intro && `$exactfile" in probe
-    assert "? 'complete' : 'partial'" in probe
-    assert "if ($attachmentState -notin @('complete', 'legacy', 'partial'))" in script
+    assert "`$row->intro === `$intro && `$exactmetadata" in probe
+    assert "(`$content === '' || `$content === false)" in probe
+    assert "echo 'lost'" in probe
+    assert "if ($attachmentState -notin @('complete', 'legacy', 'lost', 'partial'))" in script
     assert "$state = $attachmentState" in script
 
 
@@ -461,14 +472,151 @@ def test_fixture_attachment_migration_refuses_existing_or_nonlegacy_fixture() ->
     upgrade = script.split("function Ensure-FixtureAttachment", maxsplit=1)[1].split(
         "function Invoke-MoodleRest", maxsplit=1
     )[0]
-    assert (
-        "if (`$existing) { throw new moodle_exception('fixture attachment already exists'); }"
-        in upgrade
-    )
+    assert "`$repairable = (int)`$existing->get_filesize() === 76" in upgrade
+    assert "`$existing->get_contenthash() === `$contenthash" in upgrade
+    assert "(`$content === '' || `$content === false)" in upgrade
+    assert "if (!`$repairable)" in upgrade
+    assert "fixture attachment already exists" in upgrade
+    assert upgrade.index("if (!`$repairable)") < upgrade.index("`$existing->delete()")
     assert "if (`$row->intro !== '' && `$row->intro !== `$intro)" in upgrade
     assert "fixture intro is not migratable" in upgrade
     assert "create_file_from_string" in upgrade
-    assert "if ($state -in @('absent', 'legacy'))" in script
+    assert "if ($state -in @('absent', 'legacy', 'lost'))" in script
+
+
+def test_rich_fixture_models_the_public_asix_catalog_with_fictitious_data() -> None:
+    fixture = read(FIXTURE)
+    course_block = fixture.split("function fixture_courses(): array", maxsplit=1)[1].split(
+        "function fixture_assignments(): array", maxsplit=1
+    )[0]
+    assignment_block = fixture.split(
+        "function fixture_assignments(): array", maxsplit=1
+    )[1].split("function fixture_footprint_exists(): bool", maxsplit=1)[0]
+    courses = re.findall(r"'(ASIX[12]-[A-Z0-9-]+)'\s*=>", course_block)
+    assignment_ids = re.findall(
+        r"'idnumber'\s*=>\s*'(autotask-rich-[a-z0-9-]+)'", assignment_block
+    )
+    assert courses == [
+        "ASIX1-0369-ISO",
+        "ASIX1-0371-FM",
+        "ASIX1-0372-GBD",
+        "ASIX1-0373-LMSGI",
+        "ASIX1-0376-IAW",
+        "ASIX1-0377-ASGBD",
+        "ASIX2-0370-PAX",
+        "ASIX2-0374-ASO",
+        "ASIX2-0375-SXI",
+        "ASIX2-0378-SAD",
+        "ASIX2-0379-PROJ",
+    ]
+    assert len(assignment_ids) == len(set(assignment_ids)) == 11
+    for filename in (
+        "asix-router-lab.ova",
+        "practica-iso-ova.pdf",
+        "inventari.sql",
+        "servidors.xml",
+        "servidors.xsd",
+        "compose.yml",
+        "site.yml",
+        "baseline.ps1",
+        "plantilla-projecte.md",
+    ):
+        assert filename in assignment_block
+    assert "metadata-only and is not bootable" in assignment_block
+    assert "Dades de prova exclusivament fictícies" in assignment_block
+
+
+def test_rich_fixture_is_versioned_idempotent_and_fails_closed_on_partial_state() -> None:
+    fixture = read(FIXTURE)
+    assert "AUTOTASK_FIXTURE_CONFIG" in fixture
+    assert "AUTOTASK_FIXTURE_ANCHOR_CONFIG" in fixture
+    assert "return fixture_footprint_exists() ? 'partial' : 'absent'" in fixture
+    assert "return 'complete-v' . $version" in fixture
+    assert "function infer_fixture_anchor(bool $advanced): ?int" in fixture
+    assert "preg_match('/^[1-9][0-9]*$/', (string)$stored)" in fixture
+    assert "set_config(AUTOTASK_FIXTURE_ANCHOR_CONFIG, (string)$now)" in fixture
+    ensure = fixture.split("} elseif ($action === 'ensure')", maxsplit=1)[1].split(
+        "} elseif ($action === 'seed')", maxsplit=1
+    )[0]
+    assert "$state === 'partial'" in ensure
+    assert "throw new RuntimeException('rich fixture is partial')" in ensure
+    assert "$state === 'absent'" in ensure
+    assert "seed_fixture()" in ensure
+    assert "rich fixture anchor migration failed" in ensure
+    assert "echo fixture_state()" in ensure
+
+
+def test_rich_fixture_verifies_category_course_and_deadline_contracts() -> None:
+    fixture = read(FIXTURE)
+    verify = fixture.split("function verify_fixture", maxsplit=1)[1].split(
+        "function fixture_state", maxsplit=1
+    )[0]
+    for category in ("AUTOTASK-CF", "AUTOTASK-INFO", "AUTOTASK-ASIX"):
+        assert category in verify
+    assert "$info->parent !== (int)$root->id" in verify
+    assert "$asix->parent !== (int)$info->id" in verify
+    assert "$course->category !== (int)$asix->id" in verify
+    assert "Curs fictici i determinista per a proves locals de Moodle Autotask." in verify
+    assert "$reservedmodules !== count(fixture_assignments())" in verify
+    assert "$expecteddue = $spec['dueoffset'] === 0 ? 0 : $anchor + $spec['dueoffset']" in verify
+    assert "$expecteddue += 86400" in verify
+    assert "$expectedallow = $spec['allowoffset'] === 0" in verify
+    assert "(int)$row->duedate !== $expecteddue" in verify
+    assert "(int)$row->allowsubmissionsfromdate !== $expectedallow" in verify
+
+
+def test_rich_fixture_advance_changes_the_same_assignment_revision_once() -> None:
+    fixture = read(FIXTURE)
+    advance = fixture.split("function advance_fixture(): void", maxsplit=1)[1].split(
+        "$action = $argv[1]", maxsplit=1
+    )[0]
+    assert "fixture_state() !== 'complete-v1'" in advance
+    assert "$idnumber = 'autotask-rich-iso-ova'" in advance
+    assert "$row->duedate += 86400" in advance
+    assert "'filename' => 'revision-2.txt'" in advance
+    assert "set_config(AUTOTASK_FIXTURE_CONFIG, '2')" in advance
+    assert "verify_fixture(true, $anchor)" in advance
+
+
+def test_fixture_tool_is_copied_hash_verified_executed_and_removed() -> None:
+    script = read(SCRIPT)
+    tool = script.split("function Invoke-RichFixtureTool", maxsplit=1)[1].split(
+        "function Invoke-MoodleDockerWaitForDb", maxsplit=1
+    )[0]
+    assert "ValidateSet('state', 'ensure', 'seed', 'advance')" in tool
+    assert "Assert-ContainedNonReparsePath -Path $FixtureToolPath" in tool
+    assert "Get-FileHash -LiteralPath $FixtureToolPath -Algorithm SHA256" in tool
+    assert "@('cp', (ConvertTo-BashPath -Path $FixtureToolPath)" in tool
+    assert "'sha256sum', $containerPath" in tool
+    assert tool.index("$actualHash -ne $expectedHash") < tool.index(
+        "'php', $containerPath, $FixtureAction"
+    )
+    assert "unlink('$containerPath')" in tool
+    assert "MSYS2_ARG_CONV_EXCL' = '/var/www/html;/tmp/moodle-autotask-fixture.php'" in script
+    assert "Invoke-RichFixtureTool -FixtureAction 'ensure'" in script
+
+
+def test_smoke_requires_exact_rich_course_assignment_and_ova_metadata_matrix() -> None:
+    script = read(SCRIPT)
+    smoke = script.split("function Invoke-Smoke", maxsplit=1)[1].split(
+        "function Assert-ResetTarget", maxsplit=1
+    )[0]
+    assert "$expectedRichCourses = @(" in smoke
+    assert "$richAssignments.Count -ne 11" in smoke
+    assert "mod_assign_get_assignments" in smoke
+    assert "Pràctica ISO 1 - Desplegament d'una OVA" in smoke
+    assert "$ovaFiles -notcontains 'asix-router-lab.ova'" in smoke
+    assert "12 assignments across the base and ASIX fixtures" in smoke
+
+
+def test_advance_fixture_action_is_explicit_one_way_and_runs_smoke() -> None:
+    script = read(SCRIPT)
+    action = script.split("    'AdvanceFixture' {", maxsplit=1)[1].split(
+        "    'Reset' {", maxsplit=1
+    )[0]
+    assert "Invoke-RichFixtureTool -FixtureAction 'advance'" in action
+    assert "rich-fixture-advanced" in action
+    assert "Invoke-Smoke" in action
 
 
 def test_cfg_writes_web_services_only_and_mobile_uses_setting_semantics() -> None:
@@ -614,7 +762,8 @@ def test_source_integrity_rejects_dirty_runtime_sources() -> None:
     assert "function Assert-GitOrigin" in script
     assert "remote get-url origin" in script
     assert "function Assert-CleanRuntimeSource" in script
-    assert "including local.yml" in script
+    assert "$unexpected = @($entries | Where-Object { $_ -ne '!! local.yml' })" in script
+    assert "moodle-docker runtime source is dirty or contains untrusted files" in script
     assert "unexpected untracked overrides" in script
     assert "--ignored --untracked-files=all" in script
     assert "$allowed = @('!! config.php')" in script
@@ -706,6 +855,82 @@ def test_runtime_reparse_and_local_override_guards_run_before_compose() -> None:
         "$localOverride",
     ):
         assert f"Assert-SafeWriteTarget -Path {target}" in script
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_local_override_accepts_only_the_exact_persistent_moodledata_mount(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    script = read(SCRIPT)
+    functions = script.split(
+        "function Assert-NoMoodleDockerLocalOverride", maxsplit=1
+    )[1].split("function Invoke-External", maxsplit=1)[0]
+    docker_root = tmp_path / "moodle-docker"
+    docker_root.mkdir()
+    driver = tmp_path / "local-override.ps1"
+    driver.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        + f"$MoodleDockerRoot = '{docker_root.as_posix()}'\n"
+        + "function Fail { param([string]$Message) throw $Message }\n"
+        + "function Assert-SafeRuntimePaths {}\n"
+        + "function Assert-SafeWriteTarget { param([string]$Path) }\n"
+        + "function Assert-NoMoodleDockerLocalOverride"
+        + functions
+        + "\nWrite-TrustedMoodleDockerLocalOverride\n"
+        + "$path = Join-Path $MoodleDockerRoot 'local.yml'\n"
+        + "$first = [System.IO.File]::ReadAllText($path)\n"
+        + "Write-TrustedMoodleDockerLocalOverride\n"
+        + "$second = [System.IO.File]::ReadAllText($path)\n"
+        + "[System.IO.File]::WriteAllText($path, 'services: {}')\n"
+        + "$tamperError = $null\n"
+        + "try { Assert-NoMoodleDockerLocalOverride } "
+        + "catch { $tamperError = $_.Exception.Message }\n"
+        + "Remove-Item -LiteralPath $path -Force\n"
+        + "New-Item -ItemType Directory -Path $path | Out-Null\n"
+        + "$directoryError = $null\n"
+        + "try { Assert-NoMoodleDockerLocalOverride } "
+        + "catch { $directoryError = $_.Exception.Message }\n"
+        + "[PSCustomObject]@{ first = $first; second = $second; tamper = $tamperError; "
+        + "directory = $directoryError } | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    expected = (
+        "services:\n"
+        "  webserver:\n"
+        "    volumes:\n"
+        "      - moodledata:/var/www/moodledata\n"
+        "volumes:\n"
+        "  moodledata:\n"
+    )
+    assert payload["first"] == payload["second"] == expected
+    assert "untrusted moodle-docker/local.yml override" in payload["tamper"]
+    assert "non-file moodle-docker/local.yml" in payload["directory"]
+
+
+def test_compose_override_notice_is_filtered_only_after_exact_override_validation() -> None:
+    script = read(SCRIPT)
+    invoke = script.split("function Invoke-MoodleDocker", maxsplit=1)[1].split(
+        "function Invoke-RichFixtureTool", maxsplit=1
+    )[0]
+    assert invoke.index("Assert-NoMoodleDockerLocalOverride") < invoke.index(
+        "$localOverrideNotice"
+    )
+    assert "Including local options from " in invoke
+    assert "Where-Object { [string]$_ -cne $localOverrideNotice }" in invoke
 
 
 def test_git_control_state_and_reset_wwwroot_are_constrained() -> None:

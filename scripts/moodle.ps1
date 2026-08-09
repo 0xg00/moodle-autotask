@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet('Bootstrap', 'Up', 'Down', 'Status', 'Smoke', 'Reset')]
+    [ValidateSet('Bootstrap', 'Up', 'Down', 'Status', 'Smoke', 'AdvanceFixture', 'Reset')]
     [string]$Action = 'Status',
     [Parameter()]
     [switch]$Force
@@ -44,6 +44,7 @@ $ImageEvidencePath = Join-Path $RuntimeRoot 'moodle-images.json'
 $InstallEvidencePath = Join-Path $RuntimeRoot 'moodle-install.json'
 $GitHooksRoot = Join-Path $RuntimeRoot 'moodle-git-hooks'
 $VersionsPath = Join-Path $RepoRoot 'infra/moodle/versions.psd1'
+$FixtureToolPath = Join-Path $RepoRoot 'infra/moodle/fixture.php'
 $Versions = $null
 if ($Action -eq 'Bootstrap') {
     $Versions = Read-MoodleVersions -Path $VersionsPath
@@ -148,9 +149,36 @@ function Assert-NoMoodleDockerLocalOverride {
     Assert-SafeRuntimePaths
     $localOverride = Join-Path $MoodleDockerRoot 'local.yml'
     Assert-SafeWriteTarget -Path $localOverride
-    if (Test-Path -LiteralPath $localOverride) {
-        Fail 'Refusing moodle-docker/local.yml override. Remove it or run Reset -Force.'
+    if (-not (Test-Path -LiteralPath $localOverride)) {
+        return
     }
+    if (-not (Test-Path -LiteralPath $localOverride -PathType Leaf)) {
+        Fail 'Refusing non-file moodle-docker/local.yml.'
+    }
+    $item = Get-Item -LiteralPath $localOverride -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'Refusing reparse-point moodle-docker/local.yml.'
+    }
+    $expected = "services:`n  webserver:`n    volumes:`n      - moodledata:/var/www/moodledata`nvolumes:`n  moodledata:`n"
+    if ([System.IO.File]::ReadAllText($localOverride) -cne $expected) {
+        Fail 'Refusing untrusted moodle-docker/local.yml override. Run Reset -Force.'
+    }
+}
+
+function Write-TrustedMoodleDockerLocalOverride {
+    $localOverride = Join-Path $MoodleDockerRoot 'local.yml'
+    Assert-SafeWriteTarget -Path $localOverride
+    if (Test-Path -LiteralPath $localOverride) {
+        Assert-NoMoodleDockerLocalOverride
+        return
+    }
+    $content = "services:`n  webserver:`n    volumes:`n      - moodledata:/var/www/moodledata`nvolumes:`n  moodledata:`n"
+    [System.IO.File]::WriteAllText(
+        $localOverride,
+        $content,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    Assert-NoMoodleDockerLocalOverride
 }
 
 function Invoke-External {
@@ -544,8 +572,10 @@ function Assert-CleanRuntimeSource {
     }
     $entries = @($status | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($Kind -eq 'moodle-docker') {
-        if ($entries.Count -ne 0) {
-            Fail 'moodle-docker runtime source is dirty or contains untracked files (including local.yml). Run Reset -Force.'
+        Assert-NoMoodleDockerLocalOverride
+        $unexpected = @($entries | Where-Object { $_ -ne '!! local.yml' })
+        if ($unexpected.Count -ne 0 -or ($entries.Count -eq 1 -and $entries[0] -ne '!! local.yml')) {
+            Fail 'moodle-docker runtime source is dirty or contains untrusted files. Run Reset -Force.'
         }
         return
     }
@@ -762,7 +792,7 @@ function Get-MoodleDockerEnvironment {
         'COMPOSE_PROJECT_NAME' = $ProjectName
         'MOODLE_DOCKER_WEB_PORT' = $WebPort
         'MOODLE_DOCKER_WEB_HOST' = $BindIp
-        'MSYS2_ARG_CONV_EXCL' = '/var/www/html'
+        'MSYS2_ARG_CONV_EXCL' = '/var/www/html;/tmp/moodle-autotask-fixture.php'
     }
 }
 
@@ -803,7 +833,41 @@ function Invoke-MoodleDocker {
     if ($LASTEXITCODE -ne 0) {
         Fail "moodle-docker-compose command failed with exit code $LASTEXITCODE."
     }
-    return $output
+    $localOverrideNotice = 'Including local options from ' + (ConvertTo-BashPath -Path (Join-Path $MoodleDockerRoot 'local.yml'))
+    return @($output | Where-Object { [string]$_ -cne $localOverrideNotice })
+}
+
+function Invoke-RichFixtureTool {
+    param([Parameter(Mandatory = $true)][ValidateSet('state', 'ensure', 'seed', 'advance')][string]$FixtureAction)
+    Assert-ContainedNonReparsePath -Path $FixtureToolPath
+    if (-not (Test-Path -LiteralPath $FixtureToolPath -PathType Leaf)) {
+        Fail 'The committed rich Moodle fixture tool is missing.'
+    }
+    $item = Get-Item -LiteralPath $FixtureToolPath -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'Refusing a reparse-point rich Moodle fixture tool.'
+    }
+    $expectedHash = (Get-FileHash -LiteralPath $FixtureToolPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $containerPath = '/tmp/moodle-autotask-fixture.php'
+    $copied = $false
+    try {
+        Invoke-MoodleDocker -Arguments @('cp', (ConvertTo-BashPath -Path $FixtureToolPath), "webserver:$containerPath") | Out-Null
+        $copied = $true
+        $hashOutput = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'sha256sum', $containerPath)
+        $actualHash = (($hashOutput | Select-Object -First 1) -split '\s+')[0].Trim().ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+            Fail 'Rich Moodle fixture tool hash changed while copying it into the container.'
+        }
+        return Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction)
+    } finally {
+        if ($copied) {
+            try {
+                Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', "if (is_file('$containerPath')) { unlink('$containerPath'); }") | Out-Null
+            } catch {
+                Write-Warning 'Could not remove the verified temporary fixture tool from the Moodle container.'
+            }
+        }
+    }
 }
 
 function Invoke-MoodleDockerWaitForDb {
@@ -967,15 +1031,15 @@ function Get-FixtureState {
     $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', $probe)
     $state = ($result -join "`n").Trim()
     if ($state -eq 'complete') {
-        $attachmentProbe = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; global `$DB; `$intro = 'Read autotask-brief.txt before starting this deterministic local assignment.'; `$hash = 'beec33f762521fcc5976c5dd799348d888014d988dd335e91c7e195ed811f11c'; `$row = `$DB->get_record_sql(`"SELECT a.intro, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.name = ? AND cm.idnumber = ? AND m.name = 'assign'`", array('AutoTask assignment', 'autotask-assignment'), IGNORE_MISSING); if (!`$row) { echo 'partial'; } else { `$context = context_module::instance(`$row->cmid); `$file = get_file_storage()->get_file(`$context->id, 'mod_assign', 'introattachment', 0, '/', 'autotask-brief.txt'); if (!`$file) { echo ((`$row->intro === '' || `$row->intro === `$intro) ? 'legacy' : 'partial'); } else { `$exactfile = (int)`$file->get_filesize() === 76 && hash('sha256', `$file->get_content()) === `$hash; echo ((`$row->intro === `$intro && `$exactfile) ? 'complete' : 'partial'); } }"
+        $attachmentProbe = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; global `$DB; `$intro = 'Read autotask-brief.txt before starting this deterministic local assignment.'; `$hash = 'beec33f762521fcc5976c5dd799348d888014d988dd335e91c7e195ed811f11c'; `$contenthash = '9454da79f8e18ddc48c2632fb88e75adb185ee76'; `$row = `$DB->get_record_sql(`"SELECT a.intro, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.name = ? AND cm.idnumber = ? AND m.name = 'assign'`", array('AutoTask assignment', 'autotask-assignment'), IGNORE_MISSING); if (!`$row) { echo 'partial'; } else { `$context = context_module::instance(`$row->cmid); `$file = get_file_storage()->get_file(`$context->id, 'mod_assign', 'introattachment', 0, '/', 'autotask-brief.txt'); if (!`$file) { echo ((`$row->intro === '' || `$row->intro === `$intro) ? 'legacy' : 'partial'); } else { `$content = @`$file->get_content(); `$exactmetadata = (int)`$file->get_filesize() === 76 && `$file->get_contenthash() === `$contenthash; if (`$row->intro === `$intro && `$exactmetadata && is_string(`$content) && hash('sha256', `$content) === `$hash) { echo 'complete'; } elseif (`$row->intro === `$intro && `$exactmetadata && (`$content === '' || `$content === false)) { echo 'lost'; } else { echo 'partial'; } } }"
         $attachmentResult = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', $attachmentProbe)
         $attachmentState = ($attachmentResult -join "`n").Trim()
-        if ($attachmentState -notin @('complete', 'legacy', 'partial')) {
+        if ($attachmentState -notin @('complete', 'legacy', 'lost', 'partial')) {
             Fail 'Could not determine local Moodle fixture attachment state.'
         }
         $state = $attachmentState
     }
-    if ($state -notin @('absent', 'complete', 'legacy', 'partial')) {
+    if ($state -notin @('absent', 'complete', 'legacy', 'lost', 'partial')) {
         Fail 'Could not determine local Moodle fixture state.'
     }
     return $state
@@ -1000,19 +1064,23 @@ function Seed-Fixture {
             Fail 'Moodle seed did not produce the complete expected fixture. Run Reset -Force.'
         }
     }
-    if ($state -in @('absent', 'legacy')) {
+    if ($state -in @('absent', 'legacy', 'lost')) {
         Ensure-FixtureAttachment -Layout $Layout
     }
     $state = Get-FixtureState -Layout $Layout
     if ($state -ne 'complete') {
         Fail 'Could not verify complete Moodle fixture state. Run Reset -Force.'
     }
+    $richState = ((Invoke-RichFixtureTool -FixtureAction 'ensure') -join "`n").Trim()
+    if ($richState -notin @('complete-v1', 'complete-v2')) {
+        Fail 'Could not verify the rich local Moodle fixture. Run Reset -Force.'
+    }
     Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', "$($Layout.CoreCliRoot)/admin/cli/reset_password.php", '--username=student1', "--password=$($Secrets.studentPassword)") | Out-Null
 }
 
 function Ensure-FixtureAttachment {
     param([Parameter(Mandatory = $true)]$Layout)
-    $upgrade = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; global `$DB; `$row = `$DB->get_record_sql(`"SELECT a.*, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.name = ? AND cm.idnumber = ? AND m.name = 'assign'`", array('AutoTask assignment', 'autotask-assignment'), MUST_EXIST); `$intro = 'Read autotask-brief.txt before starting this deterministic local assignment.'; `$context = context_module::instance(`$row->cmid); `$storage = get_file_storage(); `$existing = `$storage->get_file(`$context->id, 'mod_assign', 'introattachment', 0, '/', 'autotask-brief.txt'); if (`$existing) { throw new moodle_exception('fixture attachment already exists'); } if (`$row->intro !== '' && `$row->intro !== `$intro) { throw new moodle_exception('fixture intro is not migratable'); } if (`$row->intro !== `$intro) { `$row->intro = `$intro; `$row->introformat = FORMAT_HTML; `$row->timemodified = time(); `$DB->update_record('assign', `$row); } `$record = (object)array('contextid' => `$context->id, 'component' => 'mod_assign', 'filearea' => 'introattachment', 'itemid' => 0, 'filepath' => '/', 'filename' => 'autotask-brief.txt', 'userid' => get_admin()->id); `$storage->create_file_from_string(`$record, 'AutoTask local fixture brief.`nUse the Moodle mobile API attachment metadata.'); echo 'fixture-attachment-ready';"
+    $upgrade = "define('CLI_SCRIPT', true); require '$($Layout.CoreConfigPath)'; global `$DB; `$row = `$DB->get_record_sql(`"SELECT a.*, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.name = ? AND cm.idnumber = ? AND m.name = 'assign'`", array('AutoTask assignment', 'autotask-assignment'), MUST_EXIST); `$intro = 'Read autotask-brief.txt before starting this deterministic local assignment.'; `$expected = 'AutoTask local fixture brief.`nUse the Moodle mobile API attachment metadata.'; `$contenthash = '9454da79f8e18ddc48c2632fb88e75adb185ee76'; `$context = context_module::instance(`$row->cmid); `$storage = get_file_storage(); `$existing = `$storage->get_file(`$context->id, 'mod_assign', 'introattachment', 0, '/', 'autotask-brief.txt'); if (`$existing) { `$content = @`$existing->get_content(); `$repairable = (int)`$existing->get_filesize() === 76 && `$existing->get_contenthash() === `$contenthash && (`$content === '' || `$content === false); if (!`$repairable) { throw new moodle_exception('fixture attachment already exists'); } `$existing->delete(); } if (`$row->intro !== '' && `$row->intro !== `$intro) { throw new moodle_exception('fixture intro is not migratable'); } if (`$row->intro !== `$intro) { `$row->intro = `$intro; `$row->introformat = FORMAT_HTML; `$row->timemodified = time(); `$DB->update_record('assign', `$row); } `$record = (object)array('contextid' => `$context->id, 'component' => 'mod_assign', 'filearea' => 'introattachment', 'itemid' => 0, 'filepath' => '/', 'filename' => 'autotask-brief.txt', 'userid' => get_admin()->id); `$storage->create_file_from_string(`$record, `$expected); echo 'fixture-attachment-ready';"
     $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', $upgrade)
     if (($result -join "`n").Trim() -ne 'fixture-attachment-ready') {
         Fail 'Moodle fixture attachment upgrade did not complete successfully.'
@@ -1094,7 +1162,32 @@ function Invoke-Smoke {
     if ($null -eq $assignment) {
         Fail 'Smoke test could not find assign module named AutoTask assignment.'
     }
-    Write-Output "Moodle REST smoke passed for ASIX-LAB / AutoTask assignment at $baseUrl."
+    $expectedRichCourses = @(
+        'ASIX1-0369-ISO', 'ASIX1-0371-FM', 'ASIX1-0372-GBD', 'ASIX1-0373-LMSGI',
+        'ASIX1-0376-IAW', 'ASIX1-0377-ASGBD', 'ASIX2-0370-PAX', 'ASIX2-0374-ASO',
+        'ASIX2-0375-SXI', 'ASIX2-0378-SAD', 'ASIX2-0379-PROJ'
+    )
+    $actualShortnames = @($courses | ForEach-Object { [string]$_.shortname })
+    foreach ($shortname in $expectedRichCourses) {
+        if ($shortname -notin $actualShortnames) {
+            Fail "Smoke test could not find enrolled rich fixture course: $shortname"
+        }
+    }
+    $assignmentsPayload = Invoke-MoodleRest -BaseUrl $baseUrl -Token $tokenData.token -Function 'mod_assign_get_assignments'
+    $richAssignments = @(
+        $assignmentsPayload.courses |
+            Where-Object { $_.shortname -in $expectedRichCourses } |
+            ForEach-Object { $_.assignments }
+    )
+    if ($richAssignments.Count -ne 11) {
+        Fail 'Smoke test did not receive the exact 11 rich fixture assignments.'
+    }
+    $ovaAssignment = @($richAssignments | Where-Object { $_.name -eq "Pràctica ISO 1 - Desplegament d'una OVA" }) | Select-Object -First 1
+    $ovaFiles = if ($null -eq $ovaAssignment) { @() } else { @($ovaAssignment.introattachments | ForEach-Object { [string]$_.filename }) }
+    if ($null -eq $ovaAssignment -or $ovaFiles -notcontains 'asix-router-lab.ova') {
+        Fail 'Smoke test did not receive the simulated OVA attachment metadata.'
+    }
+    Write-Output "Moodle REST smoke passed for 12 assignments across the base and ASIX fixtures at $baseUrl."
 }
 
 function Assert-ResetTarget {
@@ -1166,6 +1259,7 @@ switch ($Action) {
         Assert-NoMoodleDockerLocalOverride
         Assert-DockerDaemon
         Initialize-Sources
+        Write-TrustedMoodleDockerLocalOverride
         $layout = Get-MoodleLayout
         $secrets = Get-LocalSecrets
         Copy-DockerConfiguration -Layout $layout
@@ -1210,6 +1304,17 @@ switch ($Action) {
         $script:Versions = Read-MoodleVersions -Path $VersionsPath
         Assert-NormalMoodleDockerExecutionTrust
         Assert-DockerDaemon
+        Invoke-Smoke
+    }
+    'AdvanceFixture' {
+        Assert-NoMoodleDockerLocalOverride
+        $script:Versions = Read-MoodleVersions -Path $VersionsPath
+        Assert-NormalMoodleDockerExecutionTrust
+        Assert-DockerDaemon
+        $result = ((Invoke-RichFixtureTool -FixtureAction 'advance') -join "`n").Trim()
+        if ($result -ne 'rich-fixture-advanced') {
+            Fail 'Rich fixture did not advance to revision 2.'
+        }
         Invoke-Smoke
     }
     'Reset' {

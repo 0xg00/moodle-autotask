@@ -19,9 +19,11 @@ source pins are in `infra/moodle/versions.psd1`: moodle-docker commit
 `cbc847cd037906036e7047630eee03d5f87d3ff8`, and its peeled commit
 `63e16b757ca8fee05b672a27c23ee27cc8f9fabb`.
 
-After checkout, Bootstrap verifies each official `origin`, rejects tracked changes in either source,
-and rejects all moodle-docker untracked or ignored files (including auto-loaded `local.yml`). Moodle
-permits only its generated ignored local `config.php`; before each normal wrapper invocation its
+After checkout, Bootstrap verifies each official `origin` and rejects tracked changes in either
+source. Moodle-docker permits only one ignored `local.yml`, generated with exact bytes by the
+script, which mounts the named `moodledata` volume at `/var/www/moodledata`; any altered override
+fails before the wrapper runs. Moodle permits only its generated ignored local `config.php`; before
+each normal wrapper invocation its
 SHA-256 bytes must exactly match the pinned `config.docker-template.php`. Any other untracked or
 ignored payload, such as `vendor/` or `node_modules/`, is rejected. Bootstrap overwrites the
 configuration from that pinned template before wrapper trust is required. The seed runs through
@@ -61,6 +63,7 @@ Run from the repository root:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Bootstrap
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Status
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Smoke
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action AdvanceFixture
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Down
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Up
 ```
@@ -82,9 +85,26 @@ the old empty or current expected intro is a safe legacy upgrade. Any existing a
 different bytes, size, hash, or intro is partial and requires `Reset -Force`; Bootstrap never
 overwrites it.
 
+Bootstrap also creates a deterministic, entirely fictitious ASIX catalog inspired only by public
+course names: 11 modules, 11 rich assignments, and the original base assignment. The matrix covers
+an overdue task, a future-opening task, a task without a deadline, a task without attachments,
+multiple attachments, and common ASIX formats such as `.pdf`, `.ova`, `.sql`, `.xml`, `.xsd`,
+`.yml`, `.ps1`, `.txt`, and `.md`. `asix-router-lab.ova` is intentionally a tiny metadata-only
+fixture and is not bootable; it tests lab-artifact routing without distributing a real VM image.
+No private course content, person, password, or submission from either reference school is copied.
+
+The rich fixture is versioned and fail-closed. An exact v1 or v2 is idempotent; a reserved course,
+category, assignment, or file with unexpected content is `partial` and requires inspection or
+`Reset -Force`. To simulate a teacher updating the OVA task, run `AdvanceFixture` once. It keeps the
+stable task identity, changes its revision fields, and adds `revision-2.txt`; a second advance is
+rejected. Use `Reset -Force` followed by `Bootstrap` to return to v1.
+
 It creates only ignored `.runtime/moodle*` paths. `.runtime/moodle-secrets.json` holds generated
 admin and student passwords, while `.runtime/moodle-token.json` holds the mobile token. Neither is
 printed. Do not put school, production, or personal credentials in this environment.
+The generated local token is sufficient for all development and live-fixture tests. A real
+institutional Moodle token is needed only when the owner explicitly enables the final external
+integration; holiday periods or an empty real course do not block development.
 
 Bootstrap removes inherited ACLs from `.runtime` and grants secret access only to the current
 Windows user, `SYSTEM`, and Administrators. If that ACL operation cannot be applied, Bootstrap
@@ -98,9 +118,10 @@ explicitly opt in:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Reset -Force
 ```
 
-`Reset` first brings down this Compose project, validates every deletion target is inside this
-repository's `.runtime/moodle*` namespace, and then removes those targets. It does not touch any
-other Docker project or filesystem path.
+`Reset` first brings down this Compose project with `--volumes`, validates every deletion target is
+inside this repository's `.runtime/moodle*` namespace, and then removes those targets. This deletes
+the named local Moodle database and `moodledata` volumes for this exact Compose project. It does not
+touch any other Docker project or filesystem path.
 
 With `-Force`, Reset removes an ordinary `.runtime/moodle-docker/local.yml` only after validating
 containment and reparse-point safety, and before invoking the Compose wrapper. A directory or
@@ -114,8 +135,8 @@ validated `.runtime` directory as a Compose WWWROOT solely for `down`; normal ac
 the pinned Moodle checkout.
 
 The script rejects a reparse-point repository/runtime path or ancestor before source, Compose, or
-deletion work, and rejects `.runtime/moodle-docker/local.yml` before any Compose wrapper call. Do
-not add local Compose overrides to this reproducible test environment.
+deletion work. Before any Compose wrapper call it accepts only the exact generated
+`.runtime/moodle-docker/local.yml`; do not edit it or add other local overrides.
 
 `Down` only stops this Compose project, preserving its containers and database. `Up` resumes those
 existing containers, waits for PostgreSQL, and refreshes image evidence; it fails with a Bootstrap
@@ -162,9 +183,10 @@ must be running; the script neither changes Docker Desktop settings nor starts i
 
 ## Smoke contract
 
-The inline Moodle CLI seed uses supported core/course/manual-enrolment APIs to create `student1`,
-the enrolled `ASIX-LAB` course, and the `AutoTask assignment` course module with a course-module
-idnumber. The script obtains a token from Moodle's official
+The Moodle CLI seeds use supported core/course/manual-enrolment APIs to create `student1`, the
+base `ASIX-LAB` course, the public-structure-inspired ASIX category tree, 11 module courses, and 12
+assignments in total. Smoke verifies every enrollment, the exact rich assignment count, and the
+simulated OVA metadata. The script obtains a token from Moodle's official
 `login/token.php` endpoint for service `moodle_mobile_app`, then verifies REST
 `core_webservice_get_site_info`, `core_enrol_get_users_courses`, and
 `core_course_get_contents`. Moodle exception and error responses fail the command.
