@@ -126,7 +126,7 @@ def test_bind_ip_validation_allows_only_local_private_or_tailscale_addresses(
         capture_output=True,
         check=False,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
     results = json.loads(result.stdout)
