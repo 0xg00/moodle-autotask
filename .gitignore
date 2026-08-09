@@ -10,3 +10,11 @@ __pycache__/
 .runtime/
 dist/
 build/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log

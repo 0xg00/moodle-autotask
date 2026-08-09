@@ -12,3 +12,8 @@ metadata. Tokens, URLs, token paths, attachment keys, and credentials are exclud
 Use public HTTPS for real Moodle sites. HTTP is intentionally restricted to literal loopback,
 RFC1918, or Tailscale IPv4 endpoints for local development. Downloads reject redirects and URLs
 outside the verified site's exact `pluginfile.php` route.
+
+The AWS controller accepts no inbound traffic and is administered through Systems Manager. Never
+add AWS access keys, Terraform state, plan files, or secret values to the repository. Terraform
+creates a Secrets Manager container only; upload the local token JSON as a separate operation. The
+controller role deliberately cannot create lab instances or change IAM policy.

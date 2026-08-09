@@ -1,0 +1,6 @@
+expected_account_id = "<AWS_ACCOUNT_ID>"
+region              = "eu-south-2"
+
+additional_tags = {
+  Environment = "development"
+}

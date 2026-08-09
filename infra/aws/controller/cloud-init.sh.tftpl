@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/moodle-autotask-bootstrap.log | logger -t moodle-autotask-bootstrap -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl git jq python3 python3-venv unzip
+
+if ! command -v aws >/dev/null 2>&1; then
+  curl --fail --silent --show-error --location \
+    "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.36.19.zip" \
+    --output /tmp/awscliv2.zip
+  echo "545f9bf0cd58e0f30f3a9470d3c4e3387148006bf30f41fb3a4a167347be815f  /tmp/awscliv2.zip" \
+    | sha256sum --check --strict
+  rm -rf /tmp/aws
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install --update
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+
+if command -v snap >/dev/null 2>&1 && snap list amazon-ssm-agent >/dev/null 2>&1; then
+  snap start amazon-ssm-agent
+elif systemctl list-unit-files amazon-ssm-agent.service >/dev/null 2>&1; then
+  systemctl enable --now amazon-ssm-agent
+fi
+
+if ! id --user ${project_name} >/dev/null 2>&1; then
+  useradd --system --home-dir /var/lib/${project_name} --create-home --shell /usr/sbin/nologin ${project_name}
+fi
+
+install -d -o root -g root -m 0755 /opt/${project_name}
+install -d -o ${project_name} -g ${project_name} -m 0750 /var/lib/${project_name}
+install -d -o root -g ${project_name} -m 0750 /etc/${project_name}
+
+cat >/usr/local/sbin/${project_name}-refresh-token <<'TOKEN_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+token_path="/etc/${project_name}/moodle-token.json"
+temporary_path="$(mktemp "/etc/${project_name}/moodle-token.json.XXXXXX")"
+cleanup() {
+  rm -f "$temporary_path"
+}
+trap cleanup EXIT
+aws secretsmanager get-secret-value \
+  --region "${region}" \
+  --secret-id "${secret_arn}" \
+  --query SecretString \
+  --output text >"$temporary_path"
+python3 -m json.tool "$temporary_path" >/dev/null
+chown ${project_name}:${project_name} "$temporary_path"
+chmod 0600 "$temporary_path"
+mv -f "$temporary_path" "$token_path"
+trap - EXIT
+TOKEN_SCRIPT
+chmod 0750 /usr/local/sbin/${project_name}-refresh-token
+
+cat >/etc/systemd/system/${project_name}-scheduler.service <<'UNIT'
+[Unit]
+Description=Moodle Autotask notification scheduler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=${project_name}
+Group=${project_name}
+WorkingDirectory=/var/lib/${project_name}
+ExecStartPre=+/usr/local/sbin/${project_name}-refresh-token
+ExecStart=/opt/${project_name}/venv/bin/moodle-autotask-scheduler run --state /var/lib/${project_name}/state.sqlite3 --token-file /etc/${project_name}/moodle-token.json --interval-seconds ${scheduler_interval}
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/${project_name} /etc/${project_name}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+touch /var/lib/${project_name}/bootstrap-complete
+chown ${project_name}:${project_name} /var/lib/${project_name}/bootstrap-complete

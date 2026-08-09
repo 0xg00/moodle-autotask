@@ -9,6 +9,11 @@ use password login, scrape or automate a browser, provision AWS/KVM labs, invoke
 anyone. The local scheduler emits compact JSON notification events to stdout as an observable
 development/service-log sink; it is not Telegram, email, or user approval to execute or submit work.
 
+The repository now also defines an isolated AWS controller baseline in Terraform. It creates a
+Linux controller with no inbound network access, encrypted private storage, Systems Manager access,
+and an empty Secrets Manager container. It does not deploy the Python application or create lab
+machines. See [AWS controller documentation](docs/aws.md).
+
 Future adapters must preserve the capability-limited `AgentRuntime`, opaque `LabHandle`,
 idempotency-keyed lab operations, and dual approval checkpoints defined here.
 

@@ -22,3 +22,16 @@ jobs:
       - run: python -m ruff check .
       - run: python -m mypy src tests
       - run: python -m pytest -q
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+      - run: terraform fmt -check -recursive infra/aws
+      - run: terraform -chdir=infra/aws/bootstrap init -backend=false
+      - run: terraform -chdir=infra/aws/bootstrap validate
+      - run: terraform -chdir=infra/aws/controller init -backend=false
+      - run: terraform -chdir=infra/aws/controller validate

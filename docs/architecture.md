@@ -35,6 +35,12 @@ effect can repeat the same event ID, so consumers must deduplicate it. The local
 is an observable development/service-log sink, not Telegram/email/etc. Neither successful delivery
 nor manual acknowledgement is authorization to execute or submit work.
 
-The connector remains read-only: AWS, password login, scraping/browser automation, task execution,
-and Moodle submission remain outside this milestone. The scheduler only performs local notification
+The connector remains read-only: password login, scraping/browser automation, task execution, and
+Moodle submission remain outside this milestone. The scheduler only performs local notification
 delivery through its stdout development/service-log sink.
+
+AWS infrastructure is a separate adapter boundary. The Terraform baseline creates a Linux
+controller whose instance role can read the exact Moodle secret, use bounded artifact prefixes, and
+connect to Systems Manager. It cannot create labs, mutate IAM, or submit Moodle work. Future Windows
+lab provisioning will use a distinct role and explicit `LabProvider` operations so untrusted task
+execution never inherits controller or account-administration credentials.
