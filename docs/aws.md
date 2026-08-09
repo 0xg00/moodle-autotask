@@ -189,5 +189,6 @@ aws ec2 describe-instances `
 Do not manually call `run-instances`. Telegram start decisions are persisted for an exact Moodle
 revision and consumed through a transactional lease. Retries reuse the same EC2 client token; the
 worker waits for Systems Manager and schedules mandatory teardown after two hours. The next
-application milestone transfers the task inputs and runs the selected agent mode through audited
-Systems Manager commands.
+application milestone imports OVA/OVF or virtual-disk inputs through VM Import/Export, transfers the
+remaining task inputs, and runs the selected agent mode through audited Systems Manager commands.
+Until then, those appliance formats are marked `image_import_required` before any EC2 launch.

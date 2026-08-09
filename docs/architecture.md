@@ -41,7 +41,8 @@ delivery nor manual acknowledgement is authorization to execute or submit work. 
 worker deterministically selects `central`, `hybrid`, or `in_guest`. Non-central work calls the
 capability-limited AWS lab provider with a stable SHA-256 idempotency key, waits for EC2 plus SSM,
 and records the opaque handle. Only one non-central lab may be active; leases recover after crashes
-without changing the EC2 client token. Ready labs become cleanup work after two hours.
+without changing the EC2 client token. Ready labs become cleanup work after two hours. OVA/OVF and
+virtual-disk attachments fail closed before provisioning until the image-import adapter exists.
 
 The connector remains read-only: password login, scraping/browser automation, task execution, and
 Moodle submission and agent execution remain outside this milestone. Telegram uses long polling over outbound HTTPS;

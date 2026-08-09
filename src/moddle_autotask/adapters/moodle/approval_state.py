@@ -501,6 +501,21 @@ class ApprovalState:
             now,
         )
 
+    def fail_work(
+        self, claim: WorkClaim, error_code: str, now: int | None = None
+    ) -> bool:
+        if claim.item.status != "pending" or claim.item.lab_handle is not None:
+            raise ApprovalStateError("work claim cannot fail before provisioning")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code):
+            raise ApprovalStateError("work error code is invalid")
+        return self._finish_claim(
+            claim,
+            "status = 'failed', available_at = ?, error_code = ?",
+            (_now(now), error_code),
+            "fail approved work",
+            now,
+        )
+
     def work_status(self, task_key: str, revision_digest: str) -> WorkItem | None:
         _validate_identity(task_key, revision_digest)
         try:

@@ -9,6 +9,7 @@ from moddle_autotask.adapters.moodle.approval_state import (
     ApprovalStateError,
     WorkClaim,
 )
+from moddle_autotask.adapters.moodle.state import NotificationEvent
 from moddle_autotask.domain.models import (
     ExecutionMode,
     LabProvisionRequest,
@@ -65,6 +66,10 @@ def _process_claim(
             if not state.mark_ready(claim, now=now):
                 return WorkerCycle("ownership_lost", item.selected_mode)
             return WorkerCycle("central_ready", item.selected_mode)
+        if _requires_image_import(item.event):
+            if not state.fail_work(claim, "image_import_required", now=now):
+                return WorkerCycle("ownership_lost", item.selected_mode)
+            return WorkerCycle("image_import_required", item.selected_mode)
         request = LabProvisionRequest(
             TaskId(item.event.task_key),
             WorkflowRevision(item.event.revision_digest),
@@ -98,3 +103,12 @@ def _retry_delay(attempts: int) -> int:
     exponent: int = min(max(attempts - 1, 0), 6)
     delays = (30, 60, 120, 240, 480, 960, 1800)
     return delays[exponent]
+
+
+def _requires_image_import(event: NotificationEvent) -> bool:
+    return any(
+        attachment.filename.lower().endswith(
+            (".ova", ".ovf", ".vdi", ".vmdk", ".vhd", ".vhdx")
+        )
+        for attachment in event.attachments
+    )

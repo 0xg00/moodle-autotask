@@ -41,9 +41,11 @@ class _Provider:
         self.teardowns.append((handle, idempotency_key))
 
 
-def _approved(tmp_path: Path, *, lab: bool) -> tuple[ApprovalState, str, str]:
+def _approved(
+    tmp_path: Path, *, lab: bool, filename: str = "capture.pcap"
+) -> tuple[ApprovalState, str, str]:
     attachment = (
-        (NotificationAttachment("base.ova", 123, None, True),) if lab else ()
+        (NotificationAttachment(filename, 123, None, True),) if lab else ()
     )
     event = MoodleState(tmp_path / "moodle.sqlite3").enqueue(
         NotificationDraft(
@@ -120,3 +122,15 @@ def test_provider_failure_releases_lease_with_bounded_retry(tmp_path: Path) -> N
     assert item is not None and item.status == "lab_pending" and item.attempts == 2
     assert len(provider.provisions) == 2
     assert provider.provisions[0][1] == provider.provisions[1][1]
+
+
+def test_ova_requires_image_import_without_launching_blank_windows(tmp_path: Path) -> None:
+    state, task_key, revision = _approved(tmp_path, lab=True, filename="base.ova")
+    provider = _Provider()
+
+    cycle = process_one(state, provider, owner="worker", now=10)
+
+    assert cycle.result == "image_import_required"
+    assert provider.provisions == []
+    item = state.work_status(task_key, revision)
+    assert item is not None and item.status == "failed" and item.lab_handle is None

@@ -10,7 +10,9 @@ JSON locally or send an outbound Telegram message with `Hacer tarea`, `Ignorar`,
 buttons. An exact `Hacer tarea` decision atomically creates durable work. The controller selects
 `central`, `hybrid`, or `in_guest`; modes requiring a machine provision one idempotent Windows lab,
 wait for Systems Manager, and enforce a two-hour cleanup deadline. Agent execution and Moodle
-submission remain separate, unimplemented approval boundaries.
+submission remain separate, unimplemented approval boundaries. Virtual appliance attachments are
+blocked before EC2 launch until the VM Import/Export pipeline is present; a blank Windows lab is
+never substituted for an `.ova`.
 
 The repository now also defines an isolated AWS controller and ephemeral lab boundary in Terraform.
 It creates a Linux controller with no inbound network access, encrypted private storage, Systems
