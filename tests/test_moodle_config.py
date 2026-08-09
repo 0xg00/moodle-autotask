@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,8 @@ def test_current_bootstrap_token_file_bom_and_obtained_at_loads(tmp_path: Path) 
         '{"baseUrl":"http://127.0.0.1:8000","token":"opaque","obtainedAt":"2026-01-01T00:00:00Z"}',
         encoding="utf-8-sig",
     )
+    if os.name != "nt":
+        token_file.chmod(0o600)
     config = MoodleConnectionConfig.from_token_file(token_file)
     assert config.base_url == "http://127.0.0.1:8000"
 
