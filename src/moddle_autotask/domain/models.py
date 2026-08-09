@@ -124,6 +124,13 @@ class LabProvisionRequest:
     workflow_revision: WorkflowRevision
     requested_mode: ExecutionMode
     specification_digest: Digest
+    image_reference: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.requested_mode is ExecutionMode.AUTO:
+            raise ValueError("lab execution mode must be selected")
+        if self.image_reference is not None and not self.image_reference.strip():
+            raise ValueError("lab image reference must not be blank")
 
 
 @dataclass(frozen=True, slots=True)

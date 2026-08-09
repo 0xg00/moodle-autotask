@@ -116,6 +116,31 @@ data "aws_iam_policy_document" "lab_provisioner" {
   }
 
   statement {
+    sid       = "UseOwnedImportedImage"
+    effect    = "Allow"
+    actions   = ["ec2:RunInstances"]
+    resources = ["arn:${data.aws_partition.current.partition}:ec2:${var.region}:${data.aws_caller_identity.current.account_id}:image/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Project"
+      values   = [var.project_name]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Environment"
+      values   = [var.environment]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Role"
+      values   = ["lab-image"]
+    }
+  }
+
+  statement {
     sid     = "CreateTaggedLabInstance"
     effect  = "Allow"
     actions = ["ec2:RunInstances"]

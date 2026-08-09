@@ -25,6 +25,9 @@ def _lab_config() -> ControllerLabConfig:
         "ami-0123456789abcdef0",
         "t3.large",
         80,
+        "moodle-autotask-artifacts-123456789012-eu-south-2",
+        "arn:aws:iam::123456789012:role/moodle-autotask-development-image-importer",
+        "moodle-autotask-development-vmimport",
     )
 
 
@@ -88,8 +91,12 @@ def test_installer_writes_hardened_worker_with_fixed_lab_configuration(
     assert "--security-group-id sg-0123456789abcdef0" in text
     assert "--instance-profile-name moodle-autotask-development-lab" in text
     assert "--image-id ami-0123456789abcdef0" in text
+    assert "--token-file /etc/moodle-autotask/moodle-token.json" in text
+    assert "--artifact-bucket moodle-autotask-artifacts-123456789012-eu-south-2" in text
+    assert "--image-importer-role-arn arn:aws:iam::123456789012:role/" in text
+    assert "--vmimport-role-name moodle-autotask-development-vmimport" in text
     assert "NoNewPrivileges=true" in text and "ProtectSystem=strict" in text
-    assert "ExecStartPre=" not in text
+    assert "ExecStartPre=+/usr/local/sbin/moodle-autotask-refresh-config" in text
 
 
 def test_installer_rejects_symlink_target(tmp_path: Path) -> None:

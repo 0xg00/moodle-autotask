@@ -122,12 +122,15 @@ def _config(**changes: object) -> AwsLabConfig:
     return AwsLabConfig(**values)  # type: ignore[arg-type]
 
 
-def _request(*, task_id: str = "course:assignment:1") -> LabProvisionRequest:
+def _request(
+    *, task_id: str = "course:assignment:1", image_reference: str | None = None
+) -> LabProvisionRequest:
     return LabProvisionRequest(
         task_id=TaskId(task_id),
         workflow_revision=WorkflowRevision("revision-1"),
         requested_mode=ExecutionMode.CENTRAL,
         specification_digest=Digest("a" * 64),
+        image_reference=image_reference,
     )
 
 
@@ -189,6 +192,22 @@ def test_provision_replay_reconciles_without_second_instance() -> None:
 
     assert second == first
     assert sum(call[0][:2] == ("ec2", "run-instances") for call in runner.calls) == 1
+
+
+def test_provision_uses_exact_validated_imported_image() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner)
+
+    provider.provision(
+        _request(image_reference="ami-0fedcba9876543210"), idempotency_key="imported-image"
+    )
+
+    run_call = next(call[0] for call in runner.calls if call[0][:2] == ("ec2", "run-instances"))
+    assert run_call[run_call.index("--image-id") + 1] == "ami-0fedcba9876543210"
+    with pytest.raises(AwsLabError, match="invalid image ID"):
+        provider.provision(
+            _request(image_reference="ami-invalid"), idempotency_key="bad-image"
+        )
 
 
 def test_changed_request_does_not_reconcile_existing_lab() -> None:

@@ -13,6 +13,7 @@ resource "aws_s3_bucket_ownership_controls" "artifacts" {
   rule {
     object_ownership = "BucketOwnerEnforced"
   }
+
 }
 
 resource "aws_s3_bucket_public_access_block" "artifacts" {
@@ -59,6 +60,23 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
 
     noncurrent_version_expiration {
       noncurrent_days = 30
+    }
+  }
+
+  rule {
+    id     = "expire-assignment-inputs"
+    status = "Enabled"
+
+    filter {
+      prefix = "assignments/"
+    }
+
+    expiration {
+      days = 7
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 7
     }
   }
 

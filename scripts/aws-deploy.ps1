@@ -301,6 +301,25 @@ $labRoleArn = (
 if ($labRoleArn -notmatch '^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$') {
     throw 'AWS returned an invalid lab provisioner role ARN.'
 }
+$imageImporterRoleArn = (
+    Invoke-Aws -Arguments @(
+        'iam', 'get-role', '--role-name', "$namePrefix-image-importer",
+        '--query', 'Role.Arn', '--output', 'text'
+    )
+).Trim()
+if ($imageImporterRoleArn -notmatch '^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$') {
+    throw 'AWS returned an invalid image importer role ARN.'
+}
+$vmImportRoleName = "$namePrefix-vmimport"
+$resolvedVmImportRoleName = (
+    Invoke-Aws -Arguments @(
+        'iam', 'get-role', '--role-name', $vmImportRoleName,
+        '--query', 'Role.RoleName', '--output', 'text'
+    )
+).Trim()
+if ($resolvedVmImportRoleName -ne $vmImportRoleName) {
+    throw 'AWS returned an unexpected VM Import service role.'
+}
 $labPolicyResponse = Invoke-Aws -Arguments @(
     'iam', 'get-role-policy', '--role-name', "$namePrefix-lab-provisioner",
     '--policy-name', "$namePrefix-lab-provisioner", '--query', 'PolicyDocument',
@@ -376,7 +395,7 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     'worker_was_active=false; if systemctl is-active --quiet moodle-autotask-worker.service; then worker_was_active=true; systemctl stop moodle-autotask-worker.service; fi',
     "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
     'mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current',
-    "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment' --provisioner-role-arn '$labRoleArn' --subnet-id '$labSubnetId' --security-group-id '$labSecurityGroupId' --instance-profile-name '$labInstanceProfileName' --image-id '$labImageId' --instance-type '$LabInstanceType' --root-volume-size-gib '$LabRootVolumeSizeGiB'",
+    "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment' --provisioner-role-arn '$labRoleArn' --subnet-id '$labSubnetId' --security-group-id '$labSecurityGroupId' --instance-profile-name '$labInstanceProfileName' --image-id '$labImageId' --artifact-bucket '$artifactBucket' --image-importer-role-arn '$imageImporterRoleArn' --vmimport-role-name '$vmImportRoleName' --instance-type '$LabInstanceType' --root-volume-size-gib '$LabRootVolumeSizeGiB'",
     'systemctl daemon-reload',
     'if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service; fi',
     'if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service; fi',

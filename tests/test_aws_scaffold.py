@@ -33,6 +33,9 @@ def test_state_and_artifact_storage_are_private_and_encrypted() -> None:
         assert "restrict_public_buckets = true" in source
         assert 'sse_algorithm = "AES256"' in source
         assert 'variable = "aws:SecureTransport"' in source
+    assert 'id     = "expire-assignment-inputs"' in storage
+    assert 'prefix = "assignments/"' in storage
+    assert "days = 7" in storage
 
 
 def test_controller_role_cannot_create_labs_or_change_iam() -> None:
@@ -88,6 +91,23 @@ def test_lab_instance_cannot_read_moodle_secret_or_provision_labs() -> None:
     assert "s3:DeleteObject" not in instance_policy
 
 
+def test_vm_import_roles_are_separate_and_prefix_limited() -> None:
+    imports = (AWS_ROOT / "controller" / "image_imports.tf").read_text(encoding="utf-8")
+    labs = (AWS_ROOT / "controller" / "labs.tf").read_text(encoding="utf-8")
+
+    assert 'identifiers = ["vmie.amazonaws.com"]' in imports
+    assert 'variable = "sts:Externalid"' in imports
+    assert 'values   = ["vmimport"]' in imports
+    assert 'variable = "aws:SourceAccount"' in imports
+    assert 'values   = ["assignments/*"]' in imports
+    assert '"${aws_s3_bucket.artifacts.arn}/assignments/*"' in imports
+    assert 'resources = [aws_iam_role.vmimport.arn]' in imports
+    assert 'values   = ["vmie.amazonaws.com"]' in imports
+    assert 'identifiers = [aws_iam_role.controller.arn]' in imports
+    assert 'resources = [aws_iam_role.image_importer.arn]' in imports
+    assert 'values   = ["lab-image"]' in labs
+
+
 def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     script = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
 
@@ -117,6 +137,9 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "--subnet-id '$labSubnetId'" in script
     assert "--security-group-id '$labSecurityGroupId'" in script
     assert "--image-id '$labImageId'" in script
+    assert "--artifact-bucket '$artifactBucket'" in script
+    assert "--image-importer-role-arn '$imageImporterRoleArn'" in script
+    assert "--vmimport-role-name '$vmImportRoleName'" in script
     assert "moodle-autotask-controller' install" in script
     assert "ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate')" in script
     deploy_commands = script.split("$gitStatus =", 1)[1]

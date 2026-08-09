@@ -10,9 +10,11 @@ JSON locally or send an outbound Telegram message with `Hacer tarea`, `Ignorar`,
 buttons. An exact `Hacer tarea` decision atomically creates durable work. The controller selects
 `central`, `hybrid`, or `in_guest`; modes requiring a machine provision one idempotent Windows lab,
 wait for Systems Manager, and enforce a two-hour cleanup deadline. Agent execution and Moodle
-submission remain separate, unimplemented approval boundaries. Virtual appliance attachments are
-blocked before EC2 launch until the VM Import/Export pipeline is present; a blank Windows lab is
-never substituted for an `.ova`.
+submission remain separate, unimplemented approval boundaries. For a practice with exactly one
+`.ova`, the worker re-reads the approved Moodle revision, verifies and stages every attachment in
+private S3, imports the appliance through AWS VM Import/Export with an idempotent token, and launches
+only the resulting owned AMI. Other virtual-disk layouts remain blocked; a blank Windows lab is never
+substituted for an appliance.
 
 The repository now also defines an isolated AWS controller and ephemeral lab boundary in Terraform.
 It creates a Linux controller with no inbound network access, encrypted private storage, Systems

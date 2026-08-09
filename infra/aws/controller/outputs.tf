@@ -62,3 +62,13 @@ output "lab_root_volume_size_gib" {
   description = "Operator-selected encrypted lab root volume size."
   value       = var.lab_root_volume_size_gib
 }
+
+output "image_importer_role_arn" {
+  description = "Exact role the controller assumes for approved OVA imports."
+  value       = aws_iam_role.image_importer.arn
+}
+
+output "vmimport_role_name" {
+  description = "Service role passed only to AWS VM Import/Export."
+  value       = aws_iam_role.vmimport.name
+}

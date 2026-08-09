@@ -478,7 +478,13 @@ class ApprovalState:
         )
 
     def retry_work(
-        self, claim: WorkClaim, error_code: str, delay_seconds: int, now: int | None = None
+        self,
+        claim: WorkClaim,
+        error_code: str,
+        delay_seconds: int,
+        now: int | None = None,
+        *,
+        exhaustible: bool = True,
     ) -> bool:
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code):
             raise ApprovalStateError("work error code is invalid")
@@ -488,8 +494,10 @@ class ApprovalState:
             or not 1 <= delay_seconds <= 3600
         ):
             raise ApprovalStateError("work retry delay is invalid")
+        if not isinstance(exhaustible, bool):
+            raise ApprovalStateError("work retry policy is invalid")
         moment = _now(now)
-        if claim.item.attempts >= _MAX_WORK_ATTEMPTS:
+        if exhaustible and claim.item.attempts >= _MAX_WORK_ATTEMPTS:
             assignment = "status = 'failed', available_at = ?, error_code = ?"
         else:
             assignment = "available_at = ?, error_code = ?"

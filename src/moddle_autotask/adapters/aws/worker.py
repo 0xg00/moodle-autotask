@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from moddle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
@@ -18,6 +19,21 @@ from moddle_autotask.domain.models import (
 )
 from moddle_autotask.ports.contracts import LabProvider, LabReadiness
 
+from .artifacts import PreparedAssignment
+from .image_imports import ImageImportReadiness, ImageImportResult
+
+
+class ArtifactPreparer(Protocol):
+    def prepare(self, event: NotificationEvent) -> PreparedAssignment: ...
+
+
+class ImageImporter(Protocol):
+    def ensure(
+        self, prepared: PreparedAssignment, *, idempotency_key: str
+    ) -> ImageImportResult: ...
+
+    def cleanup(self, *, idempotency_key: str) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerCycle:
@@ -30,6 +46,8 @@ def process_one(
     provider: LabProvider,
     *,
     owner: str,
+    artifact_preparer: ArtifactPreparer | None = None,
+    image_importer: ImageImporter | None = None,
     lease_seconds: int = 300,
     now: int | None = None,
 ) -> WorkerCycle:
@@ -37,7 +55,14 @@ def process_one(
     if claim is None:
         return WorkerCycle("idle")
     try:
-        return _process_claim(state, provider, claim, now=now)
+        return _process_claim(
+            state,
+            provider,
+            claim,
+            artifact_preparer=artifact_preparer,
+            image_importer=image_importer,
+            now=now,
+        )
     except ApprovalStateError:
         raise
     except (RuntimeError, ValueError):
@@ -53,11 +78,17 @@ def _process_claim(
     provider: LabProvider,
     claim: WorkClaim,
     *,
+    artifact_preparer: ArtifactPreparer | None,
+    image_importer: ImageImporter | None,
     now: int | None,
 ) -> WorkerCycle:
     item = claim.item
     if item.status in {"ready", "failed"} and item.lab_handle is not None:
         provider.teardown(item.lab_handle, idempotency_key=f"cleanup-{item.provision_key}")
+        if _requires_image_import(item.event):
+            if image_importer is None:
+                raise RuntimeError("image importer is unavailable during cleanup")
+            image_importer.cleanup(idempotency_key=item.provision_key)
         if not state.mark_cleaned(claim, now=now):
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("lab_cleaned", item.selected_mode)
@@ -66,15 +97,35 @@ def _process_claim(
             if not state.mark_ready(claim, now=now):
                 return WorkerCycle("ownership_lost", item.selected_mode)
             return WorkerCycle("central_ready", item.selected_mode)
+        image_id: str | None = None
         if _requires_image_import(item.event):
-            if not state.fail_work(claim, "image_import_required", now=now):
-                return WorkerCycle("ownership_lost", item.selected_mode)
-            return WorkerCycle("image_import_required", item.selected_mode)
+            if artifact_preparer is None or image_importer is None:
+                if not state.fail_work(claim, "image_import_required", now=now):
+                    return WorkerCycle("ownership_lost", item.selected_mode)
+                return WorkerCycle("image_import_required", item.selected_mode)
+            prepared = artifact_preparer.prepare(item.event)
+            imported = image_importer.ensure(prepared, idempotency_key=item.provision_key)
+            if imported.readiness is ImageImportReadiness.PENDING:
+                if not state.retry_work(
+                    claim,
+                    "image_import_pending",
+                    60,
+                    now=now,
+                    exhaustible=False,
+                ):
+                    return WorkerCycle("ownership_lost", item.selected_mode)
+                return WorkerCycle("image_import_pending", item.selected_mode)
+            image_id = imported.image_id
+            if image_id is None:
+                raise RuntimeError("completed image import has no image ID")
+        elif artifact_preparer is not None:
+            artifact_preparer.prepare(item.event)
         request = LabProvisionRequest(
             TaskId(item.event.task_key),
             WorkflowRevision(item.event.revision_digest),
             item.selected_mode,
             item.specification_digest,
+            image_reference=image_id,
         )
         handle = provider.provision(request, idempotency_key=item.provision_key)
         if not state.record_lab(claim, handle, now=now):

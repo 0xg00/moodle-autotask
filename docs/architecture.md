@@ -42,7 +42,13 @@ worker deterministically selects `central`, `hybrid`, or `in_guest`. Non-central
 capability-limited AWS lab provider with a stable SHA-256 idempotency key, waits for EC2 plus SSM,
 and records the opaque handle. Only one non-central lab may be active; leases recover after crashes
 without changing the EC2 client token. Ready labs become cleanup work after two hours. OVA/OVF and
-virtual-disk attachments fail closed before provisioning until the image-import adapter exists.
+virtual-disk attachments fail closed unless the approved revision contains exactly one OVA. That
+supported path re-enumerates Moodle, requires the exact task and revision digests, downloads all
+attachments through the hardened pluginfile client, and stages them under a content-addressed
+private S3 prefix. The importer uses a stable EC2 client token, an isolated importer role, and the
+VM Import/Export service role. It verifies the import task's tags and S3 source, tags the resulting
+AMI and snapshots, and passes that exact AMI to the lab provider. Cleanup terminates the lab,
+deregisters the imported AMI, and deletes its snapshots before completing the work item.
 
 The connector remains read-only: password login, scraping/browser automation, task execution, and
 Moodle submission and agent execution remain outside this milestone. Telegram uses long polling over outbound HTTPS;
@@ -52,10 +58,12 @@ file and never accepted as a command-line value or placed in callback data.
 AWS infrastructure is a separate adapter boundary. The Terraform baseline creates a Linux
 controller whose instance role can read the exact Moodle secret, use bounded artifact prefixes, and
 connect to Systems Manager. It cannot call EC2 directly or mutate IAM. For an approved provision
-operation it can assume one exact lab-provisioner role. That role can launch only the operator-fixed
-Windows image, instance types, subnet, security group, volume bounds, and lab instance profile, and
-can terminate only project-tagged labs. The guest profile can read task inputs, write lab results,
-and connect to Systems Manager; it cannot read the Moodle token or provision another lab.
+operation it can assume one exact lab-provisioner role. A second exact role can start and clean up
+tagged VM imports and can pass only the dedicated VM Import/Export service role. The provisioner can
+launch only the operator-fixed Windows image or a project-owned imported image, plus the fixed
+instance type, subnet, security group, volume bounds, and lab instance profile; it can terminate only
+project-tagged labs. The guest profile can read task inputs, write lab results, and connect to Systems
+Manager; it cannot read the Moodle token or provision another lab.
 
 `AwsEc2LabProvider` hashes task and workflow identities before tagging, binds EC2's client token to
 the complete immutable request plus caller idempotency key, reconciles by that key, validates every

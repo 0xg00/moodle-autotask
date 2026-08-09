@@ -189,6 +189,19 @@ aws ec2 describe-instances `
 Do not manually call `run-instances`. Telegram start decisions are persisted for an exact Moodle
 revision and consumed through a transactional lease. Retries reuse the same EC2 client token; the
 worker waits for Systems Manager and schedules mandatory teardown after two hours. The next
-application milestone imports OVA/OVF or virtual-disk inputs through VM Import/Export, transfers the
-remaining task inputs, and runs the selected agent mode through audited Systems Manager commands.
-Until then, those appliance formats are marked `image_import_required` before any EC2 launch.
+execution milestone runs the selected agent mode through audited Systems Manager commands.
+
+The current image-import boundary supports exactly one `.ova` in an approved revision. Before any
+import it re-reads that exact revision, downloads every attachment with the Moodle token kept out of
+AWS arguments, hashes the bytes, uploads them to `assignments/<task>/<revision>/<attachment>/<sha256>/`,
+and verifies S3 size, checksum, metadata, and SSE-S3. Assignment inputs expire after seven days.
+`ImportImage` is encrypted and uses a stable client token plus the isolated image-importer and
+VM Import/Export service roles. The imported AMI and snapshots are ownership-tagged, verified, and
+removed during the mandatory lab cleanup.
+
+Imports use `BYOL`; the operator is responsible for having cloud-use rights for the appliance OS.
+The source bucket and EC2 import must remain in the same Region. Multi-file OVF/VMDK/VHD layouts,
+VDI, and multiple appliance attachments remain fail-closed because their disk order, boot mode, and
+licensing cannot be inferred safely from filenames. The bundled local `asix-router-lab.ova` is only
+a 76-byte routing fixture and is intentionally not a bootable image, so it must never be used for a
+live AWS import test.

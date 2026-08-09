@@ -141,7 +141,9 @@ class AwsEc2LabProvider:
             return existing
 
         session = self._assume_role(provision_key)
-        image_id = self._config.image_id
+        image_id = request.image_reference or self._config.image_id
+        if _IMAGE_PATTERN.fullmatch(image_id) is None:
+            raise AwsLabError("lab request contains an invalid image ID")
         tags = self._tags(request, provision_key)
         tag_specifications = json.dumps(
             [
@@ -347,6 +349,7 @@ class AwsEc2LabProvider:
         AwsEc2LabProvider._require_non_blank(idempotency_key, "idempotency key")
         payload = {
             "idempotency_key": idempotency_key,
+            "image_reference": request.image_reference,
             "mode": request.requested_mode.value,
             "specification_digest": request.specification_digest.value,
             "task_id": request.task_id.value,

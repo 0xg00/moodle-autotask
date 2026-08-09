@@ -33,6 +33,9 @@ class ControllerLabConfig:
     image_id: str
     instance_type: str
     root_volume_size_gib: int
+    artifact_bucket: str
+    image_importer_role_arn: str
+    vmimport_role_name: str
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -90,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--security-group-id", required=True)
     parser.add_argument("--instance-profile-name", required=True)
     parser.add_argument("--image-id", required=True)
+    parser.add_argument("--artifact-bucket", required=True)
+    parser.add_argument("--image-importer-role-arn", required=True)
+    parser.add_argument("--vmimport-role-name", required=True)
     parser.add_argument("--instance-type", default="t3.large")
     parser.add_argument("--root-volume-size-gib", type=int, default=80)
     args = parser.parse_args(argv)
@@ -107,6 +113,9 @@ def main(argv: list[str] | None = None) -> int:
             args.image_id,
             args.instance_type,
             args.root_volume_size_gib,
+            args.artifact_bucket,
+            args.image_importer_role_arn,
+            args.vmimport_role_name,
         )
         install_controller_services(Path("/"), args.region, args.environment, config)
         return 0
@@ -347,6 +356,9 @@ def _worker_unit(
         config.instance_profile_name,
         config.image_id,
         config.instance_type,
+        config.artifact_bucket,
+        config.image_importer_role_arn,
+        config.vmimport_role_name,
     )
     if any("\n" in value or "\r" in value or not value for value in values):
         raise ControllerServiceError("worker configuration is invalid")
@@ -357,7 +369,11 @@ def _worker_unit(
             "/opt/moodle-autotask/current/venv/bin/moodle-autotask-worker",
             "run",
             "--state /var/lib/moodle-autotask/approval.sqlite3",
+            "--token-file /etc/moodle-autotask/moodle-token.json",
             f"--region {shlex.quote(region)}",
+            f"--artifact-bucket {shlex.quote(config.artifact_bucket)}",
+            f"--image-importer-role-arn {shlex.quote(config.image_importer_role_arn)}",
+            f"--vmimport-role-name {shlex.quote(config.vmimport_role_name)}",
             f"--environment {shlex.quote(environment)}",
             f"--provisioner-role-arn {shlex.quote(config.provisioner_role_arn)}",
             f"--subnet-id {shlex.quote(config.subnet_id)}",
@@ -381,6 +397,7 @@ def _worker_unit(
             "User=moodle-autotask",
             "Group=moodle-autotask",
             "WorkingDirectory=/var/lib/moodle-autotask",
+            "ExecStartPre=+/usr/local/sbin/moodle-autotask-refresh-config",
             f"ExecStart={command}",
             "Restart=on-failure",
             "RestartSec=30",
@@ -393,7 +410,7 @@ def _worker_unit(
             "ProtectKernelModules=true",
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
-            "ReadWritePaths=/var/lib/moodle-autotask",
+            "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock",
             "RestrictSUIDSGID=true",
             "",
             "[Install]",
