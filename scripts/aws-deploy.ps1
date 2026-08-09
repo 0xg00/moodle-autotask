@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Deploy', 'Status')]
+    [ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate')]
     [string]$Action = 'Deploy',
 
     [Parameter(Mandatory)]
@@ -12,6 +12,9 @@ param(
 
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')]
     [string]$Profile = 'moodle-autotask',
+
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{1,19}$')]
+    [string]$Environment = 'development',
 
     [ValidatePattern('^$|^i-[0-9a-f]{8,17}$')]
     [string]$InstanceId = ''
@@ -204,9 +207,38 @@ $controllerInstanceId = Resolve-ControllerInstanceId
 if ($Action -eq 'Status') {
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Inspect application deployment' -Commands @(
         'set -eu',
-        'printf "service-enabled="; systemctl is-enabled moodle-autotask-scheduler.service 2>/dev/null || true',
-        'printf "service-active="; systemctl is-active moodle-autotask-scheduler.service 2>/dev/null || true',
+        'printf "scheduler-enabled="; systemctl is-enabled moodle-autotask-scheduler.service 2>/dev/null || true',
+        'printf "scheduler-active="; systemctl is-active moodle-autotask-scheduler.service 2>/dev/null || true',
+        'printf "telegram-enabled="; systemctl is-enabled moodle-autotask-telegram.service 2>/dev/null || true',
+        'printf "telegram-active="; systemctl is-active moodle-autotask-telegram.service 2>/dev/null || true',
         'printf "current-release="; readlink /opt/moodle-autotask/current 2>/dev/null || true'
+    )
+    exit 0
+}
+
+if ($Action -eq 'Activate') {
+    Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Activate application services' -Commands @(
+        'set -eu',
+        'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-scheduler',
+        'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-telegram',
+        'test -x /usr/local/sbin/moodle-autotask-refresh-config',
+        '/usr/local/sbin/moodle-autotask-refresh-config',
+        'systemctl daemon-reload',
+        'if ! systemctl enable moodle-autotask-scheduler.service moodle-autotask-telegram.service; then systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service || true; exit 1; fi',
+        'if ! systemctl start moodle-autotask-scheduler.service moodle-autotask-telegram.service; then systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service || true; systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service || true; exit 1; fi',
+        'systemctl is-active --quiet moodle-autotask-scheduler.service',
+        'systemctl is-active --quiet moodle-autotask-telegram.service',
+        "echo 'activated-environment=$Environment'"
+    )
+    exit 0
+}
+
+if ($Action -eq 'Deactivate') {
+    Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Deactivate application services' -Commands @(
+        'set -eu',
+        'systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service || true',
+        'systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service || true',
+        'echo services-deactivated'
     )
     exit 0
 }
@@ -259,12 +291,15 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     "python3 -m venv '$releaseRoot/venv'",
     "'$releaseRoot/venv/bin/pip' install --disable-pip-version-check --no-deps '$remoteWheel'",
     "'$releaseRoot/venv/bin/moodle-autotask-scheduler' --help >/dev/null",
-    'was_active=false; if systemctl is-active --quiet moodle-autotask-scheduler.service; then was_active=true; systemctl stop moodle-autotask-scheduler.service; fi',
-    "sed -i 's|/opt/moodle-autotask/venv/bin|/opt/moodle-autotask/current/venv/bin|' /etc/systemd/system/moodle-autotask-scheduler.service",
+    "'$releaseRoot/venv/bin/moodle-autotask-telegram' --help >/dev/null",
+    'scheduler_was_active=false; if systemctl is-active --quiet moodle-autotask-scheduler.service; then scheduler_was_active=true; systemctl stop moodle-autotask-scheduler.service; fi',
+    'telegram_was_active=false; if systemctl is-active --quiet moodle-autotask-telegram.service; then telegram_was_active=true; systemctl stop moodle-autotask-telegram.service; fi',
     "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
     'mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current',
+    "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment'",
     'systemctl daemon-reload',
-    'if [ "$was_active" = true ]; then systemctl start moodle-autotask-scheduler.service; fi',
+    'if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service; fi',
+    'if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service; fi',
     "rm -f '$remoteWheel'",
     "echo 'deployed-commit=$commitSha'",
     "echo 'deployed-sha256=$wheelDigest'"

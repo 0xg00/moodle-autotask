@@ -16,6 +16,7 @@ dependencies = []
 moodle-autotask-moodle = "moddle_autotask.adapters.moodle.cli:main"
 moodle-autotask-scheduler = "moddle_autotask.adapters.moodle.scheduler_cli:main"
 moodle-autotask-telegram = "moddle_autotask.adapters.moodle.telegram_cli:main"
+moodle-autotask-controller = "moddle_autotask.adapters.aws.controller_service:main"
 
 [project.optional-dependencies]
 dev = ["mypy>=1.10", "pytest>=8.0", "ruff>=0.5"]

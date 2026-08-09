@@ -53,10 +53,13 @@ data "aws_iam_policy_document" "controller" {
   }
 
   statement {
-    sid       = "ReadMoodleToken"
-    effect    = "Allow"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.moodle_token.arn]
+    sid     = "ReadRuntimeSecrets"
+    effect  = "Allow"
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      aws_secretsmanager_secret.moodle_token.arn,
+      aws_secretsmanager_secret.telegram_config.arn,
+    ]
   }
 }
 

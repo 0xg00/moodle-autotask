@@ -33,6 +33,8 @@ def test_controller_role_cannot_create_labs_or_change_iam() -> None:
 
     assert "AmazonSSMManagedInstanceCore" in policy
     assert '"secretsmanager:GetSecretValue"' in policy
+    assert "aws_secretsmanager_secret.moodle_token.arn" in policy
+    assert "aws_secretsmanager_secret.telegram_config.arn" in policy
     assert "ec2:RunInstances" not in policy
     assert "iam:Create" not in policy
     assert "iam:Put" not in policy
@@ -91,5 +93,32 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "[IO.File]::WriteAllText" in script
     assert "'file://' + $parametersPath.Replace" in script
     assert "moodle-autotask-scheduler.service" in script
-    assert "systemctl enable" not in script
+    assert "moodle-autotask-telegram.service" in script
+    assert "moodle-autotask-controller' install" in script
+    assert "ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate')" in script
+    deploy_commands = script.split("$gitStatus =", 1)[1]
+    assert "systemctl enable" not in deploy_commands
+    activation = script.split("if ($Action -eq 'Activate')", 1)[1].split(
+        "if ($Action -eq 'Deactivate')", 1
+    )[0]
+    assert activation.index("moodle-autotask-refresh-config") < activation.index(
+        "systemctl enable"
+    )
+    assert "systemctl stop moodle-autotask-scheduler.service" in activation
+    assert "systemctl disable moodle-autotask-scheduler.service" in activation
     assert "--secret-string" not in script
+
+
+def test_telegram_secret_has_no_terraform_value_and_services_stay_disabled() -> None:
+    storage = (AWS_ROOT / "controller" / "storage.tf").read_text(encoding="utf-8")
+    compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")
+    cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'resource "aws_secretsmanager_secret" "telegram_config"' in storage
+    assert "secret_version" not in storage and "secret_string" not in storage
+    assert "telegram_secret_arn" in compute
+    assert "moodle-autotask-telegram run" in cloud_init
+    assert "--telegram-config-file" in cloud_init and "--approval-state" in cloud_init
+    assert "systemctl enable --now moodle-autotask" not in cloud_init

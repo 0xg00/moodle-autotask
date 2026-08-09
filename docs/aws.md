@@ -12,7 +12,7 @@ Terraform does not own Moodle token values, student files, or individual lab ins
 - EC2 requires IMDSv2, uses an encrypted gp3 root volume, has API termination protection, and
   receives temporary credentials from an instance profile.
 - The controller instance profile can access only the project artifact prefixes, the exact Moodle
-  token secret, Systems Manager channels, and one exact `sts:AssumeRole` target. It cannot call
+  and Telegram secrets, Systems Manager channels, and one exact `sts:AssumeRole` target. It cannot call
   EC2 lab APIs or change IAM directly.
 - The separate lab provisioner can use only the approved Windows AMI, dedicated subnet,
   no-ingress security group, fixed instance profile, approved instance sizes, encrypted volume
@@ -22,8 +22,8 @@ Terraform does not own Moodle token values, student files, or individual lab ins
   create another lab, or change IAM.
 - S3 state and artifacts have public access blocked, versioning, default encryption, and an
   explicit deny for non-TLS requests.
-- Terraform creates the Secrets Manager container but never a secret version. Put the complete
-  local Moodle token JSON into the secret outside Terraform so it never enters state or Git.
+- Terraform creates separate Moodle and Telegram Secrets Manager containers but never secret
+  versions. Put their complete JSON values into AWS outside Terraform so neither enters state or Git.
 - The subnet has an internet route because real Moodle and package repositories are external. The
   instance receives a public egress address, but the security group accepts no inbound traffic.
 
@@ -95,7 +95,7 @@ and verifies EC2 ownership tags plus Systems Manager readiness. There is no RDP 
 agent runtime will use audited Systems Manager commands after the existing start-work approval; the
 provider alone does not execute practice instructions.
 
-## Store the Moodle token value
+## Store runtime secret values
 
 The secret value must be the complete JSON token file already accepted by the connector. Do not
 pass a token literal on the command line:
@@ -108,13 +108,32 @@ aws secretsmanager put-secret-value `
   --profile moodle-autotask
 ```
 
-The scheduler service is installed but remains disabled until a reviewed application artifact is
-deployed. This prevents a half-installed controller from polling Moodle. The bootstrap pins AWS CLI
-v2 and verifies its archive against the committed SHA-256 before installation.
+Create a Telegram bot separately, open its private chat, and store the exact protected configuration
+accepted by the application. `chatId` and `allowedUserId` are positive numeric IDs and normally equal
+for the intended single-user private chat:
+
+```json
+{"botToken":"<TELEGRAM_BOT_TOKEN>","chatId":123456789,"allowedUserId":123456789}
+```
+
+```powershell
+aws secretsmanager put-secret-value `
+  --secret-id 'moodle-autotask/development/telegram-config' `
+  --secret-string file://.runtime/telegram.json `
+  --region eu-south-2 `
+  --profile moodle-autotask
+```
+
+The controller role can read exactly these two secret ARNs. Terraform does not receive either value.
+
+The scheduler and outbound Telegram poller services are installed but remain disabled until a
+reviewed application artifact and both valid secret values exist. This prevents a half-installed
+controller from polling Moodle or Telegram. The bootstrap pins AWS CLI v2 and verifies its archive
+against the committed SHA-256 before installation.
 
 Deploy a clean committed revision as a digest-bound wheel. The helper uploads it to the private
 artifact bucket, verifies the same SHA-256 on EC2, installs an immutable release, and atomically
-updates `/opt/moodle-autotask/current`. It never enables the scheduler:
+updates `/opt/moodle-autotask/current`. `Deploy` never enables either service:
 
 ```powershell
 .\scripts\aws-deploy.ps1 `
@@ -127,6 +146,18 @@ updates `/opt/moodle-autotask/current`. It never enables the scheduler:
   -AccountId '<AWS_ACCOUNT_ID>' `
   -Profile 'moodle-autotask'
 ```
+
+After both secret values exist, activation first refreshes and validates them, then enables and
+starts both units together. Any start failure stops and disables both. Deactivation is explicit:
+
+```powershell
+.\scripts\aws-deploy.ps1 -Action Activate -AccountId '<AWS_ACCOUNT_ID>' -Profile 'moodle-autotask'
+.\scripts\aws-deploy.ps1 -Action Deactivate -AccountId '<AWS_ACCOUNT_ID>' -Profile 'moodle-autotask'
+```
+
+Both units use outbound HTTPS only, run as the unprivileged `moodle-autotask` account, and share the
+approval SQLite database. The root-only pre-start refresher serializes concurrent refreshes, validates
+both JSON shapes, writes mode-`0600` files atomically, and never places secret values on a command line.
 
 ## Verify operations
 

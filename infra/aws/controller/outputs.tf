@@ -18,6 +18,11 @@ output "moodle_token_secret_arn" {
   value       = aws_secretsmanager_secret.moodle_token.arn
 }
 
+output "telegram_config_secret_arn" {
+  description = "Telegram secret container ARN; Terraform never manages its value."
+  value       = aws_secretsmanager_secret.telegram_config.arn
+}
+
 output "ssm_start_session_command" {
   description = "Command for an audited shell without SSH or inbound ports."
   value       = "aws ssm start-session --target ${aws_instance.controller.id} --region ${var.region}"

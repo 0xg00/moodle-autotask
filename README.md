@@ -12,8 +12,8 @@ lab, execute agents, or authorize Moodle submission.
 
 The repository now also defines an isolated AWS controller and ephemeral lab boundary in Terraform.
 It creates a Linux controller with no inbound network access, encrypted private storage, Systems
-Manager access, an empty Secrets Manager container, separate capability-limited lab roles, and a
-commit/digest-bound deployment helper. The helper never enables the scheduler, and the boundary
+Manager access, empty Moodle and Telegram Secrets Manager containers, separate capability-limited
+lab roles, and a commit/digest-bound deployment helper. Deployment never enables the services, and the boundary
 does not launch a lab without an approved application workflow. See
 [AWS controller documentation](docs/aws.md).
 

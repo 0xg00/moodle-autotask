@@ -14,10 +14,11 @@ resource "aws_instance" "controller" {
   user_data_replace_on_change = false
 
   user_data = templatefile("${path.module}/cloud-init.sh.tftpl", {
-    region             = var.region
-    secret_arn         = aws_secretsmanager_secret.moodle_token.arn
-    project_name       = var.project_name
-    scheduler_interval = 86400
+    region              = var.region
+    secret_arn          = aws_secretsmanager_secret.moodle_token.arn
+    telegram_secret_arn = aws_secretsmanager_secret.telegram_config.arn
+    project_name        = var.project_name
+    scheduler_interval  = 86400
   })
 
   metadata_options {

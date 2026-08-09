@@ -101,3 +101,9 @@ resource "aws_secretsmanager_secret" "moodle_token" {
   description             = "Moodle mobile token JSON consumed by the controller"
   recovery_window_in_days = 7
 }
+
+resource "aws_secretsmanager_secret" "telegram_config" {
+  name                    = "${var.project_name}/${var.environment}/telegram-config"
+  description             = "Telegram bot and private approval identities consumed by the controller"
+  recovery_window_in_days = 7
+}
