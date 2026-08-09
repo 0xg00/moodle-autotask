@@ -256,7 +256,7 @@ if ($Action -eq 'CodexSmoke') {
         '! id -nG moodle-agent | tr '' '' ''\n'' | grep -Fxq moodle-autotask',
         'if runuser -u moodle-agent -- test -r /etc/moodle-autotask/moodle-token.json; then echo secret-boundary-failed; exit 1; fi',
         'install -d -o moodle-agent -g moodle-agent -m 0700 /var/lib/moodle-agent/smoke',
-        'runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex sandbox -C /var/lib/moodle-agent/smoke -- sh -c ''test ! -r /var/lib/moodle-agent/.codex/auth.json && test ! -r /etc/moodle-autotask/moodle-token.json && test -w /var/lib/moodle-agent/smoke''',
+        'runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex sandbox --permission-profile moodle-autotask --include-managed-config -C /var/lib/moodle-agent/smoke -- sh -c ''test ! -r /var/lib/moodle-agent/.codex/auth.json && test ! -r /etc/moodle-autotask/moodle-token.json && test -w /var/lib/moodle-agent/smoke''',
         'result="$(timeout 120s runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex exec --ephemeral --skip-git-repo-check --color never -C /var/lib/moodle-agent/smoke ''Reply with exactly: CODEX_SMOKE_OK'')"',
         'test "$result" = "CODEX_SMOKE_OK"',
         'echo codex-smoke=ok',

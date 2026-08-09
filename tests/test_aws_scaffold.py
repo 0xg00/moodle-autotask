@@ -157,7 +157,10 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "/usr/local/sbin/moodle-autotask-install-codex" in script
     assert "moodle-autotask-codex-login.service" in script
     assert "CODEX_HOME=/var/lib/moodle-agent/.codex" in script
-    assert "moodle-autotask-codex sandbox -C /var/lib/moodle-agent/smoke -- sh -c" in script
+    assert (
+        "moodle-autotask-codex sandbox --permission-profile moodle-autotask "
+        "--include-managed-config -C /var/lib/moodle-agent/smoke -- sh -c"
+    ) in script
     assert "test ! -r /var/lib/moodle-agent/.codex/auth.json" in script
     assert "test ! -r /etc/moodle-autotask/moodle-token.json" in script
     assert "codex-sandbox=isolated" in script
