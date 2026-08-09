@@ -167,6 +167,30 @@ All three units use outbound connections only, run as the unprivileged `moodle-a
 approval SQLite database. The root-only pre-start refresher serializes concurrent refreshes, validates
 both JSON shapes, writes mode-`0600` files atomically, and never places secret values on a command line.
 
+## Link the central Codex agent
+
+Each deployment installs the pinned official Codex CLI archive only after verifying both the archive
+and extracted binary SHA-256. Codex runs as the separate `moodle-agent` system account. That account
+is not a member of the application group, cannot read `/etc/moodle-autotask`, and stores its login in
+`/var/lib/moodle-agent/.codex/auth.json` with private permissions.
+
+Start the headless device-code flow after the first deployment:
+
+```powershell
+.\scripts\aws-deploy.ps1 `
+  -Action CodexLogin `
+  -AccountId '<AWS_ACCOUNT_ID>' `
+  -Profile 'moodle-autotask'
+```
+
+Open the URL shown by the command and enter its one-time code. A successful login is cached and
+refreshed by Codex during normal use; a new code is not required for every Moodle task. Authentication
+is requested again only after logout, revocation, deletion of the persistent cache, an account policy
+change, or a refresh failure. Never copy, print, commit, or place `auth.json` in Secrets Manager.
+
+`-Action Status` reports only `authenticated` or `unauthenticated`; it never returns tokens. The login
+unit is transient and cannot read the Moodle or Telegram secret directory.
+
 ## Verify operations
 
 Wait until the instance appears as `Online` in Systems Manager, then use the output command:

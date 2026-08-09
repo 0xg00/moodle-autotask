@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate')]
+    [ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate', 'CodexLogin')]
     [string]$Action = 'Deploy',
 
     [Parameter(Mandatory)]
@@ -222,7 +222,26 @@ if ($Action -eq 'Status') {
         'printf "telegram-active="; systemctl is-active moodle-autotask-telegram.service 2>/dev/null || true',
         'printf "worker-enabled="; systemctl is-enabled moodle-autotask-worker.service 2>/dev/null || true',
         'printf "worker-active="; systemctl is-active moodle-autotask-worker.service 2>/dev/null || true',
-        'printf "current-release="; readlink /opt/moodle-autotask/current 2>/dev/null || true'
+        'printf "current-release="; readlink /opt/moodle-autotask/current 2>/dev/null || true',
+        'printf "codex-version="; /usr/local/bin/moodle-autotask-codex --version 2>/dev/null || echo unavailable',
+        'if runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex login status >/dev/null 2>&1; then echo codex-auth=authenticated; else echo codex-auth=unauthenticated; fi'
+    )
+    exit 0
+}
+
+if ($Action -eq 'CodexLogin') {
+    Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Start one-time Codex device login' -Commands @(
+        'set -eu',
+        'test -x /usr/local/bin/moodle-autotask-codex',
+        'test -f /etc/systemd/system/moodle-autotask-codex-login.service',
+        'if runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex login status >/dev/null 2>&1; then echo codex-auth=authenticated; exit 0; fi',
+        'systemctl stop moodle-autotask-codex-login.service 2>/dev/null || true',
+        'systemctl reset-failed moodle-autotask-codex-login.service 2>/dev/null || true',
+        'systemctl start --no-block moodle-autotask-codex-login.service',
+        'sleep 3',
+        'invocation_id="$(systemctl show moodle-autotask-codex-login.service --property=InvocationID --value)"',
+        'test "$invocation_id" != ""',
+        'journalctl "_SYSTEMD_INVOCATION_ID=$invocation_id" --no-pager --output=cat'
     )
     exit 0
 }
@@ -396,6 +415,8 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
     'mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current',
     "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment' --provisioner-role-arn '$labRoleArn' --subnet-id '$labSubnetId' --security-group-id '$labSecurityGroupId' --instance-profile-name '$labInstanceProfileName' --image-id '$labImageId' --artifact-bucket '$artifactBucket' --image-importer-role-arn '$imageImporterRoleArn' --vmimport-role-name '$vmImportRoleName' --instance-type '$LabInstanceType' --root-volume-size-gib '$LabRootVolumeSizeGiB'",
+    '/usr/local/sbin/moodle-autotask-install-codex',
+    'test -x /usr/local/bin/moodle-autotask-codex',
     'systemctl daemon-reload',
     'if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service; fi',
     'if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service; fi',

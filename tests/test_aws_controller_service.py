@@ -34,11 +34,15 @@ def _lab_config() -> ControllerLabConfig:
 def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: Path) -> None:
     install_controller_services(tmp_path, "eu-south-2", "development")
     refresh = tmp_path / "usr/local/sbin/moodle-autotask-refresh-config"
+    codex_installer = tmp_path / "usr/local/sbin/moodle-autotask-install-codex"
+    codex_login = tmp_path / "etc/systemd/system/moodle-autotask-codex-login.service"
     scheduler = tmp_path / "etc/systemd/system/moodle-autotask-scheduler.service"
     telegram = tmp_path / "etc/systemd/system/moodle-autotask-telegram.service"
     refresh_text = refresh.read_text(encoding="utf-8")
     scheduler_text = scheduler.read_text(encoding="utf-8")
     telegram_text = telegram.read_text(encoding="utf-8")
+    codex_installer_text = codex_installer.read_text(encoding="utf-8")
+    codex_login_text = codex_login.read_text(encoding="utf-8")
 
     assert "moodle-autotask/development/moodle-token" in refresh_text
     assert "moodle-autotask/development/telegram-config" in refresh_text
@@ -50,6 +54,23 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "--telegram-config-file /etc/moodle-autotask/telegram.json" in scheduler_text
     assert "--approval-state /var/lib/moodle-autotask/approval.sqlite3" in scheduler_text
     assert "moodle-autotask-telegram run" in telegram_text
+    assert "rust-v0.147.0/codex-x86_64-unknown-linux-musl.tar.gz" in codex_installer_text
+    assert "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36" in (
+        codex_installer_text
+    )
+    assert "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40" in (
+        codex_installer_text
+    )
+    assert "cli_auth_credentials_store = \"file\"" in codex_installer_text
+    assert "forced_login_method = \"chatgpt\"" in codex_installer_text
+    assert "moodle-agent must not belong to the application secret group" in (
+        codex_installer_text
+    )
+    assert "--device-auth" in codex_login_text
+    assert "User=moodle-agent" in codex_login_text
+    assert "ReadWritePaths=/var/lib/moodle-agent" in codex_login_text
+    assert "/etc/moodle-autotask" not in codex_login_text
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex_login_text
     for unit in (scheduler_text, telegram_text):
         assert "NoNewPrivileges=true" in unit
         assert "ProtectSystem=strict" in unit
@@ -58,14 +79,17 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
         assert "ExecStartPre=+/usr/local/sbin/moodle-autotask-refresh-config" in unit
     if os.name != "nt":
         assert stat.S_IMODE(refresh.stat().st_mode) == 0o750
+        assert stat.S_IMODE(codex_installer.stat().st_mode) == 0o750
+        assert stat.S_IMODE(codex_login.stat().st_mode) == 0o644
         assert stat.S_IMODE(scheduler.stat().st_mode) == 0o644
         assert stat.S_IMODE(telegram.stat().st_mode) == 0o644
     bash = shutil.which("bash")
     if bash is not None:
-        result = subprocess.run(
-            [bash, "-n"], input=refresh_text.encode(), capture_output=True, timeout=10
-        )
-        assert result.returncode == 0, result.stderr.decode(errors="replace")
+        for script in (refresh_text, codex_installer_text):
+            result = subprocess.run(
+                [bash, "-n"], input=script.encode(), capture_output=True, timeout=10
+            )
+            assert result.returncode == 0, result.stderr.decode(errors="replace")
 
 
 def test_installer_is_idempotent_and_replaces_only_regular_targets(tmp_path: Path) -> None:

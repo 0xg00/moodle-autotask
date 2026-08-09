@@ -141,7 +141,13 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "--image-importer-role-arn '$imageImporterRoleArn'" in script
     assert "--vmimport-role-name '$vmImportRoleName'" in script
     assert "moodle-autotask-controller' install" in script
-    assert "ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate')" in script
+    assert (
+        "ValidateSet('Deploy', 'Status', 'Activate', 'Deactivate', 'CodexLogin')"
+        in script
+    )
+    assert "/usr/local/sbin/moodle-autotask-install-codex" in script
+    assert "moodle-autotask-codex-login.service" in script
+    assert "CODEX_HOME=/var/lib/moodle-agent/.codex" in script
     deploy_commands = script.split("$gitStatus =", 1)[1]
     assert "systemctl enable" not in deploy_commands
     activation = script.split("if ($Action -eq 'Activate')", 1)[1].split(

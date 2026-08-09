@@ -22,6 +22,13 @@ class ControllerServiceError(RuntimeError):
 _REGION = re.compile(r"^[a-z]{2}-[a-z]+-[0-9]$")
 _ENVIRONMENT = re.compile(r"^[a-z0-9][a-z0-9-]{1,19}$")
 _PROJECT = "moodle-autotask"
+_CODEX_VERSION = "0.147.0"
+_CODEX_ARCHIVE_SHA256 = (
+    "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36"
+)
+_CODEX_BINARY_SHA256 = (
+    "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +65,23 @@ def install_controller_services(
         raise ControllerServiceError("controller environment is invalid")
     secret_prefix = f"{_PROJECT}/{environment}"
     refresh = _refresh_script(region, secret_prefix)
+    codex_installer = _codex_installer_script()
+    codex_login = _codex_login_unit()
     scheduler = _scheduler_unit()
     telegram = _telegram_unit()
     _write(root, Path("usr/local/sbin/moodle-autotask-refresh-config"), refresh, 0o750)
+    _write(
+        root,
+        Path("usr/local/sbin/moodle-autotask-install-codex"),
+        codex_installer,
+        0o750,
+    )
+    _write(
+        root,
+        Path("etc/systemd/system/moodle-autotask-codex-login.service"),
+        codex_login,
+        0o644,
+    )
     _write(
         root,
         Path("etc/systemd/system/moodle-autotask-scheduler.service"),
@@ -251,6 +272,124 @@ mv -f "$temporary_directory/telegram.json" /etc/moodle-autotask/telegram.json
 trap - EXIT
 rmdir "$temporary_directory"
 """
+
+
+def _codex_installer_script() -> str:
+    archive_name = "codex-x86_64-unknown-linux-musl"
+    archive_url = (
+        "https://github.com/openai/codex/releases/download/"
+        f"rust-v{_CODEX_VERSION}/{archive_name}.tar.gz"
+    )
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+agent_user=moodle-agent
+agent_home=/var/lib/moodle-agent
+codex_home="$agent_home/.codex"
+version={shlex.quote(_CODEX_VERSION)}
+archive_url={shlex.quote(archive_url)}
+archive_sha256={shlex.quote(_CODEX_ARCHIVE_SHA256)}
+binary_sha256={shlex.quote(_CODEX_BINARY_SHA256)}
+binary_name={shlex.quote(archive_name)}
+install_root="/opt/moodle-autotask/codex/$version"
+install_target="$install_root/codex"
+
+if id --user "$agent_user" >/dev/null 2>&1; then
+  passwd_entry="$(getent passwd "$agent_user")"
+  IFS=: read -r account_name _ account_uid _ _ account_home _ <<<"$passwd_entry"
+  test "$account_name" = "$agent_user"
+  test "$account_uid" -ne 0
+  test "$account_home" = "$agent_home"
+else
+  useradd --system --home-dir "$agent_home" --create-home \
+    --shell /usr/sbin/nologin "$agent_user"
+fi
+if id -nG "$agent_user" | tr ' ' '\n' | grep -Fxq moodle-autotask; then
+  echo 'moodle-agent must not belong to the application secret group' >&2
+  exit 1
+fi
+
+install -d -o "$agent_user" -g "$agent_user" -m 0700 "$agent_home" "$codex_home"
+if [ -e "$codex_home/auth.json" ] || [ -L "$codex_home/auth.json" ]; then
+  test -f "$codex_home/auth.json"
+  test ! -L "$codex_home/auth.json"
+  test "$(stat -c '%U:%G:%a' "$codex_home/auth.json")" = \
+    "$agent_user:$agent_user:600"
+fi
+
+temporary_directory="$(mktemp -d /tmp/moodle-autotask-codex.XXXXXX)"
+cleanup() {{
+  rm -rf "$temporary_directory"
+}}
+trap cleanup EXIT
+
+if [ ! -f "$install_target" ] || \
+   [ "$(sha256sum "$install_target" | cut -d ' ' -f 1)" != "$binary_sha256" ]; then
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --fail --silent --show-error --location "$archive_url" \
+    --output "$temporary_directory/codex.tar.gz"
+  echo "$archive_sha256  $temporary_directory/codex.tar.gz" \
+    | sha256sum --check --strict
+  test "$(tar -tzf "$temporary_directory/codex.tar.gz")" = "$binary_name"
+  tar -xzf "$temporary_directory/codex.tar.gz" --no-same-owner \
+    --no-same-permissions -C "$temporary_directory"
+  test -f "$temporary_directory/$binary_name"
+  test ! -L "$temporary_directory/$binary_name"
+  echo "$binary_sha256  $temporary_directory/$binary_name" \
+    | sha256sum --check --strict
+  install -d -o root -g root -m 0755 "$install_root"
+  install -o root -g root -m 0755 \
+    "$temporary_directory/$binary_name" "$install_target"
+fi
+echo "$binary_sha256  $install_target" | sha256sum --check --strict
+ln -sfn "$install_target" /usr/local/bin/moodle-autotask-codex.next
+mv -Tf /usr/local/bin/moodle-autotask-codex.next \
+  /usr/local/bin/moodle-autotask-codex
+
+cat >"$temporary_directory/config.toml" <<'CONFIG'
+cli_auth_credentials_store = "file"
+forced_login_method = "chatgpt"
+CONFIG
+install -o "$agent_user" -g "$agent_user" -m 0600 \
+  "$temporary_directory/config.toml" "$codex_home/config.toml"
+test "$(/usr/local/bin/moodle-autotask-codex --version)" = \
+  "codex-cli $version"
+"""
+
+
+def _codex_login_unit() -> str:
+    return "\n".join(
+        (
+            "[Unit]",
+            "Description=Moodle Autotask one-time Codex device login",
+            "Wants=network-online.target",
+            "After=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            "User=moodle-agent",
+            "Group=moodle-agent",
+            "Environment=HOME=/var/lib/moodle-agent",
+            "Environment=CODEX_HOME=/var/lib/moodle-agent/.codex",
+            "WorkingDirectory=/var/lib/moodle-agent",
+            "ExecStart=/usr/local/bin/moodle-autotask-codex login --device-auth",
+            "TimeoutStartSec=15min",
+            "UMask=0077",
+            "NoNewPrivileges=true",
+            "PrivateDevices=true",
+            "PrivateTmp=true",
+            "ProtectControlGroups=true",
+            "ProtectHome=true",
+            "ProtectKernelModules=true",
+            "ProtectKernelTunables=true",
+            "ProtectSystem=strict",
+            "ReadWritePaths=/var/lib/moodle-agent",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "RestrictSUIDSGID=true",
+            "",
+        )
+    )
 
 
 def _scheduler_unit() -> str:
