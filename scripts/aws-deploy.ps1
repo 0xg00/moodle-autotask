@@ -1,0 +1,271 @@
+[CmdletBinding()]
+param(
+    [ValidateSet('Deploy', 'Status')]
+    [string]$Action = 'Deploy',
+
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9]{12}$')]
+    [string]$AccountId,
+
+    [ValidatePattern('^[a-z]{2}-[a-z]+-[0-9]$')]
+    [string]$Region = 'eu-south-2',
+
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')]
+    [string]$Profile = 'moodle-autotask',
+
+    [ValidatePattern('^$|^i-[0-9a-f]{8,17}$')]
+    [string]$InstanceId = ''
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$runtimeRoot = Join-Path $repoRoot '.runtime\aws-deploy'
+$artifactBucket = "moodle-autotask-artifacts-$AccountId-$Region"
+
+function Resolve-AwsCli {
+    $command = Get-Command aws -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+
+    $perUserPath = Join-Path $env:LOCALAPPDATA 'Programs\Amazon\AWSCLIV2\aws.exe'
+    if (Test-Path -LiteralPath $perUserPath -PathType Leaf) {
+        return $perUserPath
+    }
+
+    throw 'AWS CLI v2 was not found.'
+}
+
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Executable,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $Executable @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        $detail = ($output | Out-String).Trim()
+        throw "Native command failed: $Executable. $detail"
+    }
+    return @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+}
+
+function Invoke-Aws {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    return Invoke-Native -Executable $script:awsCli -Arguments (
+        $Arguments + @('--region', $Region, '--profile', $Profile)
+    )
+}
+
+function Initialize-RuntimeRoot {
+    if (Test-Path -LiteralPath $runtimeRoot) {
+        $runtimeItem = Get-Item -Force -LiteralPath $runtimeRoot
+        if ($runtimeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'The deployment runtime directory cannot be a reparse point.'
+        }
+        return
+    }
+
+    New-Item -ItemType Directory -Path $runtimeRoot | Out-Null
+}
+
+function Resolve-ControllerInstanceId {
+    if ($InstanceId) {
+        return $InstanceId
+    }
+
+    $response = Invoke-Aws -Arguments @(
+        'ec2', 'describe-instances',
+        '--filters',
+        'Name=tag:Project,Values=moodle-autotask',
+        'Name=tag:Role,Values=controller',
+        'Name=instance-state-name,Values=running',
+        '--query', 'Reservations[].Instances[].InstanceId',
+        '--output', 'json'
+    )
+    $ids = @($response | ConvertFrom-Json)
+    if ($ids.Count -ne 1 -or $ids[0] -notmatch '^i-[0-9a-f]{8,17}$') {
+        throw 'Expected exactly one running Moodle Autotask controller instance.'
+    }
+    return [string]$ids[0]
+}
+
+function Wait-SsmCommand {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandId,
+
+        [Parameter(Mandatory)]
+        [string]$TargetInstanceId
+    )
+
+    $terminalStatuses = @('Success', 'Cancelled', 'TimedOut', 'Failed', 'Cancelling')
+    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+        Start-Sleep -Seconds 2
+        try {
+            $response = Invoke-Aws -Arguments @(
+                'ssm', 'get-command-invocation',
+                '--command-id', $CommandId,
+                '--instance-id', $TargetInstanceId,
+                '--output', 'json'
+            )
+        }
+        catch {
+            if ($attempt -lt 5) {
+                continue
+            }
+            throw
+        }
+
+        $invocation = $response | ConvertFrom-Json
+        if ($terminalStatuses -notcontains $invocation.Status) {
+            continue
+        }
+        if ($invocation.Status -ne 'Success' -or $invocation.ResponseCode -ne 0) {
+            throw "SSM command failed with status $($invocation.Status)."
+        }
+        if ($invocation.StandardOutputContent) {
+            $invocation.StandardOutputContent.TrimEnd() | Write-Output
+        }
+        return
+    }
+
+    throw 'SSM command did not finish within 180 seconds.'
+}
+
+function Send-ControllerCommand {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TargetInstanceId,
+
+        [Parameter(Mandatory)]
+        [string[]]$Commands,
+
+        [Parameter(Mandatory)]
+        [string]$Comment
+    )
+
+    $parameters = @{ commands = $Commands } | ConvertTo-Json -Compress
+    $parametersPath = Join-Path $runtimeRoot "ssm-$([Guid]::NewGuid().ToString('N')).json"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($parametersPath, $parameters, $utf8NoBom)
+    try {
+        $parametersUri = 'file://' + $parametersPath.Replace('\', '/')
+        $commandId = (
+            Invoke-Aws -Arguments @(
+                'ssm', 'send-command',
+                '--instance-ids', $TargetInstanceId,
+                '--document-name', 'AWS-RunShellScript',
+                '--comment', $Comment,
+                '--parameters', $parametersUri,
+                '--timeout-seconds', '180',
+                '--query', 'Command.CommandId',
+                '--output', 'text'
+            )
+        ).Trim()
+    }
+    finally {
+        Remove-Item -Force -LiteralPath $parametersPath -ErrorAction SilentlyContinue
+    }
+    if ($commandId -notmatch '^[0-9a-f-]{36}$') {
+        throw 'AWS returned an invalid SSM command ID.'
+    }
+    Wait-SsmCommand -CommandId $commandId -TargetInstanceId $TargetInstanceId
+}
+
+$script:awsCli = Resolve-AwsCli
+$identityAccountId = (
+    Invoke-Aws -Arguments @('sts', 'get-caller-identity', '--query', 'Account', '--output', 'text')
+).Trim()
+if ($identityAccountId -ne $AccountId) {
+    throw 'The authenticated AWS account does not match AccountId.'
+}
+
+Initialize-RuntimeRoot
+$controllerInstanceId = Resolve-ControllerInstanceId
+
+if ($Action -eq 'Status') {
+    Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Inspect application deployment' -Commands @(
+        'set -eu',
+        'printf "service-enabled="; systemctl is-enabled moodle-autotask-scheduler.service 2>/dev/null || true',
+        'printf "service-active="; systemctl is-active moodle-autotask-scheduler.service 2>/dev/null || true',
+        'printf "current-release="; readlink /opt/moodle-autotask/current 2>/dev/null || true'
+    )
+    exit 0
+}
+
+$gitStatus = Invoke-Native -Executable 'git' -Arguments @(
+    '-C', $repoRoot, 'status', '--porcelain', '--untracked-files=all'
+)
+if ($gitStatus) {
+    throw 'Deploy requires a clean Git worktree.'
+}
+
+$commitSha = (
+    Invoke-Native -Executable 'git' -Arguments @('-C', $repoRoot, 'rev-parse', 'HEAD')
+).Trim()
+if ($commitSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'Git returned an invalid commit SHA.'
+}
+
+$wheelRoot = Join-Path $runtimeRoot $commitSha
+if (-not (Test-Path -LiteralPath $wheelRoot)) {
+    New-Item -ItemType Directory -Path $wheelRoot | Out-Null
+}
+
+Invoke-Native -Executable 'python' -Arguments @(
+    '-m', 'pip', 'wheel', '--disable-pip-version-check', '--no-deps',
+    '--wheel-dir', $wheelRoot, $repoRoot
+) | Write-Output
+
+$wheels = @(Get-ChildItem -File -LiteralPath $wheelRoot -Filter 'moddle_autotask-*.whl')
+if ($wheels.Count -ne 1) {
+    throw 'Expected exactly one Moodle Autotask wheel.'
+}
+$wheel = $wheels[0]
+$wheelDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $wheel.FullName).Hash.ToLowerInvariant()
+if ($wheelDigest -notmatch '^[0-9a-f]{64}$') {
+    throw 'Wheel digest is invalid.'
+}
+
+$artifactKey = "controller/releases/$commitSha/$wheelDigest/$($wheel.Name)"
+$artifactUri = "s3://$artifactBucket/$artifactKey"
+Invoke-Aws -Arguments @('s3', 'cp', $wheel.FullName, $artifactUri, '--only-show-errors') | Out-Null
+
+$releaseRoot = "/opt/moodle-autotask/releases/$wheelDigest"
+$remoteWheel = "/tmp/$($wheel.Name)"
+Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy $commitSha" -Commands @(
+    'set -eu',
+    "aws s3 cp '$artifactUri' '$remoteWheel' --only-show-errors",
+    "echo '$wheelDigest  $remoteWheel' | sha256sum --check --strict",
+    "install -d -o root -g root -m 0755 '$releaseRoot'",
+    "python3 -m venv '$releaseRoot/venv'",
+    "'$releaseRoot/venv/bin/pip' install --disable-pip-version-check --no-deps '$remoteWheel'",
+    "'$releaseRoot/venv/bin/moodle-autotask-scheduler' --help >/dev/null",
+    'was_active=false; if systemctl is-active --quiet moodle-autotask-scheduler.service; then was_active=true; systemctl stop moodle-autotask-scheduler.service; fi',
+    "sed -i 's|/opt/moodle-autotask/venv/bin|/opt/moodle-autotask/current/venv/bin|' /etc/systemd/system/moodle-autotask-scheduler.service",
+    "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
+    'mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current',
+    'systemctl daemon-reload',
+    'if [ "$was_active" = true ]; then systemctl start moodle-autotask-scheduler.service; fi',
+    "rm -f '$remoteWheel'",
+    "echo 'deployed-commit=$commitSha'",
+    "echo 'deployed-sha256=$wheelDigest'"
+)

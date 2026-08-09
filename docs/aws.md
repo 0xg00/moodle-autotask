@@ -84,9 +84,24 @@ aws secretsmanager put-secret-value `
 ```
 
 The scheduler service is installed but remains disabled until a reviewed application artifact is
-deployed under `/opt/moodle-autotask/venv`. This prevents a half-installed controller from polling
-Moodle. The bootstrap pins AWS CLI v2 and verifies its archive against the committed SHA-256 before
-installation.
+deployed. This prevents a half-installed controller from polling Moodle. The bootstrap pins AWS CLI
+v2 and verifies its archive against the committed SHA-256 before installation.
+
+Deploy a clean committed revision as a digest-bound wheel. The helper uploads it to the private
+artifact bucket, verifies the same SHA-256 on EC2, installs an immutable release, and atomically
+updates `/opt/moodle-autotask/current`. It never enables the scheduler:
+
+```powershell
+.\scripts\aws-deploy.ps1 `
+  -Action Deploy `
+  -AccountId '<AWS_ACCOUNT_ID>' `
+  -Profile 'moodle-autotask'
+
+.\scripts\aws-deploy.ps1 `
+  -Action Status `
+  -AccountId '<AWS_ACCOUNT_ID>' `
+  -Profile 'moodle-autotask'
+```
 
 ## Verify operations
 
