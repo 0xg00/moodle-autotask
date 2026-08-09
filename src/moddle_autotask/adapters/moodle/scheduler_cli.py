@@ -7,12 +7,22 @@ import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Never
+from typing import Never, cast
 
+from .approval_state import ApprovalState
 from .config import MoodleConnectionConfig
-from .scheduler import CycleResult, LocalJsonSink, SchedulerOptions, once, run, summary_json
+from .scheduler import (
+    CycleResult,
+    LocalJsonSink,
+    NotificationSink,
+    SchedulerOptions,
+    once,
+    run,
+    summary_json,
+)
 from .service import MoodleService
 from .state import MoodleState
+from .telegram import TelegramApprovalSink, TelegramClient, TelegramConfig
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -35,6 +45,8 @@ def _parser() -> _SafeArgumentParser:
         child.add_argument("--retry-base-seconds", type=int, default=5)
         child.add_argument("--retry-max-seconds", type=int, default=3600)
         child.add_argument("--request-timeout-seconds", type=int, default=15)
+        child.add_argument("--telegram-config-file", type=Path)
+        child.add_argument("--approval-state", type=Path)
         if command == "run":
             child.add_argument("--interval-seconds", type=int, default=86400)
     return parser
@@ -56,13 +68,26 @@ def main(
             raise ValueError("interval seconds are invalid")
         if not 1 <= args.request_timeout_seconds <= 120:
             raise ValueError("request timeout is invalid")
+        if (args.telegram_config_file is None) != (args.approval_state is None):
+            raise ValueError("Telegram configuration is incomplete")
         config = replace(
             MoodleConnectionConfig.from_token_file(args.token_file),
             timeout_seconds=args.request_timeout_seconds,
         )
         service = service_factory(config)
         state = MoodleState(args.state)
-        sink = LocalJsonSink()
+        sink: NotificationSink
+        if args.telegram_config_file is None:
+            sink = LocalJsonSink()
+        else:
+            telegram_config = TelegramConfig.from_file(args.telegram_config_file)
+            approval_state = ApprovalState(args.approval_state)
+            sink = cast(
+                NotificationSink,
+                TelegramApprovalSink(
+                    telegram_config, TelegramClient(telegram_config), approval_state
+                ),
+            )
         if args.command == "once":
             result = once_runner(state, service, sink, options)
             summary_json(result)

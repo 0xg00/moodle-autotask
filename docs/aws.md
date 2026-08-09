@@ -147,5 +147,7 @@ aws ec2 describe-instances `
   --profile moodle-autotask
 ```
 
-Do not manually call `run-instances`. The next application milestone wires the approved workflow
-record to this provider and adds audited Systems Manager execution and mandatory teardown.
+Do not manually call `run-instances`. Telegram start decisions are now persisted for an exact Moodle
+revision, but no process consumes them to call this provider. The next application milestone wires
+that approved record to a durable workflow and adds audited Systems Manager execution and mandatory
+teardown.

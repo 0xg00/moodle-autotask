@@ -238,3 +238,80 @@ def test_injected_once_and_runner_are_used_without_secrets(
         == 0
     )
     assert seen == [9]
+
+
+def test_telegram_options_must_be_complete_before_state_creation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state.sqlite3"
+    assert (
+        main(
+            [
+                "once",
+                "--state",
+                str(state),
+                "--token-file",
+                str(tmp_path / "moodle.json"),
+                "--telegram-config-file",
+                str(tmp_path / "telegram.json"),
+            ]
+        )
+        == 1
+    )
+    assert not state.exists()
+    assert "telegram.json" not in capsys.readouterr().err
+
+
+def test_scheduler_constructs_telegram_sink_only_when_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
+        lambda path: MoodleConnectionConfig("https://example.test", "safe"),
+    )
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.TelegramConfig.from_file",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
+    )
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.ApprovalState", lambda path: object()
+    )
+    client = object()
+    sink = object()
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.TelegramClient", lambda config: client
+    )
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.TelegramApprovalSink",
+        lambda config, selected_client, state: sink,
+    )
+    seen: list[object] = []
+
+    def once_runner(
+        state: object, service: object, selected_sink: object, options: object
+    ) -> CycleResult:
+        seen.append(selected_sink)
+        return CycleResult(True, 0, 0, 0)
+
+    assert (
+        main(
+            [
+                "once",
+                "--state",
+                str(tmp_path / "moodle-state.sqlite3"),
+                "--token-file",
+                str(tmp_path / "moodle.json"),
+                "--telegram-config-file",
+                str(tmp_path / "telegram.json"),
+                "--approval-state",
+                str(tmp_path / "approval.sqlite3"),
+            ],
+            service_factory=lambda config: cast(MoodleService, object()),
+            once_runner=once_runner,
+        )
+        == 0
+    )
+    assert seen == [sink]

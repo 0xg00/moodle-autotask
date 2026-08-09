@@ -5,9 +5,10 @@ Private-development repository for a provider-neutral task automation foundation
 Current functionality includes a narrow Moodle mobile-service connector: it verifies a configured
 site identity, enumerates assignments and official attachment metadata, records explicit local
 acknowledgements, and safely downloads selected plugin-file attachments. It does not submit work,
-use password login, scrape or automate a browser, invoke Codex, or notify
-anyone. The local scheduler emits compact JSON notification events to stdout as an observable
-development/service-log sink; it is not Telegram, email, or user approval to execute or submit work.
+use password login, scrape or automate a browser, or invoke Codex. The scheduler can emit compact
+JSON locally or send an outbound Telegram message with `Hacer tarea`, `Ignorar`, and `Ver detalles`
+buttons. Telegram decisions are persisted for the exact task revision; they do not yet provision a
+lab, execute agents, or authorize Moodle submission.
 
 The repository now also defines an isolated AWS controller and ephemeral lab boundary in Terraform.
 It creates a Linux controller with no inbound network access, encrypted private storage, Systems

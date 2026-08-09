@@ -228,10 +228,32 @@ leaves events recoverable; `run` retries after the bounded retry-base delay, whi
 wait for the configured interval. Leases renew while a sink call is active; future sinks must return
 within their lease or renew it.
 
-Its only current sink is compact JSON on stdout for development/service logs, not Telegram/email/etc.
-Delivery is at-least-once and consumers deduplicate stable `event_id`; stdout is local transport only
-and neither a notification nor an automatic acknowledgement authorizes execution or submission. Download
-selection uses keys returned by `scan`, not URLs. Transfers reject redirects, non-pluginfile URLs,
+Without additional options the sink is compact JSON on stdout. Telegram is an explicit opt-in. Put
+the bot token and numeric private-chat identities in a protected, ignored file; never pass the token
+on the command line or commit this example with a real value:
+
+```json
+{"botToken":"<TELEGRAM_BOT_TOKEN>","chatId":123456789,"allowedUserId":123456789}
+```
+
+On POSIX the configuration file must be mode `0600`. Start the scheduler with both Telegram options:
+
+```powershell
+moodle-autotask-scheduler run --token-file .runtime/moodle-token.json --state .runtime/moodle-state.sqlite3 --telegram-config-file .runtime/telegram.json --approval-state .runtime/approval.sqlite3
+moodle-autotask-telegram run --config-file .runtime/telegram.json --state .runtime/approval.sqlite3
+```
+
+The first process sends each durable event; the second uses outbound Telegram long polling and
+persists the update cursor. No webhook or inbound firewall rule is required. Only the exact
+`allowedUserId` in the exact `chatId` can decide. `Hacer tarea` records approval of that exact
+revision, `Ignorar` records the opposite terminal decision, and `Ver detalles` is read-only. Replayed
+buttons are idempotent and an updated Moodle revision needs its own decision. This milestone does
+not consume an approval to start AWS or agents yet, and it never treats notification delivery as
+approval.
+
+Notification delivery remains at-least-once: a crash after Telegram accepts `sendMessage` but before
+local commit can repeat a message with the same buttons. Download selection uses keys returned by
+`scan`, not URLs. Transfers reject redirects, non-pluginfile URLs,
 unsafe filenames, and size mismatches; the mobile token is appended only after URL validation.
 The default attachment cap is 16 GiB (hard maximum 64 GiB), so plan local disk capacity before
 selecting OVA images; callers may lower the limit but it is always enforced while streaming.

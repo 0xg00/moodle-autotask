@@ -32,12 +32,17 @@ uses schema v2: a same-database durable outbox creates a stable event ID from th
 revision hashes, leases delivery with renewable ownership, and atomically records successful local
 delivery with the exact acknowledgement. It is honestly at-least-once: a crash after a sink side
 effect can repeat the same event ID, so consumers must deduplicate it. The local JSON stdout sink
-is an observable development/service-log sink, not Telegram/email/etc. Neither successful delivery
-nor manual acknowledgement is authorization to execute or submit work.
+remains available for development. The optional outbound-only Telegram sink reuses opaque callback
+tokens across delivery retries, accepts decisions only from one configured user and chat, and stores
+`pending`, `approved`, or `ignored` against the exact task and revision in a separate SQLite state.
+Its durable update cursor makes callbacks idempotent across process restarts. Neither successful
+delivery nor manual acknowledgement is authorization to execute or submit work. A Telegram
+`approved` decision is durable input for the future execution workflow, not a direct cloud action.
 
 The connector remains read-only: password login, scraping/browser automation, task execution, and
-Moodle submission remain outside this milestone. The scheduler only performs local notification
-delivery through its stdout development/service-log sink.
+Moodle submission remain outside this milestone. Telegram uses long polling over outbound HTTPS;
+the controller exposes no webhook or inbound port. Bot credentials are read only from a protected
+file and never accepted as a command-line value or placed in callback data.
 
 AWS infrastructure is a separate adapter boundary. The Terraform baseline creates a Linux
 controller whose instance role can read the exact Moodle secret, use bounded artifact prefixes, and
