@@ -763,7 +763,7 @@ def test_source_integrity_rejects_dirty_runtime_sources() -> None:
     assert "remote get-url origin" in script
     assert "function Assert-CleanRuntimeSource" in script
     assert "$unexpected = @($entries | Where-Object { $_ -ne '!! local.yml' })" in script
-    assert "moodle-docker runtime source is dirty or contains untrusted files" in script
+    assert "dirty or contains untracked files or an untrusted override" in script
     assert "unexpected untracked overrides" in script
     assert "--ignored --untracked-files=all" in script
     assert "$allowed = @('!! config.php')" in script

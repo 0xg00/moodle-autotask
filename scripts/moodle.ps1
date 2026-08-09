@@ -575,7 +575,7 @@ function Assert-CleanRuntimeSource {
         Assert-NoMoodleDockerLocalOverride
         $unexpected = @($entries | Where-Object { $_ -ne '!! local.yml' })
         if ($unexpected.Count -ne 0 -or ($entries.Count -eq 1 -and $entries[0] -ne '!! local.yml')) {
-            Fail 'moodle-docker runtime source is dirty or contains untrusted files. Run Reset -Force.'
+            Fail 'moodle-docker runtime source is dirty or contains untracked files or an untrusted override. Run Reset -Force.'
         }
         return
     }
