@@ -80,6 +80,10 @@ Review every plan before applying it. Never commit a plan file: it can contain a
 This apply creates the lab roles, profile, subnet, and security group, but does not launch a Windows
 instance and therefore does not start Windows compute charges.
 
+The controller cloud-init is creation-only. Terraform ignores later `user_data` changes so an
+application release cannot stop the persistent controller or change its public IP. Deploy updated
+application artifacts and systemd units through `scripts/aws-deploy.ps1` over Systems Manager.
+
 The default lab profile is deliberately constrained to Windows Server 2022, `t3.large`, and an
 encrypted 80 GiB root volume. Operators may choose only the Terraform-validated alternatives;
 Moodle content never becomes an AMI ID, instance type, subnet, security group, profile, or volume

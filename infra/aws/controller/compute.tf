@@ -21,6 +21,10 @@ resource "aws_instance" "controller" {
     scheduler_interval  = 86400
   })
 
+  lifecycle {
+    ignore_changes = [user_data]
+  }
+
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"

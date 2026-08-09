@@ -15,6 +15,13 @@ def test_controller_has_no_ingress_and_requires_imdsv2() -> None:
     assert "key_name" not in compute
 
 
+def test_controller_updates_do_not_restart_ec2_for_user_data_changes() -> None:
+    compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")
+
+    assert "lifecycle {" in compute
+    assert "ignore_changes = [user_data]" in compute
+
+
 def test_state_and_artifact_storage_are_private_and_encrypted() -> None:
     bootstrap = (AWS_ROOT / "bootstrap" / "main.tf").read_text(encoding="utf-8")
     storage = (AWS_ROOT / "controller" / "storage.tf").read_text(encoding="utf-8")
