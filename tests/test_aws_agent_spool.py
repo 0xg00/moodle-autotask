@@ -235,18 +235,16 @@ def test_lab_plan_executes_once_then_waits_for_final_report(tmp_path: Path) -> N
     assert broker.step(event, prepared, ExecutionMode.HYBRID, handle, executor).status == (
         "pending"
     )
-    plan = next(jobs.iterdir())
+    plan = _job_for_phase(jobs, "lab_plan")
     _write_result(results, plan, commands=["Write-Output 'ok'"])
     assert broker.step(event, prepared, ExecutionMode.HYBRID, handle, executor).status == (
         "pending"
     )
-    report = next(
-        job
-        for job in jobs.iterdir()
-        if json.loads((job / "job.json").read_text(encoding="utf-8"))["phase"] == "lab_report"
-    )
+    report = _job_for_phase(jobs, "lab_report")
     assert len(executor.calls) == 1
     dispatches = list((jobs / "dispatches").glob("*.json"))
+    assert (jobs / "dispatches").is_dir()
+    assert plan != jobs / "dispatches" and report != jobs / "dispatches"
     assert len(dispatches) == 1
     dispatch = json.loads(dispatches[0].read_text(encoding="utf-8"))
     assert dispatch["state"] == "dispatched"
