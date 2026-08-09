@@ -63,6 +63,28 @@ variable "root_volume_size_gib" {
   }
 }
 
+variable "lab_instance_type" {
+  description = "Fixed EC2 size for approved ephemeral Windows labs."
+  type        = string
+  default     = "t3.large"
+
+  validation {
+    condition     = contains(["t3.large", "m6i.large"], var.lab_instance_type)
+    error_message = "lab_instance_type must be t3.large or m6i.large."
+  }
+}
+
+variable "lab_root_volume_size_gib" {
+  description = "Encrypted root volume size for approved ephemeral labs."
+  type        = number
+  default     = 80
+
+  validation {
+    condition     = var.lab_root_volume_size_gib >= 50 && var.lab_root_volume_size_gib <= 500
+    error_message = "lab_root_volume_size_gib must be between 50 and 500 GiB."
+  }
+}
+
 variable "additional_tags" {
   description = "Additional non-sensitive resource tags."
   type        = map(string)

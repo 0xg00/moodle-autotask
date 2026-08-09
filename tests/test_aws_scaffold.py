@@ -39,6 +39,46 @@ def test_controller_role_cannot_create_labs_or_change_iam() -> None:
     assert "iam:Attach" not in policy
 
 
+def test_lab_boundary_uses_separate_roles_and_no_ingress() -> None:
+    controller_policy = (AWS_ROOT / "controller" / "iam.tf").read_text(encoding="utf-8")
+    labs = (AWS_ROOT / "controller" / "labs.tf").read_text(encoding="utf-8")
+    network = (AWS_ROOT / "controller" / "network.tf").read_text(encoding="utf-8")
+
+    assert "ec2:RunInstances" not in controller_policy
+    assert 'actions   = ["sts:AssumeRole"]' in labs
+    assert "aws_iam_role.controller.arn" in labs
+    assert 'resources = [aws_iam_role.lab_instance.arn]' in labs
+    assert 'variable = "iam:PassedToService"' in labs
+    assert 'values   = ["ec2.amazonaws.com"]' in labs
+    assert 'variable = "ec2:ResourceTag/Project"' in labs
+    assert 'variable = "ec2:ResourceTag/Environment"' in labs
+    assert 'variable = "ec2:ResourceTag/Role"' in labs
+    assert 'variable = "ec2:InstanceType"' in labs
+    assert 'variable = "ec2:InstanceProfile"' in labs
+    assert 'variable = "ec2:MetadataHttpTokens"' in labs
+    assert 'values   = ["required"]' in labs
+    assert 'variable = "ec2:Encrypted"' in labs
+    assert 'variable = "ec2:VolumeType"' in labs
+    assert 'values   = ["gp3"]' in labs
+    assert 'resource "aws_security_group" "lab"' in network
+    assert 'description = "No ingress; ephemeral labs use AWS Systems Manager"' in network
+    assert network.count("ingress     = []") == 2
+
+
+def test_lab_instance_cannot_read_moodle_secret_or_provision_labs() -> None:
+    labs = (AWS_ROOT / "controller" / "labs.tf").read_text(encoding="utf-8")
+    instance_policy = labs.split('data "aws_iam_policy_document" "lab_instance_artifacts"', 1)[1]
+    instance_policy = instance_policy.split(
+        'resource "aws_iam_role_policy" "lab_instance_artifacts"', 1
+    )[0]
+
+    assert "assignments/*" in instance_policy
+    assert "lab-results/*" in instance_policy
+    assert "secretsmanager" not in instance_policy
+    assert "ec2:RunInstances" not in instance_policy
+    assert "s3:DeleteObject" not in instance_policy
+
+
 def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     script = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
 

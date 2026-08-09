@@ -41,6 +41,13 @@ delivery through its stdout development/service-log sink.
 
 AWS infrastructure is a separate adapter boundary. The Terraform baseline creates a Linux
 controller whose instance role can read the exact Moodle secret, use bounded artifact prefixes, and
-connect to Systems Manager. It cannot create labs, mutate IAM, or submit Moodle work. Future Windows
-lab provisioning will use a distinct role and explicit `LabProvider` operations so untrusted task
-execution never inherits controller or account-administration credentials.
+connect to Systems Manager. It cannot call EC2 directly or mutate IAM. For an approved provision
+operation it can assume one exact lab-provisioner role. That role can launch only the operator-fixed
+Windows image, instance types, subnet, security group, volume bounds, and lab instance profile, and
+can terminate only project-tagged labs. The guest profile can read task inputs, write lab results,
+and connect to Systems Manager; it cannot read the Moodle token or provision another lab.
+
+`AwsEc2LabProvider` hashes task and workflow identities before tagging, binds EC2's client token to
+the complete immutable request plus caller idempotency key, reconciles by that key, validates every
+opaque handle and ownership tag, and treats a lab as ready only after both EC2 and Systems Manager
+report it usable. Launch configuration is operator input, never data extracted from Moodle text.
