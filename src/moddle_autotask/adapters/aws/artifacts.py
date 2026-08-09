@@ -42,6 +42,10 @@ class PreparedAssignment:
     task_key: str
     revision_digest: str
     artifacts: tuple[PreparedArtifact, ...]
+    course_name: str = ""
+    course_shortname: str = ""
+    title: str = ""
+    intro: str = ""
 
 
 class AssignmentLoader(Protocol):
@@ -122,7 +126,15 @@ class AwsMoodleArtifactPreparer:
             if isinstance(error, ArtifactPreparationError):
                 raise
             raise ArtifactPreparationError("could not stage approved Moodle artifacts") from error
-        prepared = PreparedAssignment(event.task_key, event.revision_digest, artifacts)
+        prepared = PreparedAssignment(
+            event.task_key,
+            event.revision_digest,
+            artifacts,
+            assignment.course_name,
+            assignment.course_shortname,
+            assignment.title,
+            assignment.intro,
+        )
         self._prepared[identity] = prepared
         return prepared
 

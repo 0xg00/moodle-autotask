@@ -140,6 +140,21 @@ def test_send_message_uses_post_form_and_exact_inline_buttons() -> None:
     assert calls[-1] == "closed"
 
 
+def test_send_document_uses_bounded_multipart_without_putting_token_in_body() -> None:
+    client, calls = _client(
+        {"ok": True, "result": {"message_id": 8, "chat": {"id": 42}}}
+    )
+
+    assert client.send_document(42, "practica.md", b"# Informe\n", "Terminada") == 8
+
+    method, path, body, headers = cast(tuple[str, str, bytes, dict[str, str]], calls[0])
+    assert method == "POST" and path == f"/bot{TOKEN}/sendDocument"
+    assert headers["Content-Type"].startswith("multipart/form-data; boundary=")
+    assert b'name="chat_id"' in body and b"42" in body
+    assert b'filename="practica.md"' in body and b"# Informe" in body
+    assert TOKEN.encode() not in body
+
+
 @pytest.mark.parametrize(
     "payload",
     (

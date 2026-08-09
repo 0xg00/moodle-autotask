@@ -6,6 +6,8 @@ import json
 import os
 import re
 import subprocess
+import time
+from base64 import b64decode, b64encode
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -25,10 +27,35 @@ _SECURITY_GROUP_PATTERN = re.compile(r"^sg-[0-9a-f]{8,17}$")
 _INSTANCE_PATTERN = re.compile(r"^i-[0-9a-f]{8,17}$")
 _IMAGE_PATTERN = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_COMMAND_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_PENDING_COMMAND_STATUSES = frozenset({"Pending", "InProgress", "Delayed", "Cancelling"})
+_TERMINAL_COMMAND_STATUSES = frozenset(
+    {
+        "Success",
+        "Cancelled",
+        "Failed",
+        "TimedOut",
+        "AccessDenied",
+        "DeliveryTimedOut",
+        "ExecutionTimedOut",
+        "Undeliverable",
+        "InvalidPlatform",
+        "Terminated",
+    }
+)
+_COMMAND_TIMEOUT_SECONDS = 1800
+_COMMAND_POLL_SECONDS = 2
+_MAX_SSM_TRANSCRIPT_BYTES = 12_000
 
 
 class AwsLabError(RuntimeError):
     """Raised when AWS cannot safely establish the requested lab state."""
+
+
+@dataclass(frozen=True, slots=True)
+class LabTranscript:
+    succeeded: bool
+    output: str
 
 
 class JsonCommandRunner(Protocol):
@@ -132,7 +159,7 @@ class AwsEc2LabProvider:
 
     def __init__(self, config: AwsLabConfig, runner: JsonCommandRunner | None = None) -> None:
         self._config = config
-        self._runner = runner or AwsCliJsonRunner()
+        self._runner = runner or AwsCliJsonRunner(timeout_seconds=30)
 
     def provision(self, request: LabProvisionRequest, *, idempotency_key: str) -> LabHandle:
         provision_key = self._provision_key(request, idempotency_key)
@@ -202,9 +229,7 @@ class AwsEc2LabProvider:
             raise AwsLabError("AWS returned an invalid lab instance ID")
         return self._handle(instance_id, provision_key)
 
-    def reconcile(
-        self, request: LabProvisionRequest, *, idempotency_key: str
-    ) -> LabHandle | None:
+    def reconcile(self, request: LabProvisionRequest, *, idempotency_key: str) -> LabHandle | None:
         return self._reconcile_with_key(self._provision_key(request, idempotency_key))
 
     def readiness(self, handle: LabHandle) -> LabReadiness:
@@ -251,6 +276,187 @@ class AwsEc2LabProvider:
             instance_id,
         )
 
+    def run_powershell(
+        self, handle: LabHandle, commands: tuple[str, ...], *, execution_key: str
+    ) -> LabTranscript:
+        command_id = self.dispatch_powershell(handle, commands, execution_key=execution_key)
+        return self.wait_powershell(handle, command_id, execution_key=execution_key)
+
+    def dispatch_powershell(
+        self, handle: LabHandle, commands: tuple[str, ...], *, execution_key: str
+    ) -> str:
+        if _DIGEST_PATTERN.fullmatch(execution_key) is None:
+            raise ValueError("lab execution key is invalid")
+        if (
+            not isinstance(commands, tuple)
+            or not commands
+            or len(commands) > 32
+            or not all(isinstance(command, str) and command.strip() for command in commands)
+        ):
+            raise ValueError("lab PowerShell commands are invalid")
+        source = "\n".join(commands)
+        if len(source.encode("utf-8")) > 24 * 1024:
+            raise ValueError("lab PowerShell commands are too large")
+        instance_id, provision_key = self._parse_handle(handle)
+        if self._owned_instance(instance_id, provision_key) is None:
+            raise AwsLabError("lab instance is unavailable")
+        session = self._assume_role(provision_key)
+        encoded = b64encode(source.encode("utf-16-le")).decode("ascii")
+        wrapper = _idempotent_powershell(execution_key, encoded)
+        parameters = json.dumps(
+            {"commands": [wrapper], "executionTimeout": ["1800"]}, separators=(",", ":")
+        )
+        response = self._aws(
+            session,
+            "ssm",
+            "send-command",
+            "--region",
+            self._config.region,
+            "--instance-ids",
+            instance_id,
+            "--document-name",
+            "AWS-RunPowerShellScript",
+            "--parameters",
+            parameters,
+            "--timeout-seconds",
+            "1800",
+        )
+        command = self._mapping_field(response, "Command")
+        command_id = self._required_string(command, "CommandId")
+        if _COMMAND_ID_PATTERN.fullmatch(command_id) is None:
+            raise AwsLabError("AWS returned an invalid SSM command ID")
+        return command_id
+
+    def wait_powershell(
+        self, handle: LabHandle, command_id: str, *, execution_key: str
+    ) -> LabTranscript:
+        deadline = time.monotonic() + _COMMAND_TIMEOUT_SECONDS
+        if _DIGEST_PATTERN.fullmatch(execution_key) is None:
+            raise ValueError("lab execution key is invalid")
+        if _COMMAND_ID_PATTERN.fullmatch(command_id) is None:
+            raise ValueError("lab SSM command ID is invalid")
+        instance_id, provision_key = self._parse_handle(handle)
+        if self._owned_instance(instance_id, provision_key, deadline=deadline) is None:
+            raise AwsLabError("lab instance is unavailable")
+        return self._wait_powershell(
+            self._assume_role(provision_key, deadline=deadline),
+            instance_id,
+            command_id,
+            execution_key,
+            deadline,
+        )
+
+    def _wait_powershell(
+        self,
+        session: _Session,
+        instance_id: str,
+        command_id: str,
+        execution_key: str,
+        deadline: float,
+    ) -> LabTranscript:
+        while time.monotonic() < deadline:
+            invocations = self._list_field(
+                self._aws(
+                    session,
+                    "ssm",
+                    "list-command-invocations",
+                    "--region",
+                    self._config.region,
+                    "--command-id",
+                    command_id,
+                    "--instance-id",
+                    instance_id,
+                    "--details",
+                    deadline=deadline,
+                ),
+                "CommandInvocations",
+            )
+            if not invocations:
+                self._sleep_until_command_deadline(deadline)
+                continue
+            if len(invocations) != 1:
+                raise AwsLabError("AWS returned an ambiguous lab command invocation")
+            invocation = invocations[0]
+            if (
+                self._required_string(invocation, "CommandId") != command_id
+                or self._required_string(invocation, "InstanceId") != instance_id
+            ):
+                raise AwsLabError("AWS returned an invalid lab command invocation")
+            status = self._required_string(invocation, "Status")
+            if status in _PENDING_COMMAND_STATUSES:
+                self._sleep_until_command_deadline(deadline)
+                continue
+            if status not in _TERMINAL_COMMAND_STATUSES:
+                raise AwsLabError("AWS returned an unknown lab command status")
+            if time.monotonic() >= deadline:
+                break
+            try:
+                fetched = self._aws(
+                    session,
+                    "ssm",
+                    "get-command-invocation",
+                    "--region",
+                    self._config.region,
+                    "--command-id",
+                    command_id,
+                    "--instance-id",
+                    instance_id,
+                    deadline=deadline,
+                )
+            except AwsLabError:
+                self._sleep_until_command_deadline(deadline)
+                continue
+            invocation = self._mapping(fetched)
+            fetched_status = self._required_string(invocation, "Status")
+            if fetched_status in _PENDING_COMMAND_STATUSES:
+                self._sleep_until_command_deadline(deadline)
+                continue
+            if fetched_status != status:
+                self._sleep_until_command_deadline(deadline)
+                continue
+            output = invocation.get("StandardOutputContent", "")
+            error_output = invocation.get("StandardErrorContent", "")
+            if not isinstance(output, str) or not isinstance(error_output, str):
+                raise AwsLabError("AWS returned invalid lab command output")
+            combined = output + (("\n" + error_output) if error_output else "")
+            if len(combined.encode("utf-8")) > 2 * 1024 * 1024:
+                raise AwsLabError("lab command output is too large")
+            if status != "Success":
+                return LabTranscript(False, combined)
+            try:
+                payload = self._mapping(json.loads(output))
+            except json.JSONDecodeError as error:
+                raise AwsLabError("lab command returned invalid transcript JSON") from error
+            if set(payload) != {"executionKey", "succeeded", "transcriptBase64", "truncated"}:
+                raise AwsLabError("lab command transcript is invalid")
+            if payload.get("executionKey") != execution_key:
+                raise AwsLabError("lab command transcript identity is invalid")
+            succeeded = payload.get("succeeded")
+            encoded_transcript = payload.get("transcriptBase64")
+            truncated = payload.get("truncated")
+            if (
+                not isinstance(succeeded, bool)
+                or not isinstance(encoded_transcript, str)
+                or not isinstance(truncated, bool)
+            ):
+                raise AwsLabError("lab command transcript is invalid")
+            try:
+                transcript = b64decode(encoded_transcript, validate=True).decode("utf-8", "strict")
+            except (UnicodeDecodeError, ValueError) as error:
+                raise AwsLabError("lab command transcript is invalid") from error
+            if len(transcript.encode("utf-8")) > _MAX_SSM_TRANSCRIPT_BYTES:
+                raise AwsLabError("lab command transcript is too large")
+            if truncated:
+                transcript += "\n[transcript truncated]"
+            return LabTranscript(succeeded, transcript)
+        raise AwsLabError("lab command did not finish")
+
+    @staticmethod
+    def _sleep_until_command_deadline(deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(_COMMAND_POLL_SECONDS, remaining))
+
     def _reconcile_with_key(self, provision_key: str) -> LabHandle | None:
         session = self._assume_role(provision_key)
         response = self._aws(
@@ -276,8 +482,10 @@ class AwsEc2LabProvider:
             raise AwsLabError("AWS returned an invalid lab instance ID")
         return self._handle(instance_id, provision_key)
 
-    def _owned_instance(self, instance_id: str, provision_key: str) -> dict[str, object] | None:
-        session = self._assume_role(provision_key)
+    def _owned_instance(
+        self, instance_id: str, provision_key: str, *, deadline: float | None = None
+    ) -> dict[str, object] | None:
+        session = self._assume_role(provision_key, deadline=deadline)
         response = self._aws(
             session,
             "ec2",
@@ -286,6 +494,7 @@ class AwsEc2LabProvider:
             self._config.region,
             "--filters",
             f"Name=instance-id,Values={instance_id}",
+            deadline=deadline,
         )
         instances = self._reservation_instances(response)
         if not instances:
@@ -306,7 +515,8 @@ class AwsEc2LabProvider:
             raise AwsLabError("instance does not belong to the requested lab")
         return instances[0]
 
-    def _assume_role(self, provision_key: str) -> _Session:
+    def _assume_role(self, provision_key: str, *, deadline: float | None = None) -> _Session:
+        self._require_before_deadline(deadline)
         response = self._runner.run_json(
             (
                 "sts",
@@ -328,8 +538,14 @@ class AwsEc2LabProvider:
             session_token=self._required_string(credentials, "SessionToken"),
         )
 
-    def _aws(self, session: _Session, *arguments: str) -> object:
+    def _aws(self, session: _Session, *arguments: str, deadline: float | None = None) -> object:
+        self._require_before_deadline(deadline)
         return self._runner.run_json(tuple(arguments), extra_environment=session.environment())
+
+    @staticmethod
+    def _require_before_deadline(deadline: float | None) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AwsLabError("lab command did not finish")
 
     def _tags(self, request: LabProvisionRequest, provision_key: str) -> list[dict[str, str]]:
         return [
@@ -370,9 +586,10 @@ class AwsEc2LabProvider:
         if len(parts) != 5 or parts[:3] != ["aws-ec2", "v1", self._config.region]:
             raise AwsLabError("lab handle is not valid for this AWS provider")
         instance_id, provision_key = parts[3], parts[4]
-        if _INSTANCE_PATTERN.fullmatch(instance_id) is None or _DIGEST_PATTERN.fullmatch(
-            provision_key
-        ) is None:
+        if (
+            _INSTANCE_PATTERN.fullmatch(instance_id) is None
+            or _DIGEST_PATTERN.fullmatch(provision_key) is None
+        ):
             raise AwsLabError("lab handle is malformed")
         return instance_id, provision_key
 
@@ -420,3 +637,50 @@ class AwsEc2LabProvider:
         for reservation in cls._list_field(value, "Reservations"):
             instances.extend(cls._list_field(reservation, "Instances"))
         return instances
+
+
+def _idempotent_powershell(execution_key: str, encoded_source: str) -> str:
+    return "\n".join(
+        (
+            "$ErrorActionPreference = 'Stop'",
+            "$root = 'C:\\ProgramData\\MoodleAutotask\\executions'",
+            f"$key = '{execution_key}'",
+            "$done = Join-Path $root ($key + '.json')",
+            "$running = Join-Path $root ($key + '.running')",
+            "New-Item -ItemType Directory -Force -Path $root | Out-Null",
+            "if (Test-Path -LiteralPath $done -PathType Leaf) {",
+            "  [Console]::Out.Write((Get-Content -LiteralPath $done -Raw))",
+            "  exit 0",
+            "}",
+            "if (Test-Path -LiteralPath $running) {",
+            "  Write-Error 'Previous execution has an ambiguous state'",
+            "  exit 70",
+            "}",
+            "New-Item -ItemType File -Path $running -ErrorAction Stop | Out-Null",
+            "$scriptPath = Join-Path $root ($key + '.ps1')",
+            "$source = \"`$ErrorActionPreference = 'Stop'`r`n\" + "
+            "[Text.Encoding]::Unicode.GetString("
+            f"[Convert]::FromBase64String('{encoded_source}'))",
+            "[IO.File]::WriteAllText($scriptPath, $source, [Text.Encoding]::Unicode)",
+            "$text = (& powershell.exe -NoLogo -NoProfile -NonInteractive "
+            "-ExecutionPolicy Bypass -File $scriptPath 2>&1 | Out-String)",
+            "$ok = ($LASTEXITCODE -eq 0)",
+            "$utf8 = New-Object System.Text.UTF8Encoding($false, $true)",
+            "$bytes = $utf8.GetBytes($text)",
+            "$truncated = $bytes.Length -gt 12000",
+            "if ($truncated) { $bytes = [byte[]]$bytes[0..11999]; while ($bytes.Length) { "
+            "try { $utf8.GetString($bytes) | Out-Null; break } catch "
+            "[System.Text.DecoderFallbackException] { if ($bytes.Length -eq 1) { "
+            "$bytes = [byte[]]@() } else { $bytes = [byte[]]$bytes[0..($bytes.Length - 2)] } } } }",
+            "$payload = @{ executionKey = $key; succeeded = $ok; transcriptBase64 = "
+            "[Convert]::ToBase64String($bytes); truncated = $truncated } "
+            "| ConvertTo-Json -Compress",
+            "if ($payload.Length -gt 24000) { throw 'Lab transcript envelope is too large' }",
+            "$temporary = $done + '.tmp'",
+            "[IO.File]::WriteAllText($temporary, $payload, (New-Object Text.UTF8Encoding($false)))",
+            "Move-Item -LiteralPath $temporary -Destination $done -Force",
+            "Remove-Item -LiteralPath $running -Force",
+            "[Console]::Out.Write($payload)",
+            "exit 0",
+        )
+    )

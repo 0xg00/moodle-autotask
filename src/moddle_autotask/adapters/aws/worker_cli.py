@@ -13,8 +13,11 @@ from typing import Never
 
 from moddle_autotask.adapters.moodle.approval_state import ApprovalState
 from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moddle_autotask.adapters.moodle.telegram import TelegramClient, TelegramConfig
 
+from .agent_spool import FileAgentBroker
 from .artifacts import AwsMoodleArtifactPreparer
+from .completion import TelegramExecutionNotifier
 from .image_imports import AwsImageImportConfig, AwsImageImporter
 from .labs import AwsCliJsonRunner, AwsEc2LabProvider, AwsLabConfig
 from .worker import process_one
@@ -31,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("run", nargs="?")
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--token-file", type=Path, required=True)
+    parser.add_argument("--telegram-config-file", type=Path, required=True)
     parser.add_argument("--region", required=True)
     parser.add_argument("--artifact-bucket", required=True)
     parser.add_argument("--image-importer-role-arn", required=True)
@@ -46,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--working-directory", type=Path, default=Path("/var/lib/moodle-autotask/artifacts")
     )
+    parser.add_argument(
+        "--agent-jobs", type=Path, default=Path("/var/spool/moodle-autotask/jobs")
+    )
+    parser.add_argument(
+        "--agent-results", type=Path, default=Path("/var/spool/moodle-autotask/results")
+    )
     parser.add_argument("--interval-seconds", type=int, default=15)
     args = parser.parse_args(argv)
     if args.run != "run" or not 5 <= args.interval_seconds <= 3600:
@@ -53,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         state = ApprovalState(args.state)
         runner = AwsCliJsonRunner(timeout_seconds=3600)
+        lab_runner = AwsCliJsonRunner(timeout_seconds=30)
         provider = AwsEc2LabProvider(
             AwsLabConfig(
                 region=args.region,
@@ -65,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
                 root_volume_size_gib=args.root_volume_size_gib,
                 environment=args.environment,
             ),
-            runner,
+            lab_runner,
         )
         artifact_preparer = AwsMoodleArtifactPreparer(
             MoodleConnectionConfig.from_token_file(args.token_file),
@@ -83,6 +94,16 @@ def main(argv: list[str] | None = None) -> int:
             ),
             runner,
         )
+        execution_broker = FileAgentBroker(
+            args.agent_jobs,
+            args.agent_results,
+            args.region,
+            runner,
+        )
+        telegram_config = TelegramConfig.from_file(args.telegram_config_file)
+        execution_notifier = TelegramExecutionNotifier(
+            telegram_config, TelegramClient(telegram_config)
+        )
         owner = f"{socket.gethostname()}:{os.getpid()}"
         while True:
             cycle = process_one(
@@ -91,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
                 owner=owner,
                 artifact_preparer=artifact_preparer,
                 image_importer=image_importer,
+                execution_broker=execution_broker,
+                execution_notifier=execution_notifier,
                 lease_seconds=3600,
             )
             print(

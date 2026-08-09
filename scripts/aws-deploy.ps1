@@ -196,7 +196,7 @@ function Send-ControllerCommand {
     finally {
         Remove-Item -Force -LiteralPath $parametersPath -ErrorAction SilentlyContinue
     }
-    if ($commandId -notmatch '^[0-9a-f-]{36}$') {
+    if ($commandId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
         throw 'AWS returned an invalid SSM command ID.'
     }
     Wait-SsmCommand -CommandId $commandId -TargetInstanceId $TargetInstanceId
@@ -222,6 +222,8 @@ if ($Action -eq 'Status') {
         'printf "telegram-active="; systemctl is-active moodle-autotask-telegram.service 2>/dev/null || true',
         'printf "worker-enabled="; systemctl is-enabled moodle-autotask-worker.service 2>/dev/null || true',
         'printf "worker-active="; systemctl is-active moodle-autotask-worker.service 2>/dev/null || true',
+        'printf "agent-enabled="; systemctl is-enabled moodle-autotask-agent.service 2>/dev/null || true',
+        'printf "agent-active="; systemctl is-active moodle-autotask-agent.service 2>/dev/null || true',
         'printf "current-release="; readlink /opt/moodle-autotask/current 2>/dev/null || true',
         'printf "codex-version="; /usr/local/bin/moodle-autotask-codex --version 2>/dev/null || echo unavailable',
         'if runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex login status >/dev/null 2>&1; then echo codex-auth=authenticated; else echo codex-auth=unauthenticated; fi'
@@ -250,12 +252,15 @@ if ($Action -eq 'CodexSmoke') {
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Verify isolated Codex authentication' -Commands @(
         'set -eu',
         'test "$(stat -c ''%U:%G:%a'' /var/lib/moodle-agent/.codex/auth.json)" = "moodle-agent:moodle-agent:600"',
+        'test "$(stat -c ''%U:%G:%a'' /etc/codex/requirements.toml)" = "root:root:644"',
         '! id -nG moodle-agent | tr '' '' ''\n'' | grep -Fxq moodle-autotask',
         'if runuser -u moodle-agent -- test -r /etc/moodle-autotask/moodle-token.json; then echo secret-boundary-failed; exit 1; fi',
         'install -d -o moodle-agent -g moodle-agent -m 0700 /var/lib/moodle-agent/smoke',
-        'result="$(timeout 120s runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex exec --ephemeral --sandbox read-only --skip-git-repo-check --color never -C /var/lib/moodle-agent/smoke ''Reply with exactly: CODEX_SMOKE_OK'')"',
+        'runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex sandbox -C /var/lib/moodle-agent/smoke -- sh -c ''test ! -r /var/lib/moodle-agent/.codex/auth.json && test ! -r /etc/moodle-autotask/moodle-token.json && test -w /var/lib/moodle-agent/smoke''',
+        'result="$(timeout 120s runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex exec --ephemeral --skip-git-repo-check --color never -C /var/lib/moodle-agent/smoke ''Reply with exactly: CODEX_SMOKE_OK'')"',
         'test "$result" = "CODEX_SMOKE_OK"',
         'echo codex-smoke=ok',
+        'echo codex-sandbox=isolated',
         'echo auth-permissions=private',
         'echo application-secrets=unreadable'
     )
@@ -268,14 +273,16 @@ if ($Action -eq 'Activate') {
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-scheduler',
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-telegram',
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-worker',
+        'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-agent',
         'test -x /usr/local/sbin/moodle-autotask-refresh-config',
         '/usr/local/sbin/moodle-autotask-refresh-config',
         'systemctl daemon-reload',
-        'if ! systemctl enable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service; then systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true; exit 1; fi',
-        'if ! systemctl start moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service; then systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true; systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true; exit 1; fi',
+        'if ! systemctl enable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service; then systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; exit 1; fi',
+        'if ! systemctl start moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service; then systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; exit 1; fi',
         'systemctl is-active --quiet moodle-autotask-scheduler.service',
         'systemctl is-active --quiet moodle-autotask-telegram.service',
         'systemctl is-active --quiet moodle-autotask-worker.service',
+        'systemctl is-active --quiet moodle-autotask-agent.service',
         "echo 'activated-environment=$Environment'"
     )
     exit 0
@@ -284,8 +291,8 @@ if ($Action -eq 'Activate') {
 if ($Action -eq 'Deactivate') {
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Deactivate application services' -Commands @(
         'set -eu',
-        'systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true',
-        'systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service || true',
+        'systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true',
+        'systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true',
         'echo services-deactivated'
     )
     exit 0
@@ -425,9 +432,13 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     "'$releaseRoot/venv/bin/moodle-autotask-scheduler' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-telegram' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-worker' --help >/dev/null",
+    "'$releaseRoot/venv/bin/moodle-autotask-agent' --help >/dev/null",
     'scheduler_was_active=false; if systemctl is-active --quiet moodle-autotask-scheduler.service; then scheduler_was_active=true; systemctl stop moodle-autotask-scheduler.service; fi',
     'telegram_was_active=false; if systemctl is-active --quiet moodle-autotask-telegram.service; then telegram_was_active=true; systemctl stop moodle-autotask-telegram.service; fi',
     'worker_was_active=false; if systemctl is-active --quiet moodle-autotask-worker.service; then worker_was_active=true; systemctl stop moodle-autotask-worker.service; fi',
+    'agent_unit_was_present=false; if systemctl cat moodle-autotask-agent.service >/dev/null 2>&1; then agent_unit_was_present=true; fi',
+    'agent_was_active=false; if systemctl is-active --quiet moodle-autotask-agent.service; then agent_was_active=true; systemctl stop moodle-autotask-agent.service; fi',
+    'legacy_three_was_active=false; if [ "$agent_unit_was_present" = false ] && [ "$scheduler_was_active" = true ] && [ "$telegram_was_active" = true ] && [ "$worker_was_active" = true ]; then legacy_three_was_active=true; fi',
     "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
     'mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current',
     "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment' --provisioner-role-arn '$labRoleArn' --subnet-id '$labSubnetId' --security-group-id '$labSecurityGroupId' --instance-profile-name '$labInstanceProfileName' --image-id '$labImageId' --artifact-bucket '$artifactBucket' --image-importer-role-arn '$imageImporterRoleArn' --vmimport-role-name '$vmImportRoleName' --instance-type '$LabInstanceType' --root-volume-size-gib '$LabRootVolumeSizeGiB'",
@@ -437,6 +448,7 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     'if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service; fi',
     'if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service; fi',
     'if [ "$worker_was_active" = true ]; then systemctl start moodle-autotask-worker.service; fi',
+    'if [ "$agent_was_active" = true ] || [ "$legacy_three_was_active" = true ]; then systemctl enable --now moodle-autotask-agent.service; fi',
     "rm -f '$remoteWheel'",
     "echo 'deployed-commit=$commitSha'",
     "echo 'deployed-sha256=$wheelDigest'"

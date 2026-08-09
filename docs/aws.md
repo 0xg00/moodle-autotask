@@ -17,9 +17,10 @@ Terraform does not own Moodle token values, student files, or individual lab ins
 - The separate lab provisioner can use only the approved Windows AMI, dedicated subnet,
   no-ingress security group, fixed instance profile, approved instance sizes, encrypted volume
   bounds, and project tags. Termination requires the project, environment, and lab ownership tags.
-- A lab receives a different instance profile. It can read `assignments/*`, write but not delete
-  `lab-results/*`, and use Systems Manager. It cannot read the Moodle token, assume the provisioner,
-  create another lab, or change IAM.
+- A lab receives a different instance profile with Systems Manager runtime permissions only. It
+  cannot read the shared artifact bucket, Moodle token, assume the provisioner, create another lab,
+  or change IAM. Digest-bound transfer of per-task inputs into a lab is deferred; OVA work reaches
+  a lab only through its imported AMI.
 - S3 state and artifacts have public access blocked, versioning, default encryption, and an
   explicit deny for non-TLS requests.
 - Terraform creates separate Moodle and Telegram Secrets Manager containers but never secret
@@ -99,8 +100,9 @@ moving public `latest` parameter cannot diverge from IAM. The provider assumes t
 for one hour, uses the request-derived SHA-256 as the EC2 client token,
 and verifies EC2 ownership tags plus Systems Manager readiness. There is no RDP listener. The
 approved-work service now calls this provider only after the exact Telegram approval, limits active
-non-central work to one lab, and tears a ready lab down after two hours. A future agent runtime will
-use audited Systems Manager commands; provisioning alone does not execute practice instructions.
+non-central work to one lab, sends only bounded PowerShell plans through the official
+`AWS-RunPowerShellScript` document, and tears a completed lab down after two hours. Guest-side
+execution markers make retries idempotent and reject an ambiguous in-progress replay.
 
 ## Store runtime secret values
 
@@ -134,7 +136,8 @@ aws secretsmanager put-secret-value `
 
 The controller role can read exactly these two secret ARNs. Terraform does not receive either value.
 
-The scheduler, outbound Telegram poller, and approved-work services are installed but remain disabled until a
+The scheduler, outbound Telegram poller, approved-work worker, and isolated agent services are
+installed but remain disabled until a
 reviewed application artifact and both valid secret values exist. This prevents a half-installed
 controller from polling Moodle or Telegram. The bootstrap pins AWS CLI v2 and verifies its archive
 against the committed SHA-256 before installation.
@@ -156,16 +159,18 @@ updates `/opt/moodle-autotask/current`. `Deploy` never enables either service:
 ```
 
 After both secret values exist, activation first refreshes and validates them, then enables and
-starts all three units together. Any start failure stops and disables all three. Deactivation is explicit:
+starts all four units together. Any start failure stops and disables all four. Deactivation is explicit:
 
 ```powershell
 .\scripts\aws-deploy.ps1 -Action Activate -AccountId '<AWS_ACCOUNT_ID>' -Profile 'moodle-autotask'
 .\scripts\aws-deploy.ps1 -Action Deactivate -AccountId '<AWS_ACCOUNT_ID>' -Profile 'moodle-autotask'
 ```
 
-All three units use outbound connections only, run as the unprivileged `moodle-autotask` account, and share the
-approval SQLite database. The root-only pre-start refresher serializes concurrent refreshes, validates
-both JSON shapes, writes mode-`0600` files atomically, and never places secret values on a command line.
+The scheduler, poller, and worker run as the unprivileged `moodle-autotask` account. The agent runs
+as the separate `moodle-agent` account and exchanges digest-bound jobs through two setgid spool
+directories; it cannot read the approval database or application secret files. The root-only
+pre-start refresher serializes concurrent refreshes, validates both JSON shapes, writes mode-`0600`
+files atomically, and never places secret values on a command line.
 
 ## Link the central Codex agent
 
@@ -173,6 +178,11 @@ Each deployment installs the pinned official Codex CLI archive only after verify
 and extracted binary SHA-256. Codex runs as the separate `moodle-agent` system account. That account
 is not a member of the application group, cannot read `/etc/moodle-autotask`, and stores its login in
 `/var/lib/moodle-agent/.codex/auth.json` with private permissions.
+
+A root-owned `/etc/codex/requirements.toml` forces approval policy `never`, disables tool and web
+network access, permits only the managed workspace profile, and denies sandboxed commands any read
+access to both `/var/lib/moodle-agent/.codex` and `/etc/moodle-autotask`. The systemd unit also blocks
+both EC2 Instance Metadata Service addresses, so the agent cannot obtain the controller role credentials.
 
 Start the headless device-code flow after the first deployment:
 
@@ -191,8 +201,9 @@ change, or a refresh failure. Never copy, print, commit, or place `auth.json` in
 `-Action Status` reports only `authenticated` or `unauthenticated`; it never returns tokens. The login
 unit is transient and cannot read the Moodle or Telegram secret directory.
 
-After linking, run the read-only live smoke test. It checks the cache ownership and mode, proves that
-`moodle-agent` cannot read the Moodle token, and makes one ephemeral Codex request:
+After linking, run the live smoke test. It checks the root-owned policy and cache permissions, proves
+inside the actual Codex sandbox that neither the Codex cache nor Moodle token is readable, and makes
+one ephemeral Codex request:
 
 ```powershell
 .\scripts\aws-deploy.ps1 `
@@ -222,8 +233,10 @@ aws ec2 describe-instances `
 
 Do not manually call `run-instances`. Telegram start decisions are persisted for an exact Moodle
 revision and consumed through a transactional lease. Retries reuse the same EC2 client token; the
-worker waits for Systems Manager and schedules mandatory teardown after two hours. The next
-execution milestone runs the selected agent mode through audited Systems Manager commands.
+worker waits for Systems Manager, runs the isolated agent workflow, returns the report through
+Telegram, and schedules mandatory teardown two hours after execution. Execution-report delivery is
+at-least-once: a controller crash after Telegram accepts a document and before the lease update can
+send the same digest-bound report again.
 
 The current image-import boundary supports exactly one `.ova` in an approved revision. Before any
 import it re-reads that exact revision, downloads every attachment with the Moodle token kept out of

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from moddle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
@@ -13,12 +13,14 @@ from moddle_autotask.adapters.moodle.approval_state import (
 from moddle_autotask.adapters.moodle.state import NotificationEvent
 from moddle_autotask.domain.models import (
     ExecutionMode,
+    LabHandle,
     LabProvisionRequest,
     TaskId,
     WorkflowRevision,
 )
 from moddle_autotask.ports.contracts import LabProvider, LabReadiness
 
+from .agent_spool import ExecutionBroker, ExecutionProgress, LabCommandExecutor
 from .artifacts import PreparedAssignment
 from .image_imports import ImageImportReadiness, ImageImportResult
 
@@ -35,6 +37,10 @@ class ImageImporter(Protocol):
     def cleanup(self, *, idempotency_key: str) -> None: ...
 
 
+class ExecutionNotifier(Protocol):
+    def notify(self, event: NotificationEvent, progress: ExecutionProgress) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerCycle:
     result: str
@@ -48,24 +54,46 @@ def process_one(
     owner: str,
     artifact_preparer: ArtifactPreparer | None = None,
     image_importer: ImageImporter | None = None,
+    execution_broker: ExecutionBroker | None = None,
+    execution_notifier: ExecutionNotifier | None = None,
     lease_seconds: int = 300,
     now: int | None = None,
 ) -> WorkerCycle:
     claim = state.claim_work(owner, lease_seconds, now=now)
     if claim is None:
+        _deliver_pending_notification(state, execution_notifier, now)
         return WorkerCycle("idle")
     try:
-        return _process_claim(
+        cycle = _process_claim(
             state,
             provider,
             claim,
             artifact_preparer=artifact_preparer,
             image_importer=image_importer,
+            execution_broker=execution_broker,
+            execution_notifier=execution_notifier,
             now=now,
         )
+        _deliver_pending_notification(state, execution_notifier, now)
+        return cycle
     except ApprovalStateError:
         raise
-    except (RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError):
+        if _is_cleanup_claim(claim, execution_broker):
+            error_code = (
+                "execution_complete"
+                if claim.item.error_code == "execution_complete"
+                else "cleanup_failed"
+            )
+            if not state.retry_work(
+                claim,
+                error_code,
+                _retry_delay(claim.item.attempts),
+                now=now,
+                exhaustible=False,
+            ):
+                return WorkerCycle("ownership_lost", claim.item.selected_mode)
+            return WorkerCycle("cleanup_retry", claim.item.selected_mode)
         if not state.retry_work(
             claim, "provider_failed", _retry_delay(claim.item.attempts), now=now
         ):
@@ -80,11 +108,21 @@ def _process_claim(
     *,
     artifact_preparer: ArtifactPreparer | None,
     image_importer: ImageImporter | None,
+    execution_broker: ExecutionBroker | None,
+    execution_notifier: ExecutionNotifier | None,
     now: int | None,
 ) -> WorkerCycle:
     item = claim.item
-    if item.status in {"ready", "failed"} and item.lab_handle is not None:
-        provider.teardown(item.lab_handle, idempotency_key=f"cleanup-{item.provision_key}")
+    cleanup_ready = (
+        item.status == "ready"
+        and item.lab_handle is not None
+        and (execution_broker is None or item.error_code == "execution_complete")
+    )
+    if (item.status == "failed" and item.lab_handle is not None) or cleanup_ready:
+        provider.teardown(
+            cast(LabHandle, item.lab_handle),
+            idempotency_key=f"cleanup-{item.provision_key}",
+        )
         if _requires_image_import(item.event):
             if image_importer is None:
                 raise RuntimeError("image importer is unavailable during cleanup")
@@ -94,7 +132,9 @@ def _process_claim(
         return WorkerCycle("lab_cleaned", item.selected_mode)
     if item.status == "pending":
         if item.selected_mode is ExecutionMode.CENTRAL:
-            if not state.mark_ready(claim, now=now):
+            if not state.mark_ready(
+                claim, now=now, for_execution=execution_broker is not None
+            ):
                 return WorkerCycle("ownership_lost", item.selected_mode)
             return WorkerCycle("central_ready", item.selected_mode)
         image_id: str | None = None
@@ -132,11 +172,44 @@ def _process_claim(
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("lab_provisioned", item.selected_mode)
 
+    if item.status == "ready" and execution_broker is not None:
+        if artifact_preparer is None:
+            raise RuntimeError("artifact preparer is unavailable during execution")
+        prepared = artifact_preparer.prepare(item.event)
+        progress = execution_broker.step(
+            item.event,
+            prepared,
+            item.selected_mode,
+            item.lab_handle,
+            cast(LabCommandExecutor, provider),
+        )
+        if progress.status == "pending":
+            if not state.retry_work(
+                claim, "agent_pending", 15, now=now, exhaustible=False
+            ):
+                return WorkerCycle("ownership_lost", item.selected_mode)
+            return WorkerCycle("agent_pending", item.selected_mode)
+        if progress.status == "failed":
+            if not state.complete_execution(
+                claim, succeeded=False, summary=progress.summary,
+                report_markdown=progress.report_markdown, now=now
+            ):
+                return WorkerCycle("ownership_lost", item.selected_mode)
+            return WorkerCycle("execution_failed", item.selected_mode)
+        if not state.complete_execution(
+            claim, succeeded=True, summary=progress.summary,
+            report_markdown=progress.report_markdown, now=now
+        ):
+            return WorkerCycle("ownership_lost", item.selected_mode)
+        return WorkerCycle("execution_complete", item.selected_mode)
+
     if item.status != "lab_pending" or item.lab_handle is None:
         raise ApprovalStateError("claimed work has an invalid state")
     readiness = provider.readiness(item.lab_handle)
     if readiness is LabReadiness.READY:
-        if not state.mark_ready(claim, now=now):
+        if not state.mark_ready(
+            claim, now=now, for_execution=execution_broker is not None
+        ):
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("lab_ready", item.selected_mode)
     if readiness is LabReadiness.FAILED:
@@ -150,10 +223,39 @@ def _process_claim(
     return WorkerCycle("lab_pending", item.selected_mode)
 
 
+def _is_cleanup_claim(claim: WorkClaim, execution_broker: ExecutionBroker | None) -> bool:
+    item = claim.item
+    return (item.status == "failed" and item.lab_handle is not None) or (
+        item.status == "ready"
+        and item.lab_handle is not None
+        and (execution_broker is None or item.error_code == "execution_complete")
+    )
+
+
 def _retry_delay(attempts: int) -> int:
     exponent: int = min(max(attempts - 1, 0), 6)
     delays = (30, 60, 120, 240, 480, 960, 1800)
     return delays[exponent]
+
+
+def _deliver_pending_notification(
+    state: ApprovalState, notifier: ExecutionNotifier | None, now: int | None
+) -> None:
+    if notifier is None:
+        return
+    notification = state.pending_execution_notification()
+    if notification is None:
+        return
+    progress = ExecutionProgress(
+        "succeeded" if notification.succeeded else "failed",
+        notification.summary,
+        notification.report_markdown,
+    )
+    try:
+        notifier.notify(notification.event, progress)
+    except RuntimeError:
+        return
+    state.mark_execution_notification_delivered(notification, now=now)
 
 
 def _requires_image_import(event: NotificationEvent) -> bool:

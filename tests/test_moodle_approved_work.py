@@ -128,6 +128,8 @@ def test_v1_database_migrates_and_backfills_prior_approval(tmp_path: Path) -> No
     _approve(state, event, now=9)
     with sqlite3.connect(path) as connection:
         connection.execute("DROP INDEX work_claimable_idx")
+        connection.execute("DROP INDEX execution_outbox_pending_idx")
+        connection.execute("DROP TABLE execution_outbox")
         connection.execute("DROP TABLE work_items")
         connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
 

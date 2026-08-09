@@ -1,6 +1,6 @@
 # Architecture
 
-`moddle_autotask` is a deliberately small hexagonal foundation, not a working automation system.
+`moddle_autotask` is a deliberately small hexagonal automation foundation.
 The domain contains immutable IDs, revision and digest bindings, execution and submission values,
 and a pure task-state transition function. It imports neither application code nor adapters.
 
@@ -41,7 +41,20 @@ delivery nor manual acknowledgement is authorization to execute or submit work. 
 worker deterministically selects `central`, `hybrid`, or `in_guest`. Non-central work calls the
 capability-limited AWS lab provider with a stable SHA-256 idempotency key, waits for EC2 plus SSM,
 and records the opaque handle. Only one non-central lab may be active; leases recover after crashes
-without changing the EC2 client token. Ready labs become cleanup work after two hours. OVA/OVF and
+without changing the EC2 client token. After readiness, a digest-bound filesystem spool transfers
+only the approved assignment snapshot and verified non-appliance attachments to a separate
+`moodle-agent` user. Jobs and agent workspaces publish inputs only after a fully verified temporary
+directory is synced and renamed; startup revalidates prior inputs and replaces an incomplete stale
+directory before Codex can run. A root-owned Codex policy denies sandboxed commands access to the authentication
+cache and application secrets, disables tool network access, and prevents permission escalation.
+Central work returns a structured Markdown report. Lab work first returns bounded PowerShell
+commands; the worker validates the opaque handle and ownership tags, executes the plan with the
+official Systems Manager document, and sends the transcript back for an evidence-based final report.
+A guest-side execution marker makes retries idempotent and fails closed if a previous execution is
+still ambiguous. Completed reports are sent to the authorized Telegram chat at least once: a crash
+after Telegram accepts the document but before the work lease is committed can resend the same
+digest-bound report. Ready labs become
+cleanup work two hours after execution. OVA/OVF and
 virtual-disk attachments fail closed unless the approved revision contains exactly one OVA. That
 supported path re-enumerates Moodle, requires the exact task and revision digests, downloads all
 attachments through the hardened pluginfile client, and stages them under a content-addressed
@@ -50,8 +63,8 @@ VM Import/Export service role. It verifies the import task's tags and S3 source,
 AMI and snapshots, and passes that exact AMI to the lab provider. Cleanup terminates the lab,
 deregisters the imported AMI, and deletes its snapshots before completing the work item.
 
-The connector remains read-only: password login, scraping/browser automation, task execution, and
-Moodle submission and agent execution remain outside this milestone. Telegram uses long polling over outbound HTTPS;
+The connector remains read-only: password login, scraping/browser automation, and Moodle submission
+remain outside this milestone. Telegram uses long polling over outbound HTTPS;
 the controller exposes no webhook or inbound port. Bot credentials are read only from a protected
 file and never accepted as a command-line value or placed in callback data.
 
@@ -62,8 +75,9 @@ operation it can assume one exact lab-provisioner role. A second exact role can 
 tagged VM imports and can pass only the dedicated VM Import/Export service role. The provisioner can
 launch only the operator-fixed Windows image or a project-owned imported image, plus the fixed
 instance type, subnet, security group, volume bounds, and lab instance profile; it can terminate only
-project-tagged labs. The guest profile can read task inputs, write lab results, and connect to Systems
-Manager; it cannot read the Moodle token or provision another lab.
+project-tagged labs. The guest profile has Systems Manager runtime permissions only; it cannot read
+the shared artifact bucket, Moodle token, or provision another lab. Per-task digest-bound transfer
+into a lab is deferred; appliance work reaches the lab through the imported AMI.
 
 `AwsEc2LabProvider` hashes task and workflow identities before tagging, binds EC2's client token to
 the complete immutable request plus caller idempotency key, reconciles by that key, validates every

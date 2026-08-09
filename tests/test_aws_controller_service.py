@@ -36,6 +36,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     refresh = tmp_path / "usr/local/sbin/moodle-autotask-refresh-config"
     codex_installer = tmp_path / "usr/local/sbin/moodle-autotask-install-codex"
     codex_login = tmp_path / "etc/systemd/system/moodle-autotask-codex-login.service"
+    agent = tmp_path / "etc/systemd/system/moodle-autotask-agent.service"
     scheduler = tmp_path / "etc/systemd/system/moodle-autotask-scheduler.service"
     telegram = tmp_path / "etc/systemd/system/moodle-autotask-telegram.service"
     refresh_text = refresh.read_text(encoding="utf-8")
@@ -43,6 +44,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     telegram_text = telegram.read_text(encoding="utf-8")
     codex_installer_text = codex_installer.read_text(encoding="utf-8")
     codex_login_text = codex_login.read_text(encoding="utf-8")
+    agent_text = agent.read_text(encoding="utf-8")
 
     assert "moodle-autotask/development/moodle-token" in refresh_text
     assert "moodle-autotask/development/telegram-config" in refresh_text
@@ -63,14 +65,31 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     )
     assert "cli_auth_credentials_store = \"file\"" in codex_installer_text
     assert "forced_login_method = \"chatgpt\"" in codex_installer_text
+    assert "allowed_approval_policies = [\"never\"]" in codex_installer_text
+    assert "allowed_web_search_modes = [\"disabled\"]" in codex_installer_text
+    assert "default_permissions = \"moodle-autotask\"" in codex_installer_text
+    assert 'deny_read = ["/var/lib/moodle-agent/.codex", "/etc/moodle-autotask"]' in (
+        codex_installer_text
+    )
+    assert "install -o root -g root -m 0644" in codex_installer_text
+    assert "/etc/codex/requirements.toml" in codex_installer_text
     assert "moodle-agent must not belong to the application secret group" in (
         codex_installer_text
     )
     assert "--device-auth" in codex_login_text
     assert "User=moodle-agent" in codex_login_text
     assert "ReadWritePaths=/var/lib/moodle-agent" in codex_login_text
+    assert "IPAddressDeny=169.254.169.254/32" in codex_login_text
+    assert "IPAddressDeny=fd00:ec2::254/128" in codex_login_text
     assert "/etc/moodle-autotask" not in codex_login_text
     assert "--dangerously-bypass-approvals-and-sandbox" not in codex_login_text
+    assert "moodle-autotask-agent run" in agent_text
+    assert "User=moodle-agent" in agent_text
+    assert "ReadOnlyPaths=/var/spool/moodle-autotask/jobs /etc/codex" in agent_text
+    assert "ReadWritePaths=/var/lib/moodle-agent /var/spool/moodle-autotask/results" in (
+        agent_text
+    )
+    assert "IPAddressDeny=169.254.169.254/32" in agent_text
     for unit in (scheduler_text, telegram_text):
         assert "NoNewPrivileges=true" in unit
         assert "ProtectSystem=strict" in unit
@@ -81,6 +100,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
         assert stat.S_IMODE(refresh.stat().st_mode) == 0o750
         assert stat.S_IMODE(codex_installer.stat().st_mode) == 0o750
         assert stat.S_IMODE(codex_login.stat().st_mode) == 0o644
+        assert stat.S_IMODE(agent.stat().st_mode) == 0o644
         assert stat.S_IMODE(scheduler.stat().st_mode) == 0o644
         assert stat.S_IMODE(telegram.stat().st_mode) == 0o644
     bash = shutil.which("bash")
@@ -116,9 +136,12 @@ def test_installer_writes_hardened_worker_with_fixed_lab_configuration(
     assert "--instance-profile-name moodle-autotask-development-lab" in text
     assert "--image-id ami-0123456789abcdef0" in text
     assert "--token-file /etc/moodle-autotask/moodle-token.json" in text
+    assert "--telegram-config-file /etc/moodle-autotask/telegram.json" in text
     assert "--artifact-bucket moodle-autotask-artifacts-123456789012-eu-south-2" in text
     assert "--image-importer-role-arn arn:aws:iam::123456789012:role/" in text
     assert "--vmimport-role-name moodle-autotask-development-vmimport" in text
+    assert "--agent-jobs /var/spool/moodle-autotask/jobs" in text
+    assert "--agent-results /var/spool/moodle-autotask/results" in text
     assert "NoNewPrivileges=true" in text and "ProtectSystem=strict" in text
     assert "ExecStartPre=+/usr/local/sbin/moodle-autotask-refresh-config" in text
 

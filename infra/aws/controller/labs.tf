@@ -25,41 +25,6 @@ resource "aws_iam_role_policy_attachment" "lab_instance_ssm" {
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-data "aws_iam_policy_document" "lab_instance_artifacts" {
-  statement {
-    sid       = "ListTaskInputsAndResults"
-    effect    = "Allow"
-    actions   = ["s3:ListBucket"]
-    resources = [aws_s3_bucket.artifacts.arn]
-
-    condition {
-      test     = "StringLike"
-      variable = "s3:prefix"
-      values   = ["assignments/*", "lab-results/*"]
-    }
-  }
-
-  statement {
-    sid       = "ReadTaskInputs"
-    effect    = "Allow"
-    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
-    resources = ["${aws_s3_bucket.artifacts.arn}/assignments/*"]
-  }
-
-  statement {
-    sid       = "WriteLabResults"
-    effect    = "Allow"
-    actions   = ["s3:AbortMultipartUpload", "s3:PutObject"]
-    resources = ["${aws_s3_bucket.artifacts.arn}/lab-results/*"]
-  }
-}
-
-resource "aws_iam_role_policy" "lab_instance_artifacts" {
-  name   = "${local.name_prefix}-lab-artifacts"
-  role   = aws_iam_role.lab_instance.id
-  policy = data.aws_iam_policy_document.lab_instance_artifacts.json
-}
-
 resource "aws_iam_instance_profile" "lab" {
   name = "${local.name_prefix}-lab"
   role = aws_iam_role.lab_instance.name
@@ -100,6 +65,45 @@ data "aws_iam_policy_document" "lab_provisioner" {
     effect    = "Allow"
     actions   = ["ssm:GetParameter"]
     resources = [data.aws_ssm_parameter.windows_server_2022_ami.arn]
+  }
+
+  statement {
+    sid       = "UseApprovedPowerShellDocument"
+    effect    = "Allow"
+    actions   = ["ssm:SendCommand"]
+    resources = ["arn:${data.aws_partition.current.partition}:ssm:${var.region}::document/AWS-RunPowerShellScript"]
+  }
+
+  statement {
+    sid       = "RunCommandsOnOwnedLabs"
+    effect    = "Allow"
+    actions   = ["ssm:SendCommand"]
+    resources = ["arn:${data.aws_partition.current.partition}:ec2:${var.region}:${data.aws_caller_identity.current.account_id}:instance/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/Project"
+      values   = [var.project_name]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/Environment"
+      values   = [var.environment]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/Role"
+      values   = ["lab"]
+    }
+  }
+
+  statement {
+    sid       = "ReadLabCommandResults"
+    effect    = "Allow"
+    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+    resources = ["*"]
   }
 
   statement {

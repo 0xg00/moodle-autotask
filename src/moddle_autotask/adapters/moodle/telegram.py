@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import secrets
 import ssl
 import time
 import urllib.parse
@@ -28,6 +29,8 @@ _BOT_TOKEN = re.compile(r"^[1-9][0-9]{5,15}:[A-Za-z0-9_-]{30,100}$")
 _CALLBACK_DATA = re.compile(r"^ma:([A-Za-z0-9_-]{32})$")
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_MESSAGE_LENGTH = 4096
+_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
+_DOCUMENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +167,55 @@ class TelegramClient:
             raise TelegramError("Telegram response is invalid")
         return tuple(result)
 
+    def send_document(
+        self, chat_id: int, filename: str, content: bytes, caption: str
+    ) -> int:
+        if (
+            chat_id != self.config.chat_id
+            or not isinstance(filename, str)
+            or _DOCUMENT_NAME.fullmatch(filename) is None
+            or not isinstance(content, bytes)
+            or not content
+            or len(content) > _MAX_DOCUMENT_BYTES
+            or not isinstance(caption, str)
+            or not caption
+            or len(caption) > 1024
+        ):
+            raise TelegramError("Telegram document is invalid")
+        boundary = f"moodle-autotask-{secrets.token_hex(16)}"
+        body = b"".join(
+            (
+                _multipart_field(boundary, "chat_id", str(chat_id)),
+                _multipart_field(boundary, "caption", caption),
+                f"--{boundary}\r\n".encode(),
+                (
+                    f'Content-Disposition: form-data; name="document"; filename="{filename}"'
+                    "\r\nContent-Type: text/markdown; charset=utf-8\r\n\r\n"
+                ).encode("ascii"),
+                content,
+                f"\r\n--{boundary}--\r\n".encode(),
+            )
+        )
+        result = self._post_body(
+            "sendDocument",
+            body,
+            f"multipart/form-data; boundary={boundary}",
+            self.config.timeout_seconds,
+        )
+        if not isinstance(result, dict):
+            raise TelegramError("Telegram response is invalid")
+        message_id = result.get("message_id")
+        chat = result.get("chat")
+        if (
+            not isinstance(message_id, int)
+            or isinstance(message_id, bool)
+            or message_id < 1
+            or not isinstance(chat, dict)
+            or chat.get("id") != chat_id
+        ):
+            raise TelegramError("Telegram response is invalid")
+        return message_id
+
     def answer_callback(self, callback_id: str, text: str) -> None:
         if (
             not isinstance(callback_id, str)
@@ -182,12 +234,22 @@ class TelegramClient:
         self, method: str, parameters: dict[str, str], timeout_seconds: float | None = None
     ) -> object:
         body = urllib.parse.urlencode(parameters).encode("utf-8")
+        return self._post_body(
+            method,
+            body,
+            "application/x-www-form-urlencoded",
+            timeout_seconds or self.config.timeout_seconds,
+        )
+
+    def _post_body(
+        self, method: str, body: bytes, content_type: str, timeout_seconds: float
+    ) -> object:
         connection: http.client.HTTPSConnection | None = None
         try:
             connection = self._connection_factory(
                 "api.telegram.org",
                 443,
-                timeout=timeout_seconds or self.config.timeout_seconds,
+                timeout=timeout_seconds,
                 context=ssl.create_default_context(),
             )
             connection.request(
@@ -195,7 +257,7 @@ class TelegramClient:
                 f"/bot{self.config.bot_token}/{method}",
                 body=body,
                 headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Type": content_type,
                     "Content-Length": str(len(body)),
                 },
             )
@@ -233,6 +295,13 @@ class TelegramClient:
         finally:
             if connection is not None:
                 connection.close()
+
+
+def _multipart_field(boundary: str, name: str, value: str) -> bytes:
+    return (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+        f"{value}\r\n"
+    ).encode()
 
 
 class TelegramApprovalSink:

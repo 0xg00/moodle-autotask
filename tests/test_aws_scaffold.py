@@ -72,23 +72,29 @@ def test_lab_boundary_uses_separate_roles_and_no_ingress() -> None:
     assert 'variable = "ec2:Encrypted"' in labs
     assert 'variable = "ec2:VolumeType"' in labs
     assert 'values   = ["gp3"]' in labs
+    assert 'actions   = ["ssm:SendCommand"]' in labs
+    assert "document/AWS-RunPowerShellScript" in labs
+    assert 'actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]' in labs
+    assert 'variable = "ssm:resourceTag/Project"' in labs
+    assert 'variable = "ssm:resourceTag/Environment"' in labs
+    assert 'variable = "ssm:resourceTag/Role"' in labs
     assert 'resource "aws_security_group" "lab"' in network
     assert 'description = "No ingress; ephemeral labs use AWS Systems Manager"' in network
     assert network.count("ingress     = []") == 2
 
 
-def test_lab_instance_cannot_read_moodle_secret_or_provision_labs() -> None:
+def test_lab_instance_has_only_ssm_runtime_permissions() -> None:
     labs = (AWS_ROOT / "controller" / "labs.tf").read_text(encoding="utf-8")
-    instance_policy = labs.split('data "aws_iam_policy_document" "lab_instance_artifacts"', 1)[1]
-    instance_policy = instance_policy.split(
-        'resource "aws_iam_role_policy" "lab_instance_artifacts"', 1
+    instance_section = labs.split('resource "aws_iam_role" "lab_instance"', 1)[1]
+    instance_section = instance_section.split(
+        'resource "aws_iam_instance_profile" "lab"', 1
     )[0]
 
-    assert "assignments/*" in instance_policy
-    assert "lab-results/*" in instance_policy
-    assert "secretsmanager" not in instance_policy
-    assert "ec2:RunInstances" not in instance_policy
-    assert "s3:DeleteObject" not in instance_policy
+    assert "AmazonSSMManagedInstanceCore" in instance_section
+    assert "aws_s3_bucket.artifacts" not in instance_section
+    assert "assignments/*" not in instance_section
+    assert "lab-results/*" not in instance_section
+    assert "lab_instance_artifacts" not in labs
 
 
 def test_vm_import_roles_are_separate_and_prefix_limited() -> None:
@@ -127,7 +133,9 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "moodle-autotask-scheduler.service" in script
     assert "moodle-autotask-telegram.service" in script
     assert "moodle-autotask-worker.service" in script
+    assert "moodle-autotask-agent.service" in script
     assert "moodle-autotask-worker' --help" in script
+    assert "moodle-autotask-agent' --help" in script
     assert "'ec2', 'describe-subnets'" in script
     assert "'ec2', 'describe-security-groups'" in script
     assert "'iam', 'get-role'" in script
@@ -149,11 +157,16 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "/usr/local/sbin/moodle-autotask-install-codex" in script
     assert "moodle-autotask-codex-login.service" in script
     assert "CODEX_HOME=/var/lib/moodle-agent/.codex" in script
-    assert "--ephemeral --sandbox read-only --skip-git-repo-check" in script
+    assert "moodle-autotask-codex sandbox -C /var/lib/moodle-agent/smoke -- sh -c" in script
+    assert "test ! -r /var/lib/moodle-agent/.codex/auth.json" in script
+    assert "test ! -r /etc/moodle-autotask/moodle-token.json" in script
+    assert "codex-sandbox=isolated" in script
+    assert "--ephemeral --skip-git-repo-check" in script
     assert "application-secrets=unreadable" in script
     assert "test -r /etc/moodle-autotask/moodle-token.json" in script
     deploy_commands = script.split("$gitStatus =", 1)[1]
-    assert "systemctl enable" not in deploy_commands
+    assert "legacy_three_was_active" in deploy_commands
+    assert "systemctl enable --now moodle-autotask-agent.service" in deploy_commands
     activation = script.split("if ($Action -eq 'Activate')", 1)[1].split(
         "if ($Action -eq 'Deactivate')", 1
     )[0]
@@ -164,6 +177,7 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "systemctl disable moodle-autotask-scheduler.service" in activation
     assert "systemctl is-active --quiet moodle-autotask-worker.service" in activation
     assert "--secret-string" not in script
+    assert "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" in script
 
 
 def test_telegram_secret_has_no_terraform_value_and_services_stay_disabled() -> None:

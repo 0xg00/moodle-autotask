@@ -67,6 +67,7 @@ def install_controller_services(
     refresh = _refresh_script(region, secret_prefix)
     codex_installer = _codex_installer_script()
     codex_login = _codex_login_unit()
+    agent = _agent_unit()
     scheduler = _scheduler_unit()
     telegram = _telegram_unit()
     _write(root, Path("usr/local/sbin/moodle-autotask-refresh-config"), refresh, 0o750)
@@ -80,6 +81,12 @@ def install_controller_services(
         root,
         Path("etc/systemd/system/moodle-autotask-codex-login.service"),
         codex_login,
+        0o644,
+    )
+    _write(
+        root,
+        Path("etc/systemd/system/moodle-autotask-agent.service"),
+        agent,
         0o644,
     )
     _write(
@@ -311,6 +318,13 @@ if id -nG "$agent_user" | tr ' ' '\n' | grep -Fxq moodle-autotask; then
 fi
 
 install -d -o "$agent_user" -g "$agent_user" -m 0700 "$agent_home" "$codex_home"
+install -d -o root -g root -m 0755 /var/spool/moodle-autotask
+install -d -o moodle-autotask -g "$agent_user" -m 2750 \
+  /var/spool/moodle-autotask/jobs
+install -d -o "$agent_user" -g moodle-autotask -m 2750 \
+  /var/spool/moodle-autotask/results
+install -d -o "$agent_user" -g "$agent_user" -m 0700 \
+  "$agent_home/workspaces"
 if [ -e "$codex_home/auth.json" ] || [ -L "$codex_home/auth.json" ]; then
   test -f "$codex_home/auth.json"
   test ! -L "$codex_home/auth.json"
@@ -353,6 +367,31 @@ forced_login_method = "chatgpt"
 CONFIG
 install -o "$agent_user" -g "$agent_user" -m 0600 \
   "$temporary_directory/config.toml" "$codex_home/config.toml"
+
+cat >"$temporary_directory/requirements.toml" <<'REQUIREMENTS'
+allowed_approval_policies = ["never"]
+allowed_web_search_modes = ["disabled"]
+default_permissions = "moodle-autotask"
+
+[allowed_permission_profiles]
+moodle-autotask = true
+
+[permissions.filesystem]
+deny_read = ["/var/lib/moodle-agent/.codex", "/etc/moodle-autotask"]
+
+[permissions.moodle-autotask]
+extends = ":workspace"
+
+[permissions.moodle-autotask.network]
+enabled = false
+REQUIREMENTS
+if [ -e /etc/codex ] || [ -L /etc/codex ]; then
+  test -d /etc/codex
+  test ! -L /etc/codex
+fi
+install -d -o root -g root -m 0755 /etc/codex
+install -o root -g root -m 0644 \
+  "$temporary_directory/requirements.toml" /etc/codex/requirements.toml
 test "$(/usr/local/bin/moodle-autotask-codex --version)" = \
   "codex-cli $version"
 """
@@ -385,6 +424,8 @@ def _codex_login_unit() -> str:
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
             "ReadWritePaths=/var/lib/moodle-agent",
+            "IPAddressDeny=169.254.169.254/32",
+            "IPAddressDeny=fd00:ec2::254/128",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
             "RestrictSUIDSGID=true",
             "",
@@ -439,6 +480,57 @@ def _scheduler_unit() -> str:
     )
 
 
+def _agent_unit() -> str:
+    command = " ".join(
+        (
+            "/opt/moodle-autotask/current/venv/bin/moodle-autotask-agent",
+            "run",
+            "--jobs /var/spool/moodle-autotask/jobs",
+            "--results /var/spool/moodle-autotask/results",
+            "--workspaces /var/lib/moodle-agent/workspaces",
+            "--codex /usr/local/bin/moodle-autotask-codex",
+            "--interval-seconds 15",
+            "--timeout-seconds 1800",
+        )
+    )
+    return "\n".join(
+        (
+            "[Unit]",
+            "Description=Moodle Autotask isolated Codex execution agent",
+            "Wants=network-online.target",
+            "After=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            "User=moodle-agent",
+            "Group=moodle-agent",
+            "Environment=HOME=/var/lib/moodle-agent",
+            "Environment=CODEX_HOME=/var/lib/moodle-agent/.codex",
+            "WorkingDirectory=/var/lib/moodle-agent",
+            f"ExecStart={command}",
+            "Restart=on-failure",
+            "RestartSec=30",
+            "UMask=0027",
+            "NoNewPrivileges=true",
+            "PrivateDevices=true",
+            "PrivateTmp=true",
+            "ProtectControlGroups=true",
+            "ProtectHome=true",
+            "ProtectKernelModules=true",
+            "ProtectKernelTunables=true",
+            "ProtectSystem=strict",
+            "ReadOnlyPaths=/var/spool/moodle-autotask/jobs /etc/codex",
+            "ReadWritePaths=/var/lib/moodle-agent /var/spool/moodle-autotask/results",
+            "IPAddressDeny=169.254.169.254/32",
+            "IPAddressDeny=fd00:ec2::254/128",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "RestrictSUIDSGID=true",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        )
+    )
 def _telegram_unit() -> str:
     command = " ".join(
         (
@@ -509,6 +601,7 @@ def _worker_unit(
             "run",
             "--state /var/lib/moodle-autotask/approval.sqlite3",
             "--token-file /etc/moodle-autotask/moodle-token.json",
+            "--telegram-config-file /etc/moodle-autotask/telegram.json",
             f"--region {shlex.quote(region)}",
             f"--artifact-bucket {shlex.quote(config.artifact_bucket)}",
             f"--image-importer-role-arn {shlex.quote(config.image_importer_role_arn)}",
@@ -521,6 +614,8 @@ def _worker_unit(
             f"--image-id {shlex.quote(config.image_id)}",
             f"--instance-type {shlex.quote(config.instance_type)}",
             f"--root-volume-size-gib {config.root_volume_size_gib}",
+            "--agent-jobs /var/spool/moodle-autotask/jobs",
+            "--agent-results /var/spool/moodle-autotask/results",
             "--interval-seconds 15",
         )
     )
@@ -549,7 +644,8 @@ def _worker_unit(
             "ProtectKernelModules=true",
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
-            "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock",
+            "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock "
+            "/var/spool/moodle-autotask/jobs",
             "RestrictSUIDSGID=true",
             "",
             "[Install]",

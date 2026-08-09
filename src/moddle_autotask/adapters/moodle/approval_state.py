@@ -45,6 +45,7 @@ class WorkItem:
     status: str
     lab_handle: LabHandle | None
     attempts: int
+    error_code: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +54,16 @@ class WorkClaim:
     lease_token: str
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionNotification:
+    event: NotificationEvent
+    succeeded: bool
+    summary: str
+    report_markdown: str
+
+
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32}$")
-_SCHEMA_VERSION = "2"
+_SCHEMA_VERSION = "3"
 _METADATA_SQL = "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 _REQUESTS_SQL = (
     "CREATE TABLE requests ("
@@ -79,7 +88,7 @@ _CURSOR_SQL = (
     "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
     "next_update_id INTEGER NOT NULL CHECK (next_update_id >= 0))"
 )
-_WORK_SQL = (
+_WORK_SQL_V2 = (
     "CREATE TABLE work_items ("
     "event_id TEXT PRIMARY KEY NOT NULL, "
     "selected_mode TEXT NOT NULL CHECK (selected_mode IN ('central','in_guest','hybrid')), "
@@ -97,8 +106,21 @@ _WORK_SQL = (
     "CHECK (lab_handle IS NULL OR selected_mode != 'central'), "
     "CHECK (status != 'ready' OR selected_mode = 'central' OR lab_handle IS NOT NULL))"
 )
+_WORK_SQL = _WORK_SQL_V2.replace(
+    "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ",
+    "created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, cleanup_due_at INTEGER, ",
+)
+_OUTBOX_SQL = (
+    "CREATE TABLE execution_outbox (event_id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, "
+    "delivered_at INTEGER, created_at INTEGER NOT NULL, "
+    "FOREIGN KEY(event_id) REFERENCES work_items(event_id), "
+    "CHECK (delivered_at IS NULL OR delivered_at >= created_at))"
+)
 _WORK_CLAIMABLE_INDEX_SQL = (
     "CREATE INDEX work_claimable_idx ON work_items(status, available_at, lease_expires_at)"
+)
+_OUTBOX_PENDING_INDEX_SQL = (
+    "CREATE INDEX execution_outbox_pending_idx ON execution_outbox(delivered_at, created_at)"
 )
 _LEASE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -140,6 +162,8 @@ class ApprovalState:
                     connection.execute(_CURSOR_SQL)
                     connection.execute(_WORK_SQL)
                     connection.execute(_WORK_CLAIMABLE_INDEX_SQL)
+                    connection.execute(_OUTBOX_SQL)
+                    connection.execute(_OUTBOX_PENDING_INDEX_SQL)
                     connection.execute(
                         "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
                         (_SCHEMA_VERSION,),
@@ -156,17 +180,40 @@ class ApprovalState:
                             raise ApprovalStateError("approval state schema is corrupt")
                         connection.execute(_WORK_SQL)
                         connection.execute(_WORK_CLAIMABLE_INDEX_SQL)
+                        connection.execute(_OUTBOX_SQL)
+                        connection.execute(_OUTBOX_PENDING_INDEX_SQL)
                         connection.execute(
                             "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                             (_SCHEMA_VERSION,),
                         )
                         for payload, decided_at in connection.execute(
-                            "SELECT payload, decided_at FROM requests "
-                            "WHERE decision = 'approved'"
+                            "SELECT payload, decided_at FROM requests WHERE decision = 'approved'"
                         ).fetchall():
                             if not isinstance(payload, str) or not isinstance(decided_at, int):
                                 raise ApprovalStateError("approval state schema is corrupt")
                             _enqueue_work(connection, _event_from_json(payload), decided_at)
+                    elif version == ("2",):
+                        if not _valid_schema(connection, "2"):
+                            raise ApprovalStateError("approval state schema is corrupt")
+                        connection.execute("DROP INDEX work_claimable_idx")
+                        connection.execute("ALTER TABLE work_items RENAME TO work_items_v2")
+                        connection.execute(_WORK_SQL)
+                        connection.execute(
+                            "INSERT INTO work_items(event_id, selected_mode, specification_digest, "
+                            "provision_key, status, lab_handle, attempts, available_at, lease_owner, "  # noqa: E501
+                            "lease_token, lease_expires_at, error_code, created_at, updated_at) "
+                            "SELECT event_id, selected_mode, specification_digest, provision_key, status, "  # noqa: E501
+                            "lab_handle, attempts, available_at, lease_owner, lease_token, lease_expires_at, "  # noqa: E501
+                            "error_code, created_at, updated_at FROM work_items_v2"
+                        )
+                        connection.execute("DROP TABLE work_items_v2")
+                        connection.execute(_WORK_CLAIMABLE_INDEX_SQL)
+                        connection.execute(_OUTBOX_SQL)
+                        connection.execute(_OUTBOX_PENDING_INDEX_SQL)
+                        connection.execute(
+                            "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                            (_SCHEMA_VERSION,),
+                        )
                     elif version != (_SCHEMA_VERSION,) or not _valid_schema(
                         connection, _SCHEMA_VERSION
                     ):
@@ -379,22 +426,28 @@ class ApprovalState:
                 connection.execute("BEGIN IMMEDIATE")
                 rows = connection.execute(
                     "SELECT w.event_id, w.selected_mode, w.specification_digest, "
-                    "w.provision_key, w.status, w.lab_handle, w.attempts, r.payload "
+                    "w.provision_key, w.status, w.lab_handle, w.attempts, w.error_code, "
+                    "r.payload "
                     "FROM work_items w JOIN requests r ON r.event_id = w.event_id "
                     "WHERE (w.status IN ('pending','lab_pending') OR "
-                    "(w.status IN ('ready','failed') AND w.lab_handle IS NOT NULL)) "
+                    "(w.status = 'failed' AND w.lab_handle IS NOT NULL AND "
+                    "(w.cleanup_due_at IS NULL OR w.cleanup_due_at <= ?)) OR "
+                    "(w.status = 'ready' AND "
+                    "(w.selected_mode = 'central' OR (w.lab_handle IS NOT NULL AND "
+                    "(w.error_code IS NULL OR w.cleanup_due_at IS NULL OR "
+                    "w.cleanup_due_at <= ?))))) "
                     "AND w.available_at <= ? "
                     "AND (w.lease_expires_at IS NULL OR w.lease_expires_at <= ?) "
                     "ORDER BY CASE w.status WHEN 'failed' THEN 0 WHEN 'ready' THEN 1 "
                     "WHEN 'lab_pending' THEN 2 ELSE 3 END, "
                     "w.created_at, w.event_id",
-                    (moment, moment),
+                    (moment, moment, moment, moment),
                 ).fetchall()
                 selected: tuple[object, ...] | None = None
                 selected_event: NotificationEvent | None = None
                 selected_attempts: int | None = None
                 for row in rows:
-                    event = _event_from_json(str(row[7]))
+                    event = _event_from_json(str(row[8]))
                     stored_attempts = _stored_attempts(row[6])
                     candidate = _work_item(row, event, attempts=stored_attempts)
                     if (
@@ -403,9 +456,9 @@ class ApprovalState:
                     ):
                         active = connection.execute(
                             "SELECT 1 FROM work_items WHERE event_id != ? "
-                            "AND selected_mode != 'central' "
-                            "AND status IN ('pending','lab_pending','ready') "
-                            "AND (lab_handle IS NOT NULL OR lease_expires_at > ?) LIMIT 1",
+                            "AND ((lab_handle IS NOT NULL AND status != 'cleaned') "
+                            "OR (selected_mode != 'central' AND status = 'pending' "
+                            "AND lease_expires_at > ?)) LIMIT 1",
                             (row[0], moment),
                         ).fetchone()
                         if active is not None:
@@ -429,9 +482,7 @@ class ApprovalState:
                 if updated != 1:
                     raise ApprovalStateError("could not acquire work lease")
                 connection.execute("COMMIT")
-                item = _work_item(
-                    selected, selected_event, attempts=selected_attempts + 1
-                )
+                item = _work_item(selected, selected_event, attempts=selected_attempts + 1)
                 return WorkClaim(item, token)
         except ApprovalStateError:
             raise
@@ -449,20 +500,157 @@ class ApprovalState:
             now,
         )
 
-    def mark_ready(self, claim: WorkClaim, now: int | None = None) -> bool:
+    def mark_ready(
+        self, claim: WorkClaim, now: int | None = None, *, for_execution: bool = False
+    ) -> bool:
         if claim.item.status not in {"pending", "lab_pending"}:
             raise ApprovalStateError("work claim cannot become ready")
         if claim.item.status == "pending" and claim.item.selected_mode is not ExecutionMode.CENTRAL:
             raise ApprovalStateError("non-central work requires a lab")
         moment = _now(now)
-        available_at = (
-            moment + _LAB_TTL_SECONDS if claim.item.lab_handle is not None else moment
-        )
+        available_at = moment
+        error_code = "agent_ready" if for_execution else None
+        if claim.item.lab_handle is not None and not for_execution:
+            available_at += _LAB_TTL_SECONDS
         return self._finish_claim(
             claim,
-            "status = 'ready', available_at = ?, error_code = NULL",
-            (available_at,),
+            "status = 'ready', available_at = ?, error_code = ?",
+            (available_at, error_code),
             "mark work ready",
+            now,
+        )
+
+    def mark_execution_complete(self, claim: WorkClaim, now: int | None = None) -> bool:
+        if claim.item.status != "ready":
+            raise ApprovalStateError("work claim cannot complete execution")
+        moment = _now(now)
+        if claim.item.lab_handle is None:
+            assignment = "status = 'cleaned', available_at = ?, error_code = NULL"
+            values: tuple[object, ...] = (moment,)
+        else:
+            assignment = "available_at = ?, error_code = 'execution_complete'"
+            values = (moment + _LAB_TTL_SECONDS,)
+        return self._finish_claim(claim, assignment, values, "complete execution", now)
+
+    def complete_execution(
+        self,
+        claim: WorkClaim,
+        *,
+        succeeded: bool,
+        summary: str,
+        report_markdown: str,
+        now: int | None = None,
+    ) -> bool:
+        if claim.item.status != "ready" or not isinstance(succeeded, bool):
+            raise ApprovalStateError("work claim cannot complete execution")
+        if (
+            not isinstance(summary, str)
+            or not isinstance(report_markdown, str)
+            or len(summary.encode("utf-8")) > 16_384
+            or len(report_markdown.encode("utf-8")) > 2 * 1024 * 1024
+        ):
+            raise ApprovalStateError("execution completion is invalid")
+        moment = _now(now)
+        payload = json.dumps(
+            {"reportMarkdown": report_markdown, "succeeded": succeeded, "summary": summary},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        if claim.item.lab_handle is None:
+            assignment = "status = 'cleaned', available_at = ?, error_code = NULL"
+            values: tuple[object, ...] = (moment,)
+        elif succeeded:
+            assignment, values = (
+                "available_at = ?, error_code = 'execution_complete', cleanup_due_at = ?",
+                (moment + _LAB_TTL_SECONDS, moment + _LAB_TTL_SECONDS),
+            )
+        else:
+            assignment, values = (
+                "status = 'failed', available_at = ?, error_code = 'agent_failed', cleanup_due_at = ?",  # noqa: E501
+                (moment, moment),
+            )
+        if not isinstance(claim, WorkClaim) or not _LEASE_TOKEN.fullmatch(claim.lease_token):
+            raise ApprovalStateError("work claim is invalid")
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                updated = connection.execute(
+                    f"UPDATE work_items SET {assignment}, lease_owner = NULL, lease_token = NULL, "
+                    "lease_expires_at = NULL, updated_at = ? WHERE event_id = ? AND lease_token = ? "  # noqa: E501
+                    "AND lease_expires_at > ?",
+                    (*values, moment, claim.item.event.event_id, claim.lease_token, moment),
+                ).rowcount
+                if updated == 1:
+                    connection.execute(
+                        "INSERT INTO execution_outbox(event_id, payload, delivered_at, created_at) "
+                        "VALUES (?, ?, NULL, ?)",
+                        (claim.item.event.event_id, payload, moment),
+                    )
+                connection.execute("COMMIT")
+                return bool(updated)
+        except sqlite3.IntegrityError as error:
+            raise ApprovalStateError("execution completion is corrupt") from error
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not persist execution completion") from error
+
+    def pending_execution_notification(self) -> ExecutionNotification | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT r.payload, o.payload FROM execution_outbox o JOIN requests r "
+                    "ON r.event_id = o.event_id WHERE o.delivered_at IS NULL "
+                    "ORDER BY o.created_at, o.event_id LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    return None
+                event = _event_from_json(str(row[0]))
+                payload = json.loads(str(row[1]))
+                if not isinstance(payload, dict) or set(payload) != {
+                    "reportMarkdown",
+                    "succeeded",
+                    "summary",
+                }:
+                    raise ApprovalStateError("stored execution completion is corrupt")
+                succeeded, summary, report = (
+                    payload["succeeded"],
+                    payload["summary"],
+                    payload["reportMarkdown"],
+                )
+                if (
+                    not isinstance(succeeded, bool)
+                    or not isinstance(summary, str)
+                    or not isinstance(report, str)
+                ):
+                    raise ApprovalStateError("stored execution completion is corrupt")
+                return ExecutionNotification(event, succeeded, summary, report)
+        except (ValueError, sqlite3.Error) as error:
+            raise ApprovalStateError("could not read execution completion") from error
+
+    def mark_execution_notification_delivered(
+        self, notification: ExecutionNotification, now: int | None = None
+    ) -> bool:
+        if not isinstance(notification, ExecutionNotification):
+            raise ApprovalStateError("execution completion is invalid")
+        try:
+            with self._connect() as connection:
+                return bool(
+                    connection.execute(
+                        "UPDATE execution_outbox SET delivered_at = ? WHERE event_id = ? AND delivered_at IS NULL",  # noqa: E501
+                        (_now(now), notification.event.event_id),
+                    ).rowcount
+                )
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not record execution notification") from error
+
+    def fail_execution(self, claim: WorkClaim, error_code: str, now: int | None = None) -> bool:
+        if claim.item.status != "ready" or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code):
+            raise ApprovalStateError("work claim cannot fail execution")
+        return self._finish_claim(
+            claim,
+            "status = 'failed', available_at = ?, error_code = ?",
+            (_now(now), error_code),
+            "fail execution",
             now,
         )
 
@@ -509,9 +697,7 @@ class ApprovalState:
             now,
         )
 
-    def fail_work(
-        self, claim: WorkClaim, error_code: str, now: int | None = None
-    ) -> bool:
+    def fail_work(self, claim: WorkClaim, error_code: str, now: int | None = None) -> bool:
         if claim.item.status != "pending" or claim.item.lab_handle is not None:
             raise ApprovalStateError("work claim cannot fail before provisioning")
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code):
@@ -530,7 +716,8 @@ class ApprovalState:
             with self._connect() as connection:
                 row = connection.execute(
                     "SELECT w.event_id, w.selected_mode, w.specification_digest, "
-                    "w.provision_key, w.status, w.lab_handle, w.attempts, r.payload "
+                    "w.provision_key, w.status, w.lab_handle, w.attempts, w.error_code, "
+                    "r.payload "
                     "FROM work_items w JOIN requests r ON r.event_id = w.event_id "
                     "WHERE r.task_key = ? AND r.revision_digest = ?",
                     (task_key, revision_digest),
@@ -539,7 +726,7 @@ class ApprovalState:
                     return None
                 return _work_item(
                     row,
-                    _event_from_json(str(row[7])),
+                    _event_from_json(str(row[8])),
                     attempts=_stored_attempts(row[6]),
                 )
         except (ValueError, sqlite3.Error) as error:
@@ -603,10 +790,15 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
         ("index", "sqlite_autoindex_callbacks_1", "callbacks", None),
         ("index", "sqlite_autoindex_callbacks_2", "callbacks", None),
     }
-    if version == _SCHEMA_VERSION:
+    if version in {"2", _SCHEMA_VERSION}:
         expected.update(
             {
-                ("table", "work_items", "work_items", _WORK_SQL),
+                (
+                    "table",
+                    "work_items",
+                    "work_items",
+                    _WORK_SQL_V2 if version == "2" else _WORK_SQL,
+                ),
                 ("index", "sqlite_autoindex_work_items_1", "work_items", None),
                 ("index", "sqlite_autoindex_work_items_2", "work_items", None),
                 (
@@ -617,6 +809,19 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
                 ),
             }
         )
+    if version == _SCHEMA_VERSION:
+        expected.update(
+            {
+                ("table", "execution_outbox", "execution_outbox", _OUTBOX_SQL),
+                ("index", "sqlite_autoindex_execution_outbox_1", "execution_outbox", None),
+                (
+                    "index",
+                    "execution_outbox_pending_idx",
+                    "execution_outbox",
+                    _OUTBOX_PENDING_INDEX_SQL,
+                ),
+            }
+        )
     actual = {
         (kind, name, table, sql if isinstance(sql, str) else None)
         for kind, name, table, sql in connection.execute(
@@ -624,9 +829,7 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
             "WHERE type IN ('table','index','view','trigger') AND name != 'sqlite_sequence'"
         )
     }
-    cursor = connection.execute(
-        "SELECT singleton, next_update_id FROM telegram_cursor"
-    ).fetchall()
+    cursor = connection.execute("SELECT singleton, next_update_id FROM telegram_cursor").fetchall()
     return (
         actual == expected
         and len(cursor) == 1
@@ -685,6 +888,7 @@ def _work_item(row: tuple[object, ...], event: NotificationEvent, attempts: int)
         status = str(row[4])
         raw_handle = row[5]
         handle = None if raw_handle is None else LabHandle(str(raw_handle))
+        error_code = row[7]
     except (TypeError, ValueError) as error:
         raise ApprovalStateError("stored approved work is corrupt") from error
     expected_digest = Digest.of_json(event.as_dict())
@@ -699,12 +903,19 @@ def _work_item(row: tuple[object, ...], event: NotificationEvent, attempts: int)
         or not isinstance(attempts, int)
         or isinstance(attempts, bool)
         or attempts < 0
+        or (
+            error_code is not None
+            and (
+                not isinstance(error_code, str)
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) is None
+            )
+        )
         or (status == "lab_pending" and handle is None)
         or (handle is not None and mode is ExecutionMode.CENTRAL)
         or (status == "ready" and mode is not ExecutionMode.CENTRAL and handle is None)
     ):
         raise ApprovalStateError("stored approved work is corrupt")
-    return WorkItem(event, mode, digest, provision_key, status, handle, attempts)
+    return WorkItem(event, mode, digest, provision_key, status, handle, attempts, error_code)
 
 
 def _stored_attempts(value: object) -> int:
