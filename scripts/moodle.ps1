@@ -265,6 +265,71 @@ function Assert-DockerDaemon {
     }
 }
 
+function Get-MoodleProjectContainerMetadata {
+    param(
+        [Parameter(Mandatory = $true)]$Docker,
+        [Parameter(Mandatory = $true)][string]$ContainerId
+    )
+    $rawMetadata = @(& $Docker.Source @('inspect', '--type', 'container', $ContainerId))
+    if ($LASTEXITCODE -ne 0 -or $rawMetadata.Count -eq 0) {
+        Fail 'Could not verify a running Moodle Compose project container before source restoration.'
+    }
+    try {
+        $containers = @(([string]::Join([Environment]::NewLine, [string[]]$rawMetadata)) | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        Fail 'Could not parse Docker container metadata before source restoration.'
+    }
+    if ($containers.Count -ne 1) {
+        Fail 'Could not prove Docker container identity for safe Moodle Compose source restoration.'
+    }
+    return $containers[0]
+}
+
+function Stop-RunningMoodleProjectContainers {
+    $docker = Get-DockerCli
+    Assert-DockerDaemon
+    $rawContainerIds = @(
+        & $docker.Source @('ps', '--quiet', '--filter', "label=com.docker.compose.project=$ProjectName")
+    )
+    if ($LASTEXITCODE -ne 0) {
+        Fail 'Could not list Moodle Compose project containers before source restoration.'
+    }
+    $containerIds = @(
+        $rawContainerIds |
+            ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $allowedServices = @('webserver', 'db', 'selenium', 'exttests', 'mailhog', 'mailpit', 'redis', 'nginx', 'php-fpm')
+    $validatedIds = @()
+    foreach ($containerId in $containerIds) {
+        if ($containerId -notmatch '^[a-f0-9]{12,64}$') {
+            Fail 'The Moodle Compose project returned a malformed Docker container ID.'
+        }
+        $metadata = Get-MoodleProjectContainerMetadata -Docker $docker -ContainerId $containerId
+        if ($metadata.Id -isnot [string] -or $metadata.Id -notmatch '^[a-f0-9]{64}$' -or
+            -not $metadata.Id.StartsWith($containerId) -or
+            $metadata.Config.Labels.'com.docker.compose.project' -isnot [string] -or
+            $metadata.Config.Labels.'com.docker.compose.project' -ne $ProjectName -or
+            $metadata.Config.Labels.'com.docker.compose.service' -isnot [string] -or
+            $metadata.Config.Labels.'com.docker.compose.service' -notin $allowedServices -or
+            $metadata.State.Running -isnot [bool] -or $metadata.State.Running -ne $true) {
+            Fail 'Could not prove Docker container identity for safe Moodle Compose source restoration.'
+        }
+        $validatedIds += $metadata.Id
+    }
+    foreach ($containerId in $validatedIds) {
+        & $docker.Source @('stop', '--time', '30', $containerId) | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Fail 'Could not stop a validated Moodle Compose project container before source restoration.'
+        }
+        $stoppedMetadata = Get-MoodleProjectContainerMetadata -Docker $docker -ContainerId $containerId
+        if ($stoppedMetadata.Id -isnot [string] -or $stoppedMetadata.Id -ne $containerId -or
+            $stoppedMetadata.State.Running -isnot [bool] -or $stoppedMetadata.State.Running -ne $false) {
+            Fail 'Could not verify that a Moodle Compose project container stopped before source restoration.'
+        }
+    }
+}
+
 function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
@@ -365,14 +430,14 @@ function Assert-AllowedGitConfigEntries {
         }
         $expectedValues = @($Allowed[$entry.Key])
         $actualValues = @($entry.Values)
-        if ($entry.Key -in @('core.filemode', 'core.symlinks', 'core.ignorecase', 'core.precomposeunicode')) {
+        if ($entry.Key -in @('core.filemode', 'core.symlinks', 'core.ignorecase', 'core.precomposeunicode', 'core.autocrlf')) {
             if ($actualValues.Count -ne 1 -or $actualValues[0] -notin $expectedValues) {
                 Fail "Refusing unexpected value for Git $Scope config key $($entry.Key) in $Repository."
             }
             continue
         }
         if ($actualValues.Count -ne $expectedValues.Count) {
-            Fail "Refusing unexpected value count for Git $Scope config key $($entry.Key) in $Repository."
+            Fail "Refusing unexpected value count for Git $Scope config key $($entry.Key) in $Repository (expected $($expectedValues.Count), got $($actualValues.Count))."
         }
         for ($index = 0; $index -lt $expectedValues.Count; $index++) {
             if ($actualValues[$index] -ne $expectedValues[$index]) {
@@ -428,7 +493,8 @@ function Assert-SafeGitControlState {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$ExpectedOrigin,
-        [Parameter(Mandatory = $true)][string]$GitPath
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter()][switch]$AllowLegacyAutocrlf
     )
     $gitDirectory = Join-Path $Repository '.git'
     $hooksDirectory = Join-Path $gitDirectory 'hooks'
@@ -479,11 +545,13 @@ function Assert-SafeGitControlState {
     Assert-SafeGitIndexFlags -Repository $Repository -GitPath $GitPath
     Assert-NoGitReplacementObjects -Repository $Repository -GitPath $GitPath
     $localEntries = @(Get-GitConfigEntries -Repository $Repository -GitPath $GitPath -Scope '--local')
+    $allowedAutocrlf = if ($AllowLegacyAutocrlf) { @('false', 'true') } else { @('false') }
     $allowedLocal = @{
         'core.repositoryformatversion' = @('0')
         'core.filemode' = @('true', 'false')
         'core.bare' = @('false')
         'core.logallrefupdates' = @('true')
+        'core.autocrlf' = $allowedAutocrlf
         'core.symlinks' = @('true', 'false')
         'core.ignorecase' = @('true', 'false')
         'core.precomposeunicode' = @('true', 'false')
@@ -528,21 +596,260 @@ function Get-GitRevision {
     return ($result | Select-Object -First 1).Trim().ToLowerInvariant()
 }
 
+function Assert-RepositoryTreeWithoutReparsePoints {
+    param([Parameter(Mandatory = $true)][string]$Repository)
+    Assert-ContainedNonReparsePath -Path $Repository
+    if (-not (Test-Path -LiteralPath $Repository -PathType Container)) {
+        Fail "Runtime source is not a directory: $Repository"
+    }
+    $directories = New-Object 'System.Collections.Generic.Stack[string]'
+    $directories.Push($Repository)
+    while ($directories.Count -gt 0) {
+        $directory = $directories.Pop()
+        $directoryItem = Get-Item -LiteralPath $directory -Force
+        if (($directoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Refusing reparse-point runtime source path: $directory"
+        }
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail "Refusing reparse-point runtime source path: $($item.FullName)"
+            }
+            if ($item.PSIsContainer) {
+                $directories.Push($item.FullName)
+            }
+        }
+    }
+}
+
+function Test-RawTrackedFilesMatchIndex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$GitPath
+    )
+    $hooksPath = Get-TrustedGitHooksPath
+    Assert-RepositoryTreeWithoutReparsePoints -Repository $Repository
+    $repositoryFullPath = [IO.Path]::GetFullPath($Repository).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $repositoryPrefix = $repositoryFullPath + [IO.Path]::DirectorySeparatorChar
+    $entryOutput = @(& $GitPath --no-replace-objects -c "core.hooksPath=$hooksPath" -c 'core.fsmonitor=false' -C $Repository ls-files -s -z)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Could not inspect raw tracked files in $Repository."
+    }
+    $entries = ([string]::Concat([string[]]$entryOutput)).Split([char]0)
+    if ($entries.Count -eq 0 -or $entries[$entries.Count - 1] -ne '') {
+        Fail "Could not parse raw tracked-file entries in $Repository."
+    }
+    $trackedFiles = @()
+    for ($entryIndex = 0; $entryIndex -lt $entries.Count - 1; $entryIndex++) {
+        $entry = $entries[$entryIndex]
+        if ([string]::IsNullOrEmpty($entry)) {
+            Fail "Could not parse raw tracked-file entries in $Repository."
+        }
+        $match = [regex]::Match([string]$entry, '^(?<mode>[0-7]{6}) (?<hash>[0-9a-f]{40,64}) (?<stage>[0-3])\t(?<path>.+)$')
+        if (-not $match.Success) {
+            Fail "Could not parse tracked-file index entry in $Repository."
+        }
+        if ($match.Groups['mode'].Value -notin @('100644', '100755') -or $match.Groups['stage'].Value -ne '0') {
+            Fail "Refusing nonregular tracked-file index entry in $Repository."
+        }
+        $relativePath = $match.Groups['path'].Value
+        if ([string]::IsNullOrWhiteSpace($relativePath) -or
+            $relativePath -match '[\x00-\x1f\x7f\\"]' -or
+            $relativePath -match '^[\\/]|(^|/)\.\.?($|/)' -or
+            [IO.Path]::IsPathRooted($relativePath)) {
+            Fail "Refusing ambiguous tracked-file path in $Repository."
+        }
+        try {
+            $path = [IO.Path]::GetFullPath((Join-Path $Repository $relativePath))
+        } catch {
+            Fail "Could not resolve tracked-file path in $Repository."
+        }
+        if (-not $path.StartsWith($repositoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Fail "Refusing tracked-file path outside repository: $relativePath"
+        }
+        $trackedFiles += [PSCustomObject]@{
+            Path = $relativePath
+            Hash = $match.Groups['hash'].Value
+        }
+    }
+    if ($trackedFiles.Count -eq 0) {
+        return $true
+    }
+    $rawHashes = @()
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $GitPath
+    $startInfo.Arguments = '--no-replace-objects -c "core.hooksPath=' + $hooksPath + '" -c core.fsmonitor=false -C "' + $Repository + '" hash-object --no-filters --stdin-paths'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $rawHashOutput = $null
+    $rawHashExitCode = $null
+    $batchProcessStarted = $false
+    try {
+        [void]$process.Start()
+        $batchProcessStarted = $true
+        $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
+        $standardErrorTask = $process.StandardError.ReadToEndAsync()
+        foreach ($trackedFile in $trackedFiles) {
+            $inputBytes = $utf8.GetBytes(([string]$trackedFile.Path) + "`n")
+            $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
+        }
+        $process.StandardInput.BaseStream.Flush()
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit(30000)) {
+            $process.Kill()
+            [void]$process.WaitForExit(5000)
+            Fail "Timed out batch-hashing raw tracked files in $Repository."
+        }
+        $rawHashOutput = $standardOutputTask.Result
+        $null = $standardErrorTask.Result
+        $rawHashExitCode = $process.ExitCode
+    }
+    catch {
+        if ($batchProcessStarted) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                    [void]$process.WaitForExit(5000)
+                }
+            } catch {
+            }
+        }
+        Fail "Could not batch-hash raw tracked files in $Repository."
+    }
+    finally {
+        $process.Dispose()
+    }
+    if ($rawHashExitCode -ne 0) {
+        Fail "Could not batch-hash raw tracked files in $Repository."
+    }
+    $rawHashes = @($rawHashOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($rawHashes.Count -ne $trackedFiles.Count) {
+        Fail "Could not batch-hash raw tracked files in $Repository."
+    }
+    for ($fileIndex = 0; $fileIndex -lt $trackedFiles.Count; $fileIndex++) {
+        $relativePath = [string]$trackedFiles[$fileIndex].Path
+        $expectedHash = [string]$trackedFiles[$fileIndex].Hash
+        $rawHash = ([string]$rawHashes[$fileIndex]).Trim().ToLowerInvariant()
+        if ($rawHash -notmatch '^[0-9a-f]{40,64}$') {
+            Fail "Could not parse raw tracked-file hash for $relativePath in $Repository."
+        }
+        if ($rawHash -ne $expectedHash) {
+            $attributeOutput = @(& $GitPath --no-replace-objects -c "core.hooksPath=$hooksPath" -c 'core.fsmonitor=false' -C $Repository check-attr -z eol working-tree-encoding -- $relativePath)
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Could not inspect line-ending attributes for $relativePath in $Repository."
+            }
+            $attributeFields = ([string]::Concat([string[]]$attributeOutput)).Split([char]0)
+            if ($attributeFields.Count -ne 7 -or $attributeFields[6] -ne '') {
+                Fail "Could not parse line-ending attributes for $relativePath in $Repository."
+            }
+            $attributes = @{}
+            for ($index = 0; $index -lt 6; $index += 3) {
+                if ($attributeFields[$index] -ne $relativePath -or
+                    $attributeFields[$index + 1] -notin @('eol', 'working-tree-encoding') -or
+                    $attributes.ContainsKey($attributeFields[$index + 1])) {
+                    Fail "Could not parse line-ending attributes for $relativePath in $Repository."
+                }
+                $attributes[$attributeFields[$index + 1]] = $attributeFields[$index + 2]
+            }
+            if ($attributes.Count -ne 2 -or $attributes['eol'] -ne 'crlf' -or
+                $attributes['working-tree-encoding'] -ne 'unspecified') {
+                return $false
+            }
+            $filteredHash = @(& $GitPath --no-replace-objects -c "core.hooksPath=$hooksPath" -c 'core.fsmonitor=false' -C $Repository hash-object -- $relativePath)
+            if ($LASTEXITCODE -ne 0 -or $filteredHash.Count -ne 1) {
+                Fail "Could not hash filtered tracked file $relativePath in $Repository."
+            }
+            if (([string]$filteredHash[0]).Trim().ToLowerInvariant() -ne $expectedHash) {
+                return $false
+            }
+        }
+    }
+    return $true
+}
+
+function Test-NormalizedPinnedCheckout {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$GitPath
+    )
+    $hooksPath = Get-TrustedGitHooksPath
+    $autocrlf = @(& $GitPath --no-replace-objects -c "core.hooksPath=$hooksPath" -c 'core.fsmonitor=false' -C $Repository config --local --get-all core.autocrlf)
+    if ($LASTEXITCODE -eq 1) {
+        return $false
+    }
+    if ($LASTEXITCODE -ne 0 -or $autocrlf.Count -ne 1 -or ([string]$autocrlf[0]).Trim() -ne 'false') {
+        return $false
+    }
+    return Test-RawTrackedFilesMatchIndex -Repository $Repository -GitPath $GitPath
+}
+
 function Ensure-GitRepository {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$RepositoryUrl,
-        [Parameter(Mandatory = $true)][string]$GitPath
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter()][switch]$AllowLegacyAutocrlf
     )
     if (-not (Test-Path -LiteralPath (Join-Path $Path '.git') -PathType Container)) {
         if (Test-Path -LiteralPath $Path) {
             Fail "Runtime source path exists but is not a Git repository: $Path. Use Reset -Force after confirming it is disposable."
         }
-        Invoke-GitRuntime -GitPath $GitPath -Arguments @('clone', '--no-checkout', $RepositoryUrl, $Path) -Description "Cloning $RepositoryUrl"
+        Invoke-GitRuntime -GitPath $GitPath -Arguments @('-c', 'core.autocrlf=false', 'clone', '--no-checkout', $RepositoryUrl, $Path) -Description "Cloning $RepositoryUrl"
+        Invoke-GitRuntime -GitPath $GitPath -Arguments @('-C', $Path, 'config', '--local', '--replace-all', 'core.autocrlf', 'false') -Description "Disabling Git line-ending conversion in $Path"
         Assert-SafeGitControlState -Repository $Path -ExpectedOrigin $RepositoryUrl -GitPath $GitPath
-        return
+        return $true
     }
-    Assert-SafeGitControlState -Repository $Path -ExpectedOrigin $RepositoryUrl -GitPath $GitPath
+    Assert-SafeGitControlState -Repository $Path -ExpectedOrigin $RepositoryUrl -GitPath $GitPath -AllowLegacyAutocrlf:$AllowLegacyAutocrlf
+    return $false
+}
+
+function Restore-VerifiedPinnedCheckout {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$ExpectedOrigin,
+        [Parameter(Mandatory = $true)][string]$PinnedCommit,
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter()][switch]$AllowUnpopulatedCheckout
+    )
+    Assert-SafeGitControlState -Repository $Repository -ExpectedOrigin $ExpectedOrigin -GitPath $GitPath -AllowLegacyAutocrlf
+    if (-not $AllowUnpopulatedCheckout) {
+        $head = Get-GitRevision -Repository $Repository -Revision 'HEAD' -GitPath $GitPath
+        if ($head -ne $PinnedCommit) {
+            Fail "$Kind checkout HEAD does not match the required pinned commit."
+        }
+        Assert-CleanRuntimeSource -Repository $Repository -Kind $Kind -GitPath $GitPath
+        if (Test-NormalizedPinnedCheckout -Repository $Repository -GitPath $GitPath) {
+            return
+        }
+    }
+    Stop-RunningMoodleProjectContainers
+    try {
+        Invoke-GitRuntime -GitPath $GitPath -Arguments @('-C', $Repository, 'config', '--local', '--replace-all', 'core.autocrlf', 'false') -Description "Disabling Git line-ending conversion in $Repository"
+        Invoke-GitRuntime -GitPath $GitPath -Arguments @('-C', $Repository, 'rm', '-r', '--force', '--ignore-unmatch', '--', '.') -Description "Preparing pinned $Kind tracked files for LF restoration"
+        Invoke-GitRuntime -GitPath $GitPath -Arguments @('-C', $Repository, '-c', 'core.autocrlf=false', 'checkout', '--force', '--detach', $PinnedCommit) -Description "Restoring pinned $Kind checkout with LF line endings"
+    } catch {
+        try {
+            Invoke-GitRuntime -GitPath $GitPath -Arguments @('-C', $Repository, '-c', 'core.autocrlf=false', 'checkout', '--force', '--detach', $PinnedCommit) -Description "Recovering pinned $Kind checkout after failed LF restoration"
+        } catch {
+            Fail "Pinned $Kind checkout restoration failed and recovery could not complete. Run Reset -Force."
+        }
+        Fail "Pinned $Kind checkout restoration failed; the verified pin was restored."
+    }
+    $head = Get-GitRevision -Repository $Repository -Revision 'HEAD' -GitPath $GitPath
+    if ($head -ne $PinnedCommit) {
+        Fail "$Kind checkout HEAD does not match the required pinned commit after line-ending restoration."
+    }
+    Assert-SafeGitControlState -Repository $Repository -ExpectedOrigin $ExpectedOrigin -GitPath $GitPath
+    Assert-CleanRuntimeSource -Repository $Repository -Kind $Kind -GitPath $GitPath
+    if (-not (Test-RawTrackedFilesMatchIndex -Repository $Repository -GitPath $GitPath)) {
+        Fail "$Kind checkout raw tracked files do not match the verified pin after line-ending restoration."
+    }
 }
 
 function Assert-GitOrigin {
@@ -607,6 +914,105 @@ function Assert-GeneratedMoodleConfig {
     }
 }
 
+function Test-ByteSequenceEqual {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Left,
+        [Parameter(Mandatory = $true)][byte[]]$Right
+    )
+    if ($Left.Length -ne $Right.Length) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Left.Length; $index++) {
+        if ($Left[$index] -ne $Right[$index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-RegularNonReparseFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    Assert-ContainedNonReparsePath -Path $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Fail "$Description is missing or is not a regular file."
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Fail "$Description is not a regular non-reparse file."
+    }
+}
+
+function Repair-LegacyGeneratedMoodleConfig {
+    $template = Join-Path $MoodleDockerRoot 'config.docker-template.php'
+    $config = Join-Path $MoodleRoot 'config.php'
+    Assert-RegularNonReparseFile -Path $template -Description 'Pinned Moodle Docker template'
+    Assert-RegularNonReparseFile -Path $config -Description 'Generated Moodle config.php'
+    if ((Get-FileSha256 -Path $template) -eq (Get-FileSha256 -Path $config)) {
+        return
+    }
+    $templateBytes = [IO.File]::ReadAllBytes($template)
+    $configBytes = [IO.File]::ReadAllBytes($config)
+    if (Test-ByteSequenceEqual -Left $templateBytes -Right $configBytes) {
+        return
+    }
+    if ($templateBytes -contains [byte]13) {
+        Fail 'Pinned Moodle Docker template contains CR bytes; refusing legacy generated-config migration.'
+    }
+    $legacyBytes = New-Object 'System.Collections.Generic.List[byte]'
+    foreach ($byte in $templateBytes) {
+        if ($byte -eq 10) {
+            $legacyBytes.Add([byte]13)
+        }
+        $legacyBytes.Add($byte)
+    }
+    if (-not (Test-ByteSequenceEqual -Left $configBytes -Right $legacyBytes.ToArray())) {
+        Fail 'Generated Moodle config.php does not exactly match pinned config.docker-template.php or its legacy CRLF form. Run Bootstrap or Reset -Force.'
+    }
+
+    Stop-RunningMoodleProjectContainers
+    Assert-RegularNonReparseFile -Path $template -Description 'Pinned Moodle Docker template'
+    Assert-RegularNonReparseFile -Path $config -Description 'Generated Moodle config.php'
+    if (-not (Test-ByteSequenceEqual -Left ([IO.File]::ReadAllBytes($template)) -Right $templateBytes) -or
+        -not (Test-ByteSequenceEqual -Left ([IO.File]::ReadAllBytes($config)) -Right $configBytes)) {
+        Fail 'Generated Moodle config.php changed while preparing legacy CRLF migration.'
+    }
+    $temporary = Join-Path $MoodleRoot '.moodle-autotask-config.php.tmp'
+    $backup = Join-Path $MoodleRoot '.moodle-autotask-config.php.bak'
+    Assert-SafeWriteTarget -Path $temporary
+    Assert-SafeWriteTarget -Path $backup
+    $replaced = $false
+    try {
+        [IO.File]::WriteAllBytes($temporary, $templateBytes)
+        if (-not (Test-ByteSequenceEqual -Left ([IO.File]::ReadAllBytes($temporary)) -Right $templateBytes)) {
+            Fail 'Could not verify temporary generated Moodle config.php migration content.'
+        }
+        [IO.File]::Replace($temporary, $config, $backup, $true)
+        $replaced = $true
+        if (-not (Test-ByteSequenceEqual -Left ([IO.File]::ReadAllBytes($config)) -Right $templateBytes)) {
+            Fail 'Generated Moodle config.php migration did not produce the exact pinned template bytes.'
+        }
+        Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+    } catch {
+        if ($replaced -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
+            try {
+                [IO.File]::Replace($backup, $config, $null, $true)
+            } catch {
+                Fail 'Generated Moodle config.php migration failed and recovery could not complete. Run Reset -Force.'
+            }
+        }
+        Fail 'Generated Moodle config.php legacy CRLF migration failed; the original file was restored.'
+    } finally {
+        foreach ($path in @($temporary, $backup)) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
     $stream = [System.IO.File]::OpenRead($Path)
@@ -667,20 +1073,18 @@ function Assert-NormalMoodleDockerExecutionTrust {
 function Initialize-Sources {
     $git = Assert-Git
     Ensure-Directory -Path $RuntimeRoot
-    Ensure-GitRepository -Path $MoodleDockerRoot -RepositoryUrl $Versions.MoodleDockerRepository -GitPath $git
-    Assert-SafeGitControlState -Repository $MoodleDockerRoot -ExpectedOrigin $Versions.MoodleDockerRepository -GitPath $git
+    $dockerFreshClone = Ensure-GitRepository -Path $MoodleDockerRoot -RepositoryUrl $Versions.MoodleDockerRepository -GitPath $git -AllowLegacyAutocrlf
+    Assert-SafeGitControlState -Repository $MoodleDockerRoot -ExpectedOrigin $Versions.MoodleDockerRepository -GitPath $git -AllowLegacyAutocrlf
     Assert-GitOrigin -Repository $MoodleDockerRoot -ExpectedUrl $Versions.MoodleDockerRepository -GitPath $git
     Invoke-GitRuntime -GitPath $git -Arguments @('-C', $MoodleDockerRoot, 'fetch', '--force', 'origin', $Versions.MoodleDockerCommit) -Description 'Fetching pinned moodle-docker commit'
     $dockerCommit = Get-GitRevision -Repository $MoodleDockerRoot -Revision $Versions.MoodleDockerCommit -GitPath $git
     if ($dockerCommit -ne $Versions.MoodleDockerCommit) {
         Fail 'The fetched moodle-docker commit does not match the required pin.'
     }
-    Assert-SafeGitControlState -Repository $MoodleDockerRoot -ExpectedOrigin $Versions.MoodleDockerRepository -GitPath $git
-    Invoke-GitRuntime -GitPath $git -Arguments @('-C', $MoodleDockerRoot, 'checkout', '--detach', $Versions.MoodleDockerCommit) -Description 'Checking out pinned moodle-docker commit'
-    Assert-CleanRuntimeSource -Repository $MoodleDockerRoot -Kind 'moodle-docker' -GitPath $git
+    Restore-VerifiedPinnedCheckout -Repository $MoodleDockerRoot -Kind 'moodle-docker' -ExpectedOrigin $Versions.MoodleDockerRepository -PinnedCommit $Versions.MoodleDockerCommit -GitPath $git -AllowUnpopulatedCheckout:$dockerFreshClone
 
-    Ensure-GitRepository -Path $MoodleRoot -RepositoryUrl $Versions.MoodleRepository -GitPath $git
-    Assert-SafeGitControlState -Repository $MoodleRoot -ExpectedOrigin $Versions.MoodleRepository -GitPath $git
+    $moodleFreshClone = Ensure-GitRepository -Path $MoodleRoot -RepositoryUrl $Versions.MoodleRepository -GitPath $git -AllowLegacyAutocrlf
+    Assert-SafeGitControlState -Repository $MoodleRoot -ExpectedOrigin $Versions.MoodleRepository -GitPath $git -AllowLegacyAutocrlf
     Assert-GitOrigin -Repository $MoodleRoot -ExpectedUrl $Versions.MoodleRepository -GitPath $git
     Invoke-GitRuntime -GitPath $git -Arguments @('-C', $MoodleRoot, 'fetch', '--force', 'origin', "refs/tags/$($Versions.MoodleRelease):refs/tags/$($Versions.MoodleRelease)") -Description 'Fetching pinned Moodle release tag'
     $tagObject = Get-GitRevision -Repository $MoodleRoot -Revision "refs/tags/$($Versions.MoodleRelease)" -GitPath $git
@@ -688,13 +1092,7 @@ function Initialize-Sources {
     if ($tagObject -ne $Versions.MoodleTagObject -or $peeledCommit -ne $Versions.MoodlePeeledCommit) {
         Fail 'The fetched Moodle v5.2.1 tag object or peeled commit does not match the required pins.'
     }
-    Assert-SafeGitControlState -Repository $MoodleRoot -ExpectedOrigin $Versions.MoodleRepository -GitPath $git
-    Invoke-GitRuntime -GitPath $git -Arguments @('-C', $MoodleRoot, 'checkout', '--detach', $Versions.MoodlePeeledCommit) -Description 'Checking out pinned Moodle commit'
-    $head = Get-GitRevision -Repository $MoodleRoot -Revision 'HEAD' -GitPath $git
-    if ($head -ne $Versions.MoodlePeeledCommit) {
-        Fail 'Moodle checkout HEAD does not match the required peeled commit.'
-    }
-    Assert-CleanRuntimeSource -Repository $MoodleRoot -Kind 'moodle' -GitPath $git
+    Restore-VerifiedPinnedCheckout -Repository $MoodleRoot -Kind 'moodle' -ExpectedOrigin $Versions.MoodleRepository -PinnedCommit $Versions.MoodlePeeledCommit -GitPath $git -AllowUnpopulatedCheckout:$moodleFreshClone
 }
 
 function Get-MoodleLayout {
@@ -1190,7 +1588,8 @@ function Invoke-Smoke {
     if ($richAssignments.Count -ne 11) {
         Fail 'Smoke test did not receive the exact 11 rich fixture assignments.'
     }
-    $ovaAssignment = @($richAssignments | Where-Object { $_.name -eq "Pràctica ISO 1 - Desplegament d'una OVA" }) | Select-Object -First 1
+    $expectedOvaAssignmentName = 'Pr' + [char]0x00e0 + "ctica ISO 1 - Desplegament d'una OVA"
+    $ovaAssignment = @($richAssignments | Where-Object { $_.name -eq $expectedOvaAssignmentName }) | Select-Object -First 1
     $ovaFiles = if ($null -eq $ovaAssignment) { @() } else { @($ovaAssignment.introattachments | ForEach-Object { [string]$_.filename }) }
     if ($null -eq $ovaAssignment -or $ovaFiles -notcontains 'asix-router-lab.ova') {
         Fail 'Smoke test did not receive the simulated OVA attachment metadata.'
@@ -1283,8 +1682,10 @@ switch ($Action) {
     'Up' {
         Assert-NoMoodleDockerLocalOverride
         $script:Versions = Read-MoodleVersions -Path $VersionsPath
-        Assert-NormalMoodleDockerExecutionTrust
         Assert-DockerDaemon
+        Initialize-Sources
+        Repair-LegacyGeneratedMoodleConfig
+        Assert-NormalMoodleDockerExecutionTrust
         Resume-Stack
     }
     'Down' {

@@ -56,7 +56,10 @@ def test_script_uses_pinned_sources_and_validates_tag_and_commit() -> None:
     assert 'refs/tags/$($Versions.MoodleRelease)^{}' in script
     assert "$Versions.MoodleTagObject" in script
     assert "$Versions.MoodlePeeledCommit" in script
-    assert "checkout', '--detach'" in script
+    assert "checkout', '--force', '--detach'" in script
+    assert "'rm', '-r', '--force', '--ignore-unmatch', '--', '.'" in script
+    assert "'-c', 'core.autocrlf=false', 'clone', '--no-checkout'" in script
+    assert "'config', '--local', '--replace-all', 'core.autocrlf', 'false'" in script
 
 
 def test_script_limits_runtime_and_reset_targets() -> None:
@@ -604,9 +607,41 @@ def test_smoke_requires_exact_rich_course_assignment_and_ova_metadata_matrix() -
     assert "$expectedRichCourses = @(" in smoke
     assert "$richAssignments.Count -ne 11" in smoke
     assert "mod_assign_get_assignments" in smoke
-    assert "Pràctica ISO 1 - Desplegament d'una OVA" in smoke
+    assert "'Pr' + [char]0x00e0 + \"ctica ISO 1 - Desplegament d'una OVA\"" in smoke
+    assert "$_.name -eq $expectedOvaAssignmentName" in smoke
     assert "$ovaFiles -notcontains 'asix-router-lab.ova'" in smoke
     assert "12 assignments across the base and ASIX fixtures" in smoke
+
+
+def test_moodle_script_is_ascii_and_windows_powershell_composes_ova_assignment(
+    tmp_path: Path,
+) -> None:
+    script_bytes = SCRIPT.read_bytes()
+    assert not script_bytes.startswith(b"\xef\xbb\xbf")
+    assert all(byte < 0x80 for byte in script_bytes)
+
+    powershell = shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("Windows PowerShell 5 is not available")
+    driver = tmp_path / "ova-unicode.ps1"
+    driver.write_text(
+        "$name = 'Pr' + [char]0x00e0 + \"ctica ISO 1 - Desplegament d'una OVA\"\n"
+        + "$fixtureName = [Text.Encoding]::UTF8.GetString(\n"
+        + "  [Convert]::FromBase64String(\n"
+        + "    'UHLDoGN0aWNhIElTTyAxIC0gRGVzcGxlZ2FtZW50' + 'IGQndW5hIE9WQQ=='\n"
+        + "  )\n"
+        + ")\n"
+        + "if ($name -cne $fixtureName) { exit 1 }\n",
+        encoding="ascii",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_advance_fixture_action_is_explicit_one_way_and_runs_smoke() -> None:
@@ -768,10 +803,18 @@ def test_source_integrity_rejects_dirty_runtime_sources() -> None:
     assert "--ignored --untracked-files=all" in script
     assert "$allowed = @('!! config.php')" in script
     assert "Assert-GeneratedMoodleConfig" in script
+    assert "function Repair-LegacyGeneratedMoodleConfig" in script
+    assert "[IO.File]::Replace($temporary, $config, $backup, $true)" in script
+    assert "legacy CRLF form" in script
     assert "function Get-FileSha256" in script
     assert "[System.Security.Cryptography.SHA256]::Create()" in script
     assert "Assert-CleanRuntimeSource -Repository $MoodleDockerRoot" in script
     assert "Assert-CleanRuntimeSource -Repository $MoodleRoot" in script
+    up = script.split("    'Up' {", maxsplit=1)[1].split("    '", maxsplit=1)[0]
+    assert up.index("Initialize-Sources") < up.index("Repair-LegacyGeneratedMoodleConfig")
+    assert up.index("Repair-LegacyGeneratedMoodleConfig") < up.index(
+        "Assert-NormalMoodleDockerExecutionTrust"
+    )
 
 
 def test_reset_trusts_only_clean_pinned_moodle_docker_before_compose() -> None:
@@ -814,9 +857,14 @@ def test_normal_wrapper_execution_has_centralized_pinned_source_trust() -> None:
             "    '", maxsplit=1
         )[0]
         assert "$script:Versions = Read-MoodleVersions -Path $VersionsPath" in action_case
-        assert action_case.index("Assert-NormalMoodleDockerExecutionTrust") < action_case.index(
-            "Assert-DockerDaemon"
-        )
+        if action == "Up":
+            assert action_case.index("Assert-DockerDaemon") < action_case.index(
+                "Initialize-Sources"
+            )
+        else:
+            assert action_case.index("Assert-NormalMoodleDockerExecutionTrust") < action_case.index(
+                "Assert-DockerDaemon"
+            )
 
 
 def test_runtime_reparse_and_local_override_guards_run_before_compose() -> None:
@@ -957,8 +1005,47 @@ def test_git_control_state_and_reset_wwwroot_are_constrained() -> None:
     initialise = script.split("function Initialize-Sources", maxsplit=1)[1].split(
         "function Get-MoodleLayout", maxsplit=1
     )[0]
-    assert initialise.count("Assert-SafeGitControlState") >= 4
+    assert initialise.count("Assert-SafeGitControlState") >= 2
+    assert initialise.count("Restore-VerifiedPinnedCheckout") == 2
     assert "Invoke-GitRuntime" in initialise
+    restore = script.split("function Restore-VerifiedPinnedCheckout", maxsplit=1)[1].split(
+        "function Assert-GitOrigin", maxsplit=1
+    )[0]
+    assert "Test-RawTrackedFilesMatchIndex" in restore
+    assert restore.index("Stop-RunningMoodleProjectContainers") < restore.index("'rm', '-r'")
+    assert "Recovering pinned $Kind checkout" in restore
+    raw_tracking = script.split("function Test-RawTrackedFilesMatchIndex", maxsplit=1)[1].split(
+        "function Test-NormalizedPinnedCheckout", maxsplit=1
+    )[0]
+    assert "check-attr -z eol working-tree-encoding -- $relativePath" in raw_tracking
+    assert "hash-object --no-filters --stdin-paths" in raw_tracking
+    assert "hash-object -- $relativePath" in raw_tracking
+    assert "$utf8 = New-Object System.Text.UTF8Encoding($false)" in raw_tracking
+    assert "$process.StandardInput.BaseStream.Write" in raw_tracking
+    assert "Assert-RepositoryTreeWithoutReparsePoints" in raw_tracking
+    assert "Assert-ContainedNonReparsePath -Path $path" not in raw_tracking
+    assert "100644', '100755" in raw_tracking
+    assert "$attributes['eol'] -ne 'crlf'" in raw_tracking
+    assert "$attributes['working-tree-encoding'] -ne 'unspecified'" in raw_tracking
+    stop = script.split("function Stop-RunningMoodleProjectContainers", maxsplit=1)[1].split(
+        "function Ensure-Directory", maxsplit=1
+    )[0]
+    metadata = script.split("function Get-MoodleProjectContainerMetadata", maxsplit=1)[1].split(
+        "function Stop-RunningMoodleProjectContainers", maxsplit=1
+    )[0]
+    assert "label=com.docker.compose.project=$ProjectName" in stop
+    assert "com.docker.compose.service" in stop
+    assert "'exttests'" in stop
+    assert "'stop', '--time', '30'" in stop
+    assert "Get-MoodleProjectContainerMetadata" in stop
+    assert "$rawContainerIds = @(" in stop
+    assert "Could not list Moodle Compose project containers" in stop
+    assert stop.index("$LASTEXITCODE -ne 0") < stop.index("$containerIds = @(")
+    assert "'inspect', '--type', 'container'" in metadata
+    assert "ConvertFrom-Json -ErrorAction Stop" in metadata
+    assert "--format" not in stop
+    up = script.split("    'Up' {", maxsplit=1)[1].split("    'Down' {", maxsplit=1)[0]
+    assert up.index("Assert-DockerDaemon") < up.index("Initialize-Sources")
     environment = script.split("function Get-MoodleDockerEnvironment", maxsplit=1)[1].split(
         "function Invoke-MoodleDocker", maxsplit=1
     )[0]
@@ -967,6 +1054,117 @@ def test_git_control_state_and_reset_wwwroot_are_constrained() -> None:
     reset = script.split("function Reset-LocalEnvironment", maxsplit=1)[1]
     assert "-SkipMoodleSourceTrust -UseRuntimeWwwRoot" in reset
     assert "$GitHooksRoot" in reset
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_exttests_container_is_validated_and_stopped_before_source_mutation(tmp_path: Path) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    script = read(SCRIPT)
+    metadata = script.split("function Get-MoodleProjectContainerMetadata", maxsplit=1)[1].split(
+        "function Stop-RunningMoodleProjectContainers", maxsplit=1
+    )[0]
+    stop = script.split("function Stop-RunningMoodleProjectContainers", maxsplit=1)[1].split(
+        "function Ensure-Directory", maxsplit=1
+    )[0]
+    container_id = "a" * 64
+    driver = tmp_path / "compose-stop.ps1"
+    driver.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        + "$ProjectName = 'moddle_autotask_moodle'\n"
+        + f"$fakeDocker = '{(tmp_path / 'docker.exe').as_posix()}'\n"
+        + f"$env:FAKE_DOCKER_ID = '{container_id}'\n"
+        + f"$env:FAKE_DOCKER_LOG = '{(tmp_path / 'docker.log').as_posix()}'\n"
+        + f"$env:FAKE_DOCKER_STOP = '{(tmp_path / 'docker.stop').as_posix()}'\n"
+        + "Add-Type -TypeDefinition @'\n"
+        + "using System;\n"
+        + "using System.IO;\n"
+        + "public static class FakeDocker {\n"
+        + "    static string Value(bool running, string state) {\n"
+        + "        string id = Environment.GetEnvironmentVariable(\"FAKE_DOCKER_ID\");\n"
+        + "        string fields = \"{\\\"Id\\\":\\\"\" + id + \"\\\",\\\"Config\\\":{\\\"Labels\\\":{\\\"com.docker.compose.project\\\":\\\"moddle_autotask_moodle\\\",\\\"com.docker.compose.service\\\":\\\"exttests\\\"}},\\\"State\\\":\";\n"  # noqa: E501
+        + "        if (state == \"missing\") return \"[\" + fields + \"{}]\";\n"
+        + "        if (state == \"wrong_type\") return \"[\" + fields + \"{\\\"Running\\\":\\\"true\\\"}}]\";\n"  # noqa: E501
+        + "        return \"[\" + fields + \"{\\\"Running\\\":\" + (running ? \"true\" : \"false\") + \"}}]\";\n"  # noqa: E501
+        + "    }\n"
+        + "    public static void Main(string[] arguments) {\n"
+        + "        File.AppendAllText(Environment.GetEnvironmentVariable(\"FAKE_DOCKER_LOG\"), String.Join(\"|\", arguments) + \"\\n\");\n"  # noqa: E501
+        + "        string id = Environment.GetEnvironmentVariable(\"FAKE_DOCKER_ID\");\n"
+        + "        string mode = Environment.GetEnvironmentVariable(\"FAKE_DOCKER_MODE\");\n"
+        + "        if (arguments.Length > 0 && arguments[0] == \"ps\") {\n"
+        + "            if (mode == \"ps_failure_partial\") Console.WriteLine(id.Substring(0, 12));\n"  # noqa: E501
+        + "            if (mode == \"ps_failure_empty\" || mode == \"ps_failure_partial\") { Environment.ExitCode = 1; return; }\n"  # noqa: E501
+        + "            Console.WriteLine(id.Substring(0, 12)); return;\n"
+        + "        }\n"
+        + "        if (arguments.Length > 0 && arguments[0] == \"stop\") { File.WriteAllText(Environment.GetEnvironmentVariable(\"FAKE_DOCKER_STOP\"), \"stopped\"); return; }\n"  # noqa: E501
+        + "        if (arguments.Length > 0 && arguments[0] == \"inspect\") {\n"
+        + "            if (mode == \"malformed\") { Console.WriteLine(\"{\"); return; }\n"
+        + "            string value = Value(!File.Exists(Environment.GetEnvironmentVariable(\"FAKE_DOCKER_STOP\")), mode);\n"  # noqa: E501
+        + "            Console.WriteLine(mode == \"multiple\" ? value.Substring(0, value.Length - 1) + \",\" + value.Substring(1) : value);\n"  # noqa: E501
+        + "            return;\n"
+        + "        }\n"
+        + "        Environment.ExitCode = 1;\n"
+        + "    }\n"
+        + "}\n"
+        + "'@ -OutputAssembly $fakeDocker -OutputType ConsoleApplication\n"
+        + "function Fail { param([string]$Message) throw $Message }\n"
+        + "function Assert-DockerDaemon {}\n"
+        + "function Get-DockerCli { return [PSCustomObject]@{ Source = $fakeDocker } }\n"
+        + "function Get-MoodleProjectContainerMetadata"
+        + metadata
+        + "function Stop-RunningMoodleProjectContainers"
+        + stop
+        + "$env:FAKE_DOCKER_MODE = 'valid'\n"
+        + "Stop-RunningMoodleProjectContainers\n"
+        + "$validCommands = @([IO.File]::ReadAllLines($env:FAKE_DOCKER_LOG))\n"
+        + "$validMutation = $true\n"
+        + "$validCommands += 'mutation'\n"
+        + "$invalid = @()\n"
+        + "foreach ($mode in @('ps_failure_empty', 'ps_failure_partial', 'malformed', 'multiple', 'missing', 'wrong_type')) {\n"  # noqa: E501
+        + "  Remove-Item -LiteralPath $env:FAKE_DOCKER_LOG -Force\n"
+        + "  Remove-Item -LiteralPath $env:FAKE_DOCKER_STOP -Force -ErrorAction SilentlyContinue\n"
+        + "  $env:FAKE_DOCKER_MODE = $mode\n"
+        + "  $errorMessage = $null\n"
+        + "  $mutation = $false\n"
+        + "  try { Stop-RunningMoodleProjectContainers; $mutation = $true } catch { $errorMessage = $_.Exception.Message }\n"  # noqa: E501
+        + "  $invalid += [PSCustomObject]@{ mode = $mode; commands = @([IO.File]::ReadAllLines($env:FAKE_DOCKER_LOG)); error = $errorMessage; mutation = $mutation }\n"  # noqa: E501
+        + "}\n"
+        + "[PSCustomObject]@{ valid = $validCommands; validMutation = $validMutation; invalid = $invalid } | ConvertTo-Json -Compress -Depth 4\n",  # noqa: E501
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    valid_commands = payload["valid"]
+    stop_index = next(  # noqa: E501
+        index for index, event in enumerate(valid_commands) if event.startswith("stop|")
+    )
+    assert stop_index < valid_commands.index("mutation")
+    assert payload["validMutation"] is True
+    inspect_commands = [  # noqa: E501
+        event.split("|") for event in valid_commands if event.startswith("inspect|")
+    ]
+    assert inspect_commands == [
+        ["inspect", "--type", "container", container_id[:12]],
+        ["inspect", "--type", "container", container_id],
+    ]
+    for case in payload["invalid"]:
+        assert case["error"]
+        assert case["mutation"] is False
+        assert not any(command.startswith("stop|") for command in case["commands"])
+        if case["mode"].startswith("ps_failure_"):
+            assert case["commands"] == [
+                "ps|--quiet|--filter|label=com.docker.compose.project=moddle_autotask_moodle"
+            ]
 
 
 @pytest.mark.skipif(
@@ -1066,6 +1264,14 @@ def test_real_no_checkout_clone_allows_only_main_tracking_metadata(tmp_path: Pat
     bare_remote = tmp_path / "remote.git"
     source.mkdir()
     (source / "README").write_text("baseline\n", encoding="utf-8")
+    (source / ".gitignore").write_text("local.yml\nconfig.php\n", encoding="utf-8")
+    (source / ".gitattributes").write_text("*.cmd text eol=crlf\n", encoding="utf-8")
+    port_file = source / "assets" / "exttests" / "apache2_ports.conf"
+    port_file.parent.mkdir(parents=True)
+    port_file.write_bytes(b"9000\n")
+    command_file = source / "bin" / "moodle-docker-compose.cmd"
+    command_file.parent.mkdir(parents=True)
+    command_file.write_bytes(b"@echo off\n")
     subprocess.run(
         ["git", "init", "--initial-branch=main"],
         cwd=source,
@@ -1073,7 +1279,19 @@ def test_real_no_checkout_clone_allows_only_main_tracking_metadata(tmp_path: Pat
         capture_output=True,
         text=True,
     )
-    subprocess.run(["git", "add", "README"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "README",
+            ".gitignore",
+            ".gitattributes",
+            "assets/exttests/apache2_ports.conf",
+            "bin/moodle-docker-compose.cmd",
+        ],
+        cwd=source,
+        check=True,
+    )
     subprocess.run(
         [
             "git",
@@ -1090,6 +1308,31 @@ def test_real_no_checkout_clone_allows_only_main_tracking_metadata(tmp_path: Pat
         capture_output=True,
         text=True,
     )
+    pinned_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (source / "README").write_text("newer default HEAD\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "newer default HEAD",
+        ],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(
         ["git", "clone", "--bare", str(source), str(bare_remote)],
         check=True,
@@ -1100,41 +1343,302 @@ def test_real_no_checkout_clone_allows_only_main_tracking_metadata(tmp_path: Pat
     assert powershell is not None
     runtime = tmp_path / "runtime"
     checkout = runtime / "moodle-docker"
+    legacy_checkout = runtime / "legacy-moodle-docker"
+    subprocess.run(
+        ["git", "-c", "core.autocrlf=true", "clone", str(bare_remote), str(legacy_checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--detach", pinned_commit],
+        cwd=legacy_checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    legacy_port_file = legacy_checkout / "assets" / "exttests" / "apache2_ports.conf"
+    assert b"\r\n" in legacy_port_file.read_bytes()
+    legacy_command_file = legacy_checkout / "bin" / "moodle-docker-compose.cmd"
+    assert b"\r\n" in legacy_command_file.read_bytes()
     prefix = read(SCRIPT).split("\nswitch ($Action) {", maxsplit=1)[0]
+    driver_body = "\n".join(
+        [
+            "$script:stopCount = 0",
+            "function Stop-RunningMoodleProjectContainers { $script:stopCount++ }",
+            f"$RepoRoot = '{tmp_path.as_posix()}'",
+            f"$RuntimeRoot = '{runtime.as_posix()}'",
+            f"$MoodleRoot = '{(runtime / 'moodle').as_posix()}'",
+            f"$MoodleDockerRoot = '{checkout.as_posix()}'",
+            f"$MoodleDataRoot = '{(runtime / 'moodledata').as_posix()}'",
+            f"$GitHooksRoot = '{(runtime / 'moodle-git-hooks').as_posix()}'",
+            "$git = Assert-Git",
+            f"$checkoutPath = '{checkout.as_posix()}'",
+            f"$legacyPath = '{legacy_checkout.as_posix()}'",
+            "$originPath = (& $git -C $legacyPath config --local --get remote.origin.url)",
+            f"$pinnedCommit = '{pinned_commit}'",
+            (
+                "Assert-SafeGitControlState -Repository $legacyPath "
+                "-ExpectedOrigin $originPath -GitPath $git -AllowLegacyAutocrlf"
+            ),
+            (
+                "Restore-VerifiedPinnedCheckout -Repository $legacyPath "
+                "-Kind 'moodle-docker' -ExpectedOrigin $originPath "
+                "-PinnedCommit $pinnedCommit -GitPath $git"
+            ),
+            "$cloneArguments = @{",
+            "    Path = $checkoutPath",
+            "    RepositoryUrl = $originPath",
+            "    GitPath = $git",
+            "}",
+            "$freshClone = Ensure-GitRepository @cloneArguments",
+            (
+                "Restore-VerifiedPinnedCheckout -Repository $checkoutPath "
+                "-Kind 'moodle-docker' -ExpectedOrigin $originPath "
+                "-PinnedCommit $pinnedCommit -GitPath $git "
+                "-AllowUnpopulatedCheckout:$freshClone"
+            ),
+            (
+                "Assert-SafeGitControlState -Repository $legacyPath "
+                "-ExpectedOrigin $originPath -GitPath $git"
+            ),
+            (
+                "Assert-SafeGitControlState -Repository $checkoutPath "
+                "-ExpectedOrigin $originPath -GitPath $git"
+            ),
+            "$freshHead = Get-GitRevision -Repository $checkoutPath -Revision 'HEAD' -GitPath $git",
+            (
+                "if ($freshHead -ne $pinnedCommit) "
+                "{ throw 'Fresh clone did not restore the fetched pin.' }"
+            ),
+            (
+                "$legacyPort = [IO.File]::ReadAllBytes((Join-Path $legacyPath "
+                "'assets/exttests/apache2_ports.conf'))"
+            ),
+            (
+                "$freshPort = [IO.File]::ReadAllBytes((Join-Path $checkoutPath "
+                "'assets/exttests/apache2_ports.conf'))"
+            ),
+            (
+                "$legacyCommand = [IO.File]::ReadAllBytes((Join-Path $legacyPath "
+                "'bin/moodle-docker-compose.cmd'))"
+            ),
+            (
+                "$freshCommand = [IO.File]::ReadAllBytes((Join-Path $checkoutPath "
+                "'bin/moodle-docker-compose.cmd'))"
+            ),
+            (
+                "if ($legacyPort -contains 13 -or $freshPort -contains 13) "
+                "{ throw 'Tracked healthcheck port retained CR bytes.' }"
+            ),
+            (
+                "if ($legacyCommand -notcontains 13 -or $freshCommand -notcontains 13) "
+                "{ throw 'Intentional CRLF command file was not retained.' }"
+            ),
+            (
+                "if ((& $git -C $legacyPath config --local --get core.autocrlf) "
+                "-ne 'false') { throw 'Legacy checkout did not set core.autocrlf=false.' }"
+            ),
+            (
+                "if ((& $git -C $checkoutPath config --local --get core.autocrlf) "
+                "-ne 'false') { throw 'Fresh checkout did not set core.autocrlf=false.' }"
+            ),
+            "$remote = & $git -C $checkoutPath config --local --get branch.main.remote",
+            "$merge = & $git -C $checkoutPath config --local --get branch.main.merge",
+            (
+                "if ($remote -ne 'origin' -or $merge -ne 'refs/heads/main') "
+                "{ throw 'Fresh clone tracking metadata changed.' }"
+            ),
+            "$freshPortPath = Join-Path $checkoutPath 'assets/exttests/apache2_ports.conf'",
+            "$freshCommandPath = Join-Path $checkoutPath 'bin/moodle-docker-compose.cmd'",
+            "$freshBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($freshPortPath))",
+            (
+                "$freshCommandBytes = [Convert]::ToBase64String("
+                "[IO.File]::ReadAllBytes($freshCommandPath))"
+            ),
+            "$freshMtime = (Get-Item -LiteralPath $freshPortPath).LastWriteTimeUtc.Ticks",
+            "$freshCommandMtime = (Get-Item -LiteralPath $freshCommandPath).LastWriteTimeUtc.Ticks",
+            (
+                "$freshIndex = [Convert]::ToBase64String([IO.File]::ReadAllBytes("
+                "(Join-Path $checkoutPath '.git/index')))"
+            ),
+            "Write-TrustedMoodleDockerLocalOverride",
+            "$localOverride = [IO.File]::ReadAllText((Join-Path $checkoutPath 'local.yml'))",
+            "$stopsBeforeNoOp = $script:stopCount",
+            (
+                "Restore-VerifiedPinnedCheckout -Repository $checkoutPath "
+                "-Kind 'moodle-docker' -ExpectedOrigin $originPath "
+                "-PinnedCommit $pinnedCommit -GitPath $git"
+            ),
+            (
+                "if ($script:stopCount -ne $stopsBeforeNoOp) "
+                "{ throw 'Normalized checkout stopped containers.' }"
+            ),
+            (
+                "if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($freshPortPath)) "
+                "-ne $freshBytes) { throw 'Normalized checkout changed content.' }"
+            ),
+            (
+                "if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($freshCommandPath)) "
+                "-ne $freshCommandBytes) { throw 'No-op changed command content.' }"
+            ),
+            (
+                "if ((Get-Item -LiteralPath $freshPortPath).LastWriteTimeUtc.Ticks "
+                "-ne $freshMtime) { throw 'Normalized checkout changed mtime.' }"
+            ),
+            (
+                "if ((Get-Item -LiteralPath $freshCommandPath).LastWriteTimeUtc.Ticks "
+                "-ne $freshCommandMtime) { throw 'No-op changed command mtime.' }"
+            ),
+            (
+                "if ([Convert]::ToBase64String([IO.File]::ReadAllBytes("
+                "(Join-Path $checkoutPath '.git/index'))) -ne $freshIndex) "
+                "{ throw 'Normalized checkout changed index.' }"
+            ),
+            (
+                "if ([IO.File]::ReadAllText((Join-Path $checkoutPath 'local.yml')) "
+                "-ne $localOverride) { throw 'Normalized checkout changed local.yml.' }"
+            ),
+            (
+                "if (-not (Test-RawTrackedFilesMatchIndex -Repository $checkoutPath "
+                "-GitPath $git)) { throw 'Normalized checkout rejected explicit eol=crlf.' }"
+            ),
+            (
+                "[IO.File]::WriteAllBytes($freshPortPath, "
+                "[Text.Encoding]::ASCII.GetBytes(\"9000`r`n\"))"
+            ),
+            (
+                "if (Test-RawTrackedFilesMatchIndex -Repository $checkoutPath "
+                "-GitPath $git) { throw 'Unannotated CRLF tracked file was accepted.' }"
+            ),
+            "$flexibleSettings = @(",
+            "    @('core.filemode', 'true'), @('core.filemode', 'false'),",
+            "    @('core.symlinks', 'true'), @('core.symlinks', 'false'),",
+            "    @('core.ignorecase', 'true'), @('core.ignorecase', 'false'),",
+            "    @('core.precomposeunicode', 'true'), @('core.precomposeunicode', 'false')",
+            ")",
+            "foreach ($setting in $flexibleSettings) {",
+            (
+                "    & $git --no-replace-objects -C $checkoutPath "
+                "config --local $setting[0] $setting[1]"
+            ),
+            "    if ($LASTEXITCODE -ne 0) { throw 'Could not set permitted local Git config.' }",
+            (
+                "    Assert-SafeGitControlState -Repository $checkoutPath "
+                "-ExpectedOrigin $originPath -GitPath $git"
+            ),
+            "}",
+            "Write-Output 'clone-control-state-ok'",
+        ]
+    )
     driver = tmp_path / "clone-control-state.ps1"
+    driver.write_text(
+        prefix + "\n" + driver_body + "\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=45,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("clone-control-state-ok")
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None
+    and shutil.which("pwsh") is None
+    or shutil.which("git") is None,
+    reason="PowerShell and Git are required",
+)
+def test_raw_tracked_file_verifier_batches_hundreds_of_paths(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    bulk_directory = repository / "bulk"
+    repository.mkdir()
+    bulk_directory.mkdir()
+    for index in range(300):
+        (bulk_directory / f"tracked-{index:03}.txt").write_text(
+            f"tracked {index}\n", encoding="utf-8"
+        )
+    (bulk_directory / "trànsit-漢.txt").write_text("unicode\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-m",
+            "batch",
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "--local", "core.autocrlf", "false"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "rm", "-r", "--force", "--", "."],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--force"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    prefix = read(SCRIPT).split("\nswitch ($Action) {", maxsplit=1)[0]
+    driver = tmp_path / "batch-raw-hashes.ps1"
     driver.write_text(
         prefix
         + f"\n$RepoRoot = '{tmp_path.as_posix()}'\n"
-        + f"$RuntimeRoot = '{runtime.as_posix()}'\n"
-        + f"$MoodleRoot = '{(runtime / 'moodle').as_posix()}'\n"
-        + f"$MoodleDockerRoot = '{checkout.as_posix()}'\n"
-        + f"$MoodleDataRoot = '{(runtime / 'moodledata').as_posix()}'\n"
-        + f"$GitHooksRoot = '{(runtime / 'moodle-git-hooks').as_posix()}'\n"
+        + f"$RuntimeRoot = '{(tmp_path / 'runtime').as_posix()}'\n"
+        + "$MoodleRoot = Join-Path $RuntimeRoot 'moodle'\n"
+        + "$MoodleDockerRoot = Join-Path $RuntimeRoot 'moodle-docker'\n"
+        + "$MoodleDataRoot = Join-Path $RuntimeRoot 'moodledata'\n"
+        + "$GitHooksRoot = Join-Path $RuntimeRoot 'moodle-git-hooks'\n"
+        + f"$repository = '{repository.as_posix()}'\n"
         + "$git = Assert-Git\n"
-        + f"$checkoutPath = '{checkout.as_posix()}'\n"
-        + f"$originPath = '{bare_remote.as_posix()}'\n"
-        + "$cloneArguments = @{\n"
-        + "    Path = $checkoutPath\n"
-        + "    RepositoryUrl = $originPath\n"
-        + "    GitPath = $git\n}\n"
-        + "Ensure-GitRepository @cloneArguments\n"
-        + "$remote = & $git -C $checkoutPath config --local --get branch.main.remote\n"
-        + "$merge = & $git -C $checkoutPath config --local --get branch.main.merge\n"
-        + "if ($remote -ne 'origin' -or $merge -ne 'refs/heads/main') { exit 1 }\n"
-        + "$flexibleSettings = @(\n"
-        + "    @('core.filemode', 'true'), @('core.filemode', 'false'),\n"
-        + "    @('core.symlinks', 'true'), @('core.symlinks', 'false'),\n"
-        + "    @('core.ignorecase', 'true'), @('core.ignorecase', 'false'),\n"
-        + "    @('core.precomposeunicode', 'true'), @('core.precomposeunicode', 'false')\n"
-        + ")\n"
-        + "foreach ($setting in $flexibleSettings) {\n"
-        + "    & $git --no-replace-objects -C $checkoutPath"
-        + " config --local $setting[0] $setting[1]\n"
-        + "    if ($LASTEXITCODE -ne 0) { exit 1 }\n"
-        + "    Assert-SafeGitControlState -Repository $checkoutPath"
-        + " -ExpectedOrigin $originPath -GitPath $git\n"
+        + "$tracePath = Join-Path $RuntimeRoot 'raw-hash-trace.json'\n"
+        + "$initialOutputEncoding = $global:OutputEncoding\n"
+        + "$previousTrace = $env:GIT_TRACE2_EVENT\n"
+        + "try {\n"
+        + "    $env:GIT_TRACE2_EVENT = $tracePath\n"
+        + "    if (-not (Test-RawTrackedFilesMatchIndex -Repository $repository -GitPath $git)) { throw 'Batch verifier rejected tracked files.' }\n"  # noqa: E501
+        + "} finally {\n"
+        + "    if ($null -eq $previousTrace) { Remove-Item Env:GIT_TRACE2_EVENT -ErrorAction SilentlyContinue }\n"  # noqa: E501
+        + "    else { $env:GIT_TRACE2_EVENT = $previousTrace }\n"
         + "}\n"
-        + "Write-Output 'clone-control-state-ok'\n",
+        + "if (-not [object]::ReferenceEquals($global:OutputEncoding, $initialOutputEncoding)) { throw 'Raw verifier changed global OutputEncoding.' }\n"  # noqa: E501
+        + "$rawHashTraceLines = @(Get-Content -LiteralPath $tracePath | Where-Object { $_ -match '\"hash-object\"' -and $_ -match '\"--no-filters\"' -and $_ -match '\"--stdin-paths\"' })\n"  # noqa: E501
+        + "if ($rawHashTraceLines.Count -ne 1) { throw 'Raw verifier did not use one batch hash-object process.' }\n"  # noqa: E501
+        + "$tamperedPath = Join-Path $repository 'bulk/tracked-000.txt'\n"
+        + "[IO.File]::WriteAllBytes($tamperedPath, [Text.Encoding]::ASCII.GetBytes(\"tampered`r`n\"))\n"  # noqa: E501
+        + "if (Test-RawTrackedFilesMatchIndex -Repository $repository -GitPath $git) { throw 'Unannotated CRLF tracked file was accepted.' }\n"  # noqa: E501
+        + "Write-Output 'batch-raw-hashes-ok'\n",
         encoding="utf-8",
     )
     result = subprocess.run(
@@ -1145,7 +1649,172 @@ def test_real_no_checkout_clone_allows_only_main_tracking_metadata(tmp_path: Pat
         timeout=20,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().endswith("clone-control-state-ok")
+    assert result.stdout.strip().endswith("batch-raw-hashes-ok")
+    junction_target = tmp_path / "junction-target"
+    junction_target.mkdir()
+    junction = repository / "reparse-point"
+    junction_result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(junction_target)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if junction_result.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable")
+    reparse_driver = tmp_path / "reject-reparse-before-hash.ps1"
+    reparse_driver.write_text(
+        prefix
+        + f"\n$RepoRoot = '{tmp_path.as_posix()}'\n"
+        + f"$RuntimeRoot = '{(tmp_path / 'runtime-reparse').as_posix()}'\n"
+        + "$MoodleRoot = Join-Path $RuntimeRoot 'moodle'\n"
+        + "$MoodleDockerRoot = Join-Path $RuntimeRoot 'moodle-docker'\n"
+        + "$MoodleDataRoot = Join-Path $RuntimeRoot 'moodledata'\n"
+        + "$GitHooksRoot = Join-Path $RuntimeRoot 'moodle-git-hooks'\n"
+        + f"$repository = '{repository.as_posix()}'\n"
+        + "$git = Assert-Git\n"
+        + "$tracePath = Join-Path $RuntimeRoot 'reparse-trace.json'\n"
+        + "$env:GIT_TRACE2_EVENT = $tracePath\n"
+        + "$errorMessage = $null\n"
+        + "try { Test-RawTrackedFilesMatchIndex -Repository $repository -GitPath $git; throw 'Accepted reparse point.' }\n"  # noqa: E501
+        + "catch { $errorMessage = $_.Exception.Message }\n"
+        + "Remove-Item Env:GIT_TRACE2_EVENT -ErrorAction SilentlyContinue\n"
+        + "if ($errorMessage -notmatch 'reparse-point') { throw 'Reparse point was not rejected.' }\n"  # noqa: E501
+        + "if (Test-Path -LiteralPath $tracePath) {\n"
+        + "    $hashEvents = @(Get-Content -LiteralPath $tracePath | Where-Object { $_ -match '\"hash-object\"' })\n"  # noqa: E501
+        + "    if ($hashEvents.Count -ne 0) { throw 'Reparse point reached hash-object.' }\n"
+        + "}\n"
+        + "Write-Output 'reparse-rejected-before-hash-ok'\n",
+        encoding="utf-8",
+    )
+    reparse_result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(reparse_driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+    assert reparse_result.returncode == 0, reparse_result.stderr
+    assert reparse_result.stdout.strip().endswith("reparse-rejected-before-hash-ok")
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is not available",
+)
+def test_legacy_generated_moodle_config_migrates_only_exact_crlf(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    moodle_root = runtime / "moodle"
+    docker_root = runtime / "moodle-docker"
+    moodle_root.mkdir(parents=True)
+    docker_root.mkdir(parents=True)
+    template = docker_root / "config.docker-template.php"
+    config = moodle_root / "config.php"
+    gitignore = moodle_root / ".gitignore"
+    template_bytes = b"<?php\n$CFG->wwwroot = 'http://localhost';\n"
+    legacy_bytes = template_bytes.replace(b"\n", b"\r\n")
+    template.write_bytes(template_bytes)
+    config.write_bytes(legacy_bytes)
+    gitignore.write_text("config.php\n", encoding="utf-8")
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    prefix = read(SCRIPT).split("\nswitch ($Action) {", maxsplit=1)[0]
+    driver = tmp_path / "legacy-generated-config.ps1"
+    wrong_bytes = b"<?php\n$CFG->wwwroot = 'http://wrong';\n"
+    lone_cr_bytes = b"<?php\r$CFG->wwwroot = 'http://localhost';\n"
+    template_b64 = base64.b64encode(template_bytes).decode()
+    legacy_b64 = base64.b64encode(legacy_bytes).decode()
+    wrong_b64 = base64.b64encode(wrong_bytes).decode()
+    lone_cr_b64 = base64.b64encode(lone_cr_bytes).decode()
+    driver.write_text(
+        prefix
+        + f"\n$RepoRoot = '{tmp_path.as_posix()}'\n"
+        + f"$RuntimeRoot = '{runtime.as_posix()}'\n"
+        + f"$MoodleRoot = '{moodle_root.as_posix()}'\n"
+        + f"$MoodleDockerRoot = '{docker_root.as_posix()}'\n"
+        + f"$MoodleDataRoot = '{(runtime / 'moodledata').as_posix()}'\n"
+        + f"$GitHooksRoot = '{(runtime / 'moodle-git-hooks').as_posix()}'\n"
+        + f"$templateBytes = [Convert]::FromBase64String('{template_b64}')\n"
+        + f"$legacyBytes = [Convert]::FromBase64String('{legacy_b64}')\n"
+        + f"$wrongBytes = [Convert]::FromBase64String('{wrong_b64}')\n"
+        + f"$loneCrBytes = [Convert]::FromBase64String('{lone_cr_b64}')\n"
+        + "$configPath = Join-Path $MoodleRoot 'config.php'\n"
+        + "$script:stopCount = 0\n"
+        + "function Stop-RunningMoodleProjectContainers {\n"
+        + "    if (-not (Test-ByteSequenceEqual -Left ([IO.File]::ReadAllBytes($configPath)) -Right $legacyBytes)) { throw 'Container stop preceded legacy-byte proof.' }\n"  # noqa: E501
+        + "    $script:stopCount++\n"
+        + "}\n"
+        + "Repair-LegacyGeneratedMoodleConfig\n"
+        + "if ($script:stopCount -ne 1) { throw 'Legacy CRLF config did not stop validated containers exactly once.' }\n"  # noqa: E501
+        + "if (-not (Test-ByteSequenceEqual -Left ([IO.File]::ReadAllBytes($configPath)) -Right $templateBytes)) { throw 'Legacy config did not become exact template bytes.' }\n"  # noqa: E501
+        + "$ignoredBefore = [IO.File]::ReadAllText((Join-Path $MoodleRoot '.gitignore'))\n"
+        + "$stopsBeforeNoOp = $script:stopCount\n"
+        + "Repair-LegacyGeneratedMoodleConfig\n"
+        + "if ($script:stopCount -ne $stopsBeforeNoOp) { throw 'Exact generated config stopped containers.' }\n"  # noqa: E501
+        + "if ([IO.File]::ReadAllText((Join-Path $MoodleRoot '.gitignore')) -ne $ignoredBefore) { throw 'Config migration changed ignored-file semantics.' }\n"  # noqa: E501
+        + "function Assert-RejectedConfig { param([byte[]]$Bytes, [string]$Name)\n"
+        + "    [IO.File]::WriteAllBytes($configPath, $Bytes)\n"
+        + "    $before = [IO.File]::ReadAllBytes($configPath)\n"
+        + "    $stops = $script:stopCount\n"
+        + "    $message = $null\n"
+        + "    try { Repair-LegacyGeneratedMoodleConfig; throw \"Accepted $Name config.\" } catch { $message = $_.Exception.Message }\n"  # noqa: E501
+        + "    if ($message -notmatch 'does not exactly match') { throw \"Wrong failure for $Name config: $message\" }\n"  # noqa: E501
+        + "    if ($script:stopCount -ne $stops) { throw \"$Name config stopped containers.\" }\n"
+        + "    if (-not (Test-ByteSequenceEqual -Left ([IO.File]::ReadAllBytes($configPath)) -Right $before)) { throw \"$Name config was written.\" }\n"  # noqa: E501
+        + "}\n"
+        + "Assert-RejectedConfig -Bytes $wrongBytes -Name 'wrong-byte'\n"
+        + "Assert-RejectedConfig -Bytes $loneCrBytes -Name 'lone-CR'\n"
+        + "Write-Output 'legacy-generated-config-ok'\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("legacy-generated-config-ok")
+    target = moodle_root / "config-target.php"
+    target.write_bytes(legacy_bytes)
+    config.unlink()
+    link = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", str(config), str(target)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert link.returncode == 0, link.stderr
+    symlink_driver = tmp_path / "reject-generated-config-symlink.ps1"
+    symlink_driver.write_text(
+        prefix
+        + f"\n$RepoRoot = '{tmp_path.as_posix()}'\n"
+        + f"$RuntimeRoot = '{runtime.as_posix()}'\n"
+        + f"$MoodleRoot = '{moodle_root.as_posix()}'\n"
+        + f"$MoodleDockerRoot = '{docker_root.as_posix()}'\n"
+        + f"$MoodleDataRoot = '{(runtime / 'moodledata').as_posix()}'\n"
+        + f"$GitHooksRoot = '{(runtime / 'moodle-git-hooks').as_posix()}'\n"
+        + "$script:stopCount = 0\n"
+        + "function Stop-RunningMoodleProjectContainers { $script:stopCount++ }\n"
+        + "$before = [IO.File]::ReadAllBytes((Join-Path $MoodleRoot 'config-target.php'))\n"
+        + "$message = $null\n"
+        + "try { Repair-LegacyGeneratedMoodleConfig; throw 'Accepted generated config symlink.' } catch { $message = $_.Exception.Message }\n"  # noqa: E501
+        + "if ($message -notmatch 'reparse') { throw \"Wrong symlink failure: $message\" }\n"
+        + "if ($script:stopCount -ne 0) { throw 'Generated config symlink stopped containers.' }\n"
+        + "$after = [IO.File]::ReadAllBytes((Join-Path $MoodleRoot 'config-target.php'))\n"
+        + "if (-not (Test-ByteSequenceEqual -Left $after -Right $before)) { throw 'Generated config symlink target was written.' }\n"  # noqa: E501
+        + "Write-Output 'generated-config-symlink-rejected-ok'\n",
+        encoding="utf-8",
+    )
+    symlink_result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(symlink_driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+    assert symlink_result.returncode == 0, symlink_result.stderr
+    assert symlink_result.stdout.strip().endswith("generated-config-symlink-rejected-ok")
 
 
 @pytest.mark.skipif(
