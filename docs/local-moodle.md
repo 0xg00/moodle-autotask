@@ -213,11 +213,14 @@ must be running; the script neither changes Docker Desktop settings nor starts i
 
 The Moodle CLI seeds use supported core/course/manual-enrolment APIs to create `student1`, the
 base `ASIX-LAB` course, the public-structure-inspired ASIX category tree, 11 module courses, and 12
-assignments in total. Before expansion, Smoke requires those exact 12 assignments. After
-`ExpandFixture`, Smoke requires the exact 16 assignments, four campaign assignments, and both
+managed assignments in total. Before expansion, Smoke requires those exact 12 managed assignments.
+After `ExpandFixture`, Smoke requires the exact 16 managed assignments, four campaign assignments, and both
 simulated OVA metadata attachments. It resolves campaign assignment `cmid` values against the one
 official `core_course_get_contents` response for the campaign course and fails closed on a missing,
-duplicate, or mismatched module `idnumber`. The script obtains a token from Moodle's official
+duplicate, or case-mismatched assignment title. Moodle's student REST response intentionally does
+not expose course-module `idnumber`; the fixture PHP verifier checks those exact IDs in Moodle's
+database, while REST Smoke independently checks the campaign `cmid`/title mapping, count, and
+attachments. Assignments in unrelated courses are deliberately outside this managed scope. The script obtains a token from Moodle's official
 `login/token.php` endpoint for service `moodle_mobile_app`, then verifies REST
 `core_webservice_get_site_info`, `core_enrol_get_users_courses`, and
 `core_course_get_contents`. Moodle exception and error responses fail the command.

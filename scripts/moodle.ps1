@@ -1552,11 +1552,11 @@ function Get-MoodleToken {
     Fail 'Could not obtain a Moodle mobile token from either detected local public endpoint.'
 }
 
-function Resolve-CampaignAssignmentIdNumbers {
+function Resolve-CampaignAssignmentsByTitle {
     param(
         [Parameter(Mandatory = $true)][object]$CampaignCourse,
         [Parameter(Mandatory = $true)][object[]]$Assignments,
-        [Parameter(Mandatory = $true)][string[]]$ExpectedIdNumbers,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedTitles,
         [Parameter(Mandatory = $true)][string]$BaseUrl,
         [Parameter(Mandatory = $true)][string]$Token
     )
@@ -1567,35 +1567,71 @@ function Resolve-CampaignAssignmentIdNumbers {
     $contents = Invoke-MoodleRest -BaseUrl $BaseUrl -Token $Token -Function 'core_course_get_contents' -Parameters @{ courseid = [int]$courseIdText }
     $modulesByCmid = @{}
     foreach ($module in @($contents | ForEach-Object { $_.modules })) {
-        if ([string]$module.modname -ne 'assign') {
+        $modnameProperty = $module.PSObject.Properties['modname']
+        if ($null -eq $modnameProperty -or [string]$modnameProperty.Value -ne 'assign') {
             continue
         }
-        $cmidText = [string]$module.id
-        $idnumber = [string]$module.idnumber
-        if ($cmidText -notmatch '^[1-9][0-9]*$' -or [string]::IsNullOrWhiteSpace($idnumber) -or
+        $cmidProperty = $module.PSObject.Properties['id']
+        $titleProperty = $module.PSObject.Properties['name']
+        if ($null -eq $cmidProperty -or $null -eq $titleProperty) {
+            Fail 'Smoke test campaign assignment module metadata is invalid.'
+        }
+        $cmidText = [string]$cmidProperty.Value
+        $title = [string]$titleProperty.Value
+        if ($cmidText -notmatch '^[1-9][0-9]*$' -or [string]::IsNullOrWhiteSpace($title) -or
             $modulesByCmid.ContainsKey($cmidText)) {
             Fail 'Smoke test campaign assignment module metadata is invalid.'
         }
-        $modulesByCmid[$cmidText] = $idnumber
+        $modulesByCmid[$cmidText] = $title
     }
     $resolved = @()
     $seenCmids = @{}
     foreach ($assignment in $Assignments) {
-        $cmidText = [string]$assignment.cmid
+        $cmidProperty = $assignment.PSObject.Properties['cmid']
+        $titleProperty = $assignment.PSObject.Properties['name']
+        if ($null -eq $cmidProperty -or $null -eq $titleProperty) {
+            Fail 'Smoke test campaign assignment response is invalid.'
+        }
+        $cmidText = [string]$cmidProperty.Value
+        $title = [string]$titleProperty.Value
         if ($cmidText -notmatch '^[1-9][0-9]*$' -or $seenCmids.ContainsKey($cmidText) -or
-            -not $modulesByCmid.ContainsKey($cmidText)) {
+            -not $modulesByCmid.ContainsKey($cmidText) -or [string]::IsNullOrWhiteSpace($title) -or
+            $title -cne [string]$modulesByCmid[$cmidText]) {
             Fail 'Smoke test campaign assignment module mapping is invalid.'
         }
         $seenCmids[$cmidText] = $true
-        $resolved += [PSCustomObject]@{ Assignment = $assignment; IdNumber = $modulesByCmid[$cmidText] }
+        $resolved += [PSCustomObject]@{ Assignment = $assignment; Title = $title }
     }
-    $actualIdNumbers = @($resolved | ForEach-Object { [string]$_.IdNumber } | Sort-Object -Unique)
-    if ($resolved.Count -ne $ExpectedIdNumbers.Count -or $actualIdNumbers.Count -ne $ExpectedIdNumbers.Count -or
-        (@($actualIdNumbers | Where-Object { $_ -cnotin $ExpectedIdNumbers }).Count -ne 0) -or
-        (@($ExpectedIdNumbers | Where-Object { $_ -cnotin $actualIdNumbers }).Count -ne 0)) {
-        Fail 'Smoke test campaign assignment ID numbers are invalid.'
+    $actualTitles = @($resolved | ForEach-Object { [string]$_.Title } | Sort-Object -Unique)
+    if ($resolved.Count -ne $ExpectedTitles.Count -or $actualTitles.Count -ne $ExpectedTitles.Count -or
+        (@($actualTitles | Where-Object { $_ -cnotin $ExpectedTitles }).Count -ne 0) -or
+        (@($ExpectedTitles | Where-Object { $_ -cnotin $actualTitles }).Count -ne 0)) {
+        Fail 'Smoke test campaign assignment titles are invalid.'
     }
     return $resolved
+}
+
+function Get-ManagedAssignments {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Courses,
+        [Parameter(Mandatory = $true)][string[]]$CourseShortnames
+    )
+    return @(
+        $Courses |
+            Where-Object { [string]$_.shortname -cin $CourseShortnames } |
+            ForEach-Object { $_.assignments }
+    )
+}
+
+function Assert-ManagedAssignmentCount {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Assignments,
+        [Parameter(Mandatory = $true)][int]$ExpectedCount,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+    if ($Assignments.Count -ne $ExpectedCount) {
+        Fail $FailureMessage
+    }
 }
 
 function Invoke-Smoke {
@@ -1637,11 +1673,7 @@ function Invoke-Smoke {
         }
     }
     $assignmentsPayload = Invoke-MoodleRest -BaseUrl $baseUrl -Token $tokenData.token -Function 'mod_assign_get_assignments'
-    $richAssignments = @(
-        $assignmentsPayload.courses |
-            Where-Object { $_.shortname -in $expectedRichCourses } |
-            ForEach-Object { $_.assignments }
-    )
+    $richAssignments = Get-ManagedAssignments -Courses @($assignmentsPayload.courses) -CourseShortnames $expectedRichCourses
     if ($richAssignments.Count -ne 11) {
         Fail 'Smoke test did not receive the exact 11 rich fixture assignments.'
     }
@@ -1651,30 +1683,33 @@ function Invoke-Smoke {
     if ($null -eq $ovaAssignment -or $ovaFiles -notcontains 'asix-router-lab.ova') {
         Fail 'Smoke test did not receive the simulated OVA attachment metadata.'
     }
-    $allAssignments = @($assignmentsPayload.courses | ForEach-Object { $_.assignments })
-    $campaignCourse = @($assignmentsPayload.courses | Where-Object { $_.shortname -eq 'ASIX-CAMPAIGN-01' }) | Select-Object -First 1
+    $campaignCourse = @($assignmentsPayload.courses | Where-Object { $_.shortname -ceq 'ASIX-CAMPAIGN-01' }) | Select-Object -First 1
+    $managedCourseShortnames = @('ASIX-LAB') + $expectedRichCourses
     if ($null -eq $campaignCourse) {
-        if ($allAssignments.Count -ne 12) {
-            Fail 'Smoke test did not receive the exact 12 assignments before fixture v3 expansion.'
-        }
+        $managedAssignments = Get-ManagedAssignments -Courses @($assignmentsPayload.courses) -CourseShortnames $managedCourseShortnames
+        Assert-ManagedAssignmentCount -Assignments $managedAssignments -ExpectedCount 12 -FailureMessage 'Smoke test did not receive the exact 12 managed assignments before fixture v3 expansion.'
         Write-Output "Moodle REST smoke passed for 12 assignments across the base and ASIX fixtures at $baseUrl."
         return
     }
     $campaignAssignments = @($campaignCourse.assignments)
-    $expectedCampaignIds = @(
-        'central-report-success', 'windows-ssm-success', 'windows-command-failure', 'ova-import-negative'
+    $managedCourseShortnames += 'ASIX-CAMPAIGN-01'
+    $managedAssignments = Get-ManagedAssignments -Courses @($assignmentsPayload.courses) -CourseShortnames $managedCourseShortnames
+    $expectedCampaignTitles = @(
+        'Campaign Report', ('Pr' + [char]0x00e1 + 'ctica Windows Server validation'),
+        ('Pr' + [char]0x00e1 + 'ctica Windows Server command failure'), 'OVA import validation'
     )
     $resolvedCampaignAssignments = @(
-        Resolve-CampaignAssignmentIdNumbers -CampaignCourse $campaignCourse -Assignments $campaignAssignments -ExpectedIdNumbers $expectedCampaignIds -BaseUrl $baseUrl -Token $tokenData.token
+        Resolve-CampaignAssignmentsByTitle -CampaignCourse $campaignCourse -Assignments $campaignAssignments -ExpectedTitles $expectedCampaignTitles -BaseUrl $baseUrl -Token $tokenData.token
     )
-    $actualCampaignIds = @($resolvedCampaignAssignments | ForEach-Object { [string]$_.IdNumber } | Sort-Object)
-    if ($allAssignments.Count -ne 16 -or $campaignAssignments.Count -ne 4 -or
+    $actualCampaignTitles = @($resolvedCampaignAssignments | ForEach-Object { [string]$_.Title } | Sort-Object)
+    Assert-ManagedAssignmentCount -Assignments $managedAssignments -ExpectedCount 16 -FailureMessage 'Smoke test did not receive the exact 16 managed assignments after fixture v3 expansion.'
+    if ($campaignAssignments.Count -ne 4 -or
         $resolvedCampaignAssignments.Count -ne 4 -or
-        (@($actualCampaignIds | Where-Object { $_ -cnotin $expectedCampaignIds }).Count -ne 0) -or
-        (@($expectedCampaignIds | Where-Object { $_ -cnotin $actualCampaignIds }).Count -ne 0)) {
+        (@($actualCampaignTitles | Where-Object { $_ -cnotin $expectedCampaignTitles }).Count -ne 0) -or
+        (@($expectedCampaignTitles | Where-Object { $_ -cnotin $actualCampaignTitles }).Count -ne 0)) {
         Fail 'Smoke test did not receive the exact 16 assignments after fixture v3 expansion.'
     }
-    $negative = @($resolvedCampaignAssignments | Where-Object { $_.IdNumber -eq 'ova-import-negative' }) | Select-Object -First 1
+    $negative = @($resolvedCampaignAssignments | Where-Object { $_.Title -ceq 'OVA import validation' }) | Select-Object -First 1
     $negativeFiles = if ($null -eq $negative) { @() } else { @($negative.Assignment.introattachments | ForEach-Object { [string]$_.filename }) }
     if ($null -eq $negative -or $negativeFiles -notcontains 'negative.ova') {
         Fail 'Smoke test did not receive the v3 metadata-only OVA attachment.'

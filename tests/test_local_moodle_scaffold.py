@@ -608,7 +608,7 @@ def test_fixture_v3_rejects_tamper_and_partial_metadata_before_completion() -> N
     assert "isset($assignmentids[$assignment['idnumber']])" in fixture
     assert "function fixture_v3_has_exact_assignments" in fixture
     assert "m.name = ?" in fixture
-    assert "fixture_v3_has_exact_assignments($campaign->id, array_keys($seen))" in fixture
+    assert "fixture_v3_has_exact_assignments((int)$campaign->id, array_keys($seen))" in fixture
     assert "$DB->count_records('course_modules', ['course' => $campaign->id]) === 4" not in fixture
     assert "$user->auth !== 'nologin'" in fixture
 
@@ -661,6 +661,9 @@ def test_fixture_v3_assignment_verifier_accepts_default_announcements_but_reject
         "if (!fixture_v3_has_exact_assignments(91, $expected)) { exit(1); } "
         "$DB->modules[] = ['name' => 'assign', 'idnumber' => 'unexpected-assignment']; "
         "if (fixture_v3_has_exact_assignments(91, $expected)) { exit(2); } "
+        "$reason = null; "
+        "if (fixture_v3_verification_failure($reason, 'assignment-3-due-date') || "
+        "$reason !== 'assignment-3-due-date') { exit(3); } "
         "echo 'fixture-v3-announcements-ok';"
     )
     result = subprocess.run(
@@ -672,6 +675,33 @@ def test_fixture_v3_assignment_verifier_accepts_default_announcements_but_reject
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "fixture-v3-announcements-ok"
+
+
+def test_fixture_v3_migration_surfaces_only_bounded_verification_reasons() -> None:
+    fixture = read(FIXTURE)
+    assert (
+        "function fixture_v3_verification_failure(?string &$reason, string $code): bool"
+        in fixture
+    )
+    for reason in (
+        "'legacy-v2'",
+        "'catalog-digest'",
+        "'campaign-course'",
+        "'enrolment-count'",
+        "'enrolment-role'",
+        "'-intro-text'",
+        "'-intro-format'",
+        "'assignment-' . ($index + 1)",
+        "'campaign-assignment-set'",
+        "'verification-exception-' . $phase",
+    ):
+        assert reason in fixture
+    expand = fixture.split("function expand_fixture(): void", maxsplit=1)[1].split(
+        "if (!defined('AUTOTASK_FIXTURE_LIBRARY')", maxsplit=1
+    )[0]
+    assert "verify_fixture_v3($loaded['data'], $loaded['digest'], false, $reason)" in expand
+    assert "rich fixture verification failed during v3 migration: " in expand
+    assert "(int)$row->introformat !== (int)FORMAT_HTML" in fixture
 
 
 @pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
@@ -806,11 +836,19 @@ def test_smoke_requires_exact_rich_course_assignment_and_ova_metadata_matrix() -
     assert "$_.name -eq $expectedOvaAssignmentName" in smoke
     assert "$ovaFiles -notcontains 'asix-router-lab.ova'" in smoke
     assert "12 assignments across the base and ASIX fixtures" in smoke
-    assert "$allAssignments.Count -ne 16" in smoke
+    assert (
+        "Assert-ManagedAssignmentCount -Assignments $managedAssignments -ExpectedCount 12"
+        in smoke
+    )
+    assert (
+        "Assert-ManagedAssignmentCount -Assignments $managedAssignments -ExpectedCount 16"
+        in smoke
+    )
     assert "ASIX-CAMPAIGN-01" in smoke
-    assert "ova-import-negative" in smoke
-    assert "cmidnumber" not in smoke
-    assert "Resolve-CampaignAssignmentIdNumbers" in script
+    assert "OVA import validation" in smoke
+    assert "idnumber" not in smoke
+    assert "Resolve-CampaignAssignmentsByTitle" in script
+    assert "ExpectedIdNumbers" not in script
     assert "core_course_get_contents" in script
 
 
@@ -818,12 +856,12 @@ def test_smoke_requires_exact_rich_course_assignment_and_ova_metadata_matrix() -
     shutil.which("powershell") is None and shutil.which("pwsh") is None,
     reason="PowerShell is required",
 )
-def test_campaign_smoke_resolves_realistic_cmid_payloads_and_rejects_bad_mappings(
+def test_campaign_smoke_resolves_realistic_cmid_title_payloads_and_rejects_bad_mappings(
     tmp_path: Path,
 ) -> None:
     script = read(SCRIPT)
     resolver = script[
-        script.index("function Resolve-CampaignAssignmentIdNumbers") : script.index(
+        script.index("function Resolve-CampaignAssignmentsByTitle") : script.index(
             "function Invoke-Smoke"
         )
     ]
@@ -833,34 +871,39 @@ def test_campaign_smoke_resolves_realistic_cmid_payloads_and_rejects_bad_mapping
         + "$ErrorActionPreference = 'Stop'\n"
         + "function Fail { param([string]$Message) throw $Message }\n"
         + "$script:mode = 'exact'\n"
+        + "$script:contentsCalls = 0\n"
         + "function Invoke-MoodleRest { param($BaseUrl, $Token, $Function, $Parameters)\n"
         + "  if ($Function -ne 'core_course_get_contents') { throw 'unexpected function' }\n"
+        + "  $script:contentsCalls++\n"
         + "  $modules = @(\n"
-        + "    [PSCustomObject]@{ id = 31; modname = 'assign'; idnumber = 'central-report-success' },\n"  # noqa: E501
-        + "    [PSCustomObject]@{ id = 32; modname = 'assign'; idnumber = 'windows-ssm-success' },\n"  # noqa: E501
-        + "    [PSCustomObject]@{ id = 33; modname = 'assign'; idnumber = 'windows-command-failure' },\n"  # noqa: E501
-        + "    [PSCustomObject]@{ id = 34; modname = 'assign'; idnumber = 'ova-import-negative' }\n"
+        + "    [PSCustomObject]@{ id = 30; modname = 'forum'; name = 'Announcements' },\n"
+        + "    [PSCustomObject]@{ id = 31; modname = 'assign'; name = 'Campaign Report' },\n"
+        + "    [PSCustomObject]@{ id = 32; modname = 'assign'; name = 'Práctica Windows Server validation' },\n"  # noqa: E501
+        + "    [PSCustomObject]@{ id = 33; modname = 'assign'; name = 'Práctica Windows Server command failure' },\n"  # noqa: E501
+        + "    [PSCustomObject]@{ id = 34; modname = 'assign'; name = 'OVA import validation' }\n"
         + "  )\n"
-        + "  if ($script:mode -eq 'mismatch') { $modules[1].idnumber = 'wrong-id' }\n"
-        + "  if ($script:mode -eq 'case-mismatch') { $modules[0].idnumber = 'CENTRAL-REPORT-SUCCESS' }\n"  # noqa: E501
+        + "  if ($script:mode -eq 'mismatch') { $modules[2].name = 'wrong title' }\n"
+        + "  if ($script:mode -eq 'case-mismatch') { $modules[1].name = 'CAMPAIGN REPORT' }\n"
         + "  if ($script:mode -eq 'missing') { $modules = @($modules | Where-Object { $_.id -ne 34 }) }\n"  # noqa: E501
         + "  return @([PSCustomObject]@{ modules = $modules })\n"
         + "}\n"
         + resolver
         + "$course = [PSCustomObject]@{ id = 17 }\n"
-        + "$expected = @('central-report-success', 'windows-ssm-success', 'windows-command-failure', 'ova-import-negative')\n"  # noqa: E501
+        + "$expected = @('Campaign Report', 'Práctica Windows Server validation', 'Práctica Windows Server command failure', 'OVA import validation')\n"  # noqa: E501
         + "function New-Assignments {\n"
-        + "  $items = @(@(31, 32, 33, 34) | ForEach-Object { [PSCustomObject]@{ cmid = $_; name = 'realistic mod_assign payload' } })\n"  # noqa: E501
+        + "  $items = @([PSCustomObject]@{ cmid = 31; name = 'Campaign Report' }, [PSCustomObject]@{ cmid = 32; name = 'Práctica Windows Server validation' }, [PSCustomObject]@{ cmid = 33; name = 'Práctica Windows Server command failure' }, [PSCustomObject]@{ cmid = 34; name = 'OVA import validation' })\n"  # noqa: E501
         + "  if ($script:mode -eq 'duplicate') { $items[3].cmid = 33 }\n"
         + "  return $items\n"
         + "}\n"
-        + "$resolved = @(Resolve-CampaignAssignmentIdNumbers -CampaignCourse $course -Assignments (New-Assignments) -ExpectedIdNumbers $expected -BaseUrl 'https://example.test' -Token 'token')\n"  # noqa: E501
-        + "$actual = @($resolved | ForEach-Object { $_.IdNumber } | Sort-Object)\n"
+        + "$resolved = @(Resolve-CampaignAssignmentsByTitle -CampaignCourse $course -Assignments (New-Assignments) -ExpectedTitles $expected -BaseUrl 'https://example.test' -Token 'token')\n"  # noqa: E501
+        + "$actual = @($resolved | ForEach-Object { $_.Title } | Sort-Object)\n"
         + "if (($actual -join ',') -ne (($expected | Sort-Object) -join ',')) { throw 'exact mapping failed' }\n"  # noqa: E501
+        + "if ($script:contentsCalls -ne 1) { throw 'contents call count was not one' }\n"
         + "foreach ($failure in @('mismatch', 'case-mismatch', 'missing', 'duplicate')) {\n"
-        + "  $script:mode = $failure; $rejected = $false\n"
-        + "  try { Resolve-CampaignAssignmentIdNumbers -CampaignCourse $course -Assignments (New-Assignments) -ExpectedIdNumbers $expected -BaseUrl 'https://example.test' -Token 'token' | Out-Null } catch { $rejected = $true }\n"  # noqa: E501
+        + "  $script:mode = $failure; $script:contentsCalls = 0; $rejected = $false\n"
+        + "  try { Resolve-CampaignAssignmentsByTitle -CampaignCourse $course -Assignments (New-Assignments) -ExpectedTitles $expected -BaseUrl 'https://example.test' -Token 'token' | Out-Null } catch { $rejected = $true }\n"  # noqa: E501
         + "  if (-not $rejected) { throw \"$failure mapping was accepted\" }\n"
+        + "  if ($script:contentsCalls -ne 1) { throw \"$failure contents call count was not one\" }\n"  # noqa: E501
         + "}\n"
         + "Write-Output 'campaign-cmid-resolution-ok'\n",
         encoding="utf-8",
@@ -876,6 +919,92 @@ def test_campaign_smoke_resolves_realistic_cmid_payloads_and_rejects_bad_mapping
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("campaign-cmid-resolution-ok")
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_smoke_managed_assignment_scope_ignores_unrelated_courses_and_rejects_managed_drift(
+    tmp_path: Path,
+) -> None:
+    script = read(SCRIPT)
+    helpers = script[
+        script.index("function Get-ManagedAssignments") : script.index("function Invoke-Smoke")
+    ]
+    driver = tmp_path / "managed-assignment-scope.ps1"
+    driver.write_text(
+        "Set-StrictMode -Version Latest\n"
+        + "$ErrorActionPreference = 'Stop'\n"
+        + "function Fail { param([string]$Message) throw $Message }\n"
+        + helpers
+        + "function New-Assignments([int]$Count) { return @((1..$Count) | ForEach-Object { [PSCustomObject]@{ marker = $_ } }) }\n"  # noqa: E501
+        + "function New-Courses { return @([PSCustomObject]@{ shortname = 'ASIX-LAB'; assignments = (New-Assignments 1) }, [PSCustomObject]@{ shortname = 'ASIX1-0369-ISO'; assignments = (New-Assignments 11) }, [PSCustomObject]@{ shortname = 'ASIX-CAMPAIGN-01'; assignments = (New-Assignments 4) }, [PSCustomObject]@{ shortname = 'AUTOTASK-LIVE-E2E'; assignments = (New-Assignments 1) }) }\n"  # noqa: E501
+        + "$scope = @('ASIX-LAB', 'ASIX1-0369-ISO', 'ASIX-CAMPAIGN-01')\n"
+        + "$courses = New-Courses\n"
+        + "Assert-ManagedAssignmentCount -Assignments (Get-ManagedAssignments -Courses $courses -CourseShortnames $scope) -ExpectedCount 16 -FailureMessage 'unexpected'\n"  # noqa: E501
+        + "$courses = New-Courses; $courses[1].assignments += [PSCustomObject]@{ marker = 99 }; $rejected = $false\n"  # noqa: E501
+        + "try { Assert-ManagedAssignmentCount -Assignments (Get-ManagedAssignments -Courses $courses -CourseShortnames $scope) -ExpectedCount 16 -FailureMessage 'managed extra' } catch { $rejected = $true }\n"  # noqa: E501
+        + "if (-not $rejected) { throw 'extra managed assignment was accepted' }\n"
+        + "$courses = New-Courses; $courses[2].assignments = @($courses[2].assignments | Select-Object -Skip 1); $rejected = $false\n"  # noqa: E501
+        + "try { Assert-ManagedAssignmentCount -Assignments (Get-ManagedAssignments -Courses $courses -CourseShortnames $scope) -ExpectedCount 16 -FailureMessage 'managed missing' } catch { $rejected = $true }\n"  # noqa: E501
+        + "if (-not $rejected) { throw 'missing managed assignment was accepted' }\n"
+        + "Write-Output 'managed-assignment-scope-ok'\n",
+        encoding="utf-8",
+    )
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("managed-assignment-scope-ok")
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_campaign_smoke_production_expected_titles_match_catalog_accent(
+    tmp_path: Path,
+) -> None:
+    script = read(SCRIPT)
+    start = script.index("    $expectedCampaignTitles = @(")
+    end = script.index("    $resolvedCampaignAssignments", start)
+    production_definition = script[start:end]
+    driver = tmp_path / "campaign-production-titles.ps1"
+    driver.write_text(
+        "Set-StrictMode -Version Latest\n"
+        + production_definition
+        + "$expected = @(\n"
+        + "  'Campaign Report',\n"
+        + "  ('Pr' + [char]0x00e1 + 'ctica Windows Server validation'),\n"
+        + "  ('Pr' + [char]0x00e1 + 'ctica Windows Server command failure'),\n"
+        + "  'OVA import validation'\n"
+        + ")\n"
+        + "if ($expectedCampaignTitles.Count -ne $expected.Count -or\n"
+        + "    (@($expectedCampaignTitles | Where-Object { $_ -cnotin $expected }).Count -ne 0) -or\n"  # noqa: E501
+        + "    (@($expected | Where-Object { $_ -cnotin $expectedCampaignTitles }).Count -ne 0)) {\n"  # noqa: E501
+        + "  throw 'production campaign titles do not match catalog'\n"
+        + "}\n"
+        + "Write-Output 'campaign-production-titles-ok'\n",
+        encoding="utf-8",
+    )
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("campaign-production-titles-ok")
 
 
 def test_moodle_script_is_ascii_and_windows_powershell_composes_ova_assignment(

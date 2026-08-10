@@ -668,70 +668,111 @@ function fixture_v3_has_exact_assignments(int $courseid, array $expected): bool 
     return $actual === $expected;
 }
 
-function verify_fixture_v3(array $catalog, string $digest, bool $requirestored): bool {
+function fixture_v3_verification_failure(?string &$reason, string $code): bool {
+    $reason = $code;
+    return false;
+}
+
+function verify_fixture_v3(array $catalog, string $digest, bool $requirestored, ?string &$reason = null): bool {
     global $DB;
+    $reason = null;
+    $phase = 'legacy-v2';
     try {
         $anchor = fixture_anchor(true);
         if ($anchor === null || !verify_fixture(true, $anchor)) {
-            return false;
+            return fixture_v3_verification_failure($reason, 'legacy-v2');
         }
         $stored = get_config('core', AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG);
         if (($requirestored && (!is_string($stored) || !hash_equals($digest, $stored))) || (!$requirestored && $stored !== false && !hash_equals($digest, (string)$stored))) {
-            return false;
+            return fixture_v3_verification_failure($reason, 'catalog-digest');
         }
-        $campaign = $DB->get_record('course', ['shortname' => AUTOTASK_FIXTURE_V3_COURSE], '*', MUST_EXIST);
-        $asix = $DB->get_record('course_categories', ['idnumber' => 'AUTOTASK-ASIX'], '*', MUST_EXIST);
+        $phase = 'campaign-course';
+        $campaign = $DB->get_record('course', ['shortname' => AUTOTASK_FIXTURE_V3_COURSE]);
+        $asix = $DB->get_record('course_categories', ['idnumber' => 'AUTOTASK-ASIX']);
+        if (!$campaign || !$asix) {
+            return fixture_v3_verification_failure($reason, 'campaign-course');
+        }
         if ($campaign->fullname !== $catalog['course']['fullname'] || $campaign->summary !== $catalog['course']['summary']
                 || (int)$campaign->category !== (int)$asix->id) {
-            return false;
+            return fixture_v3_verification_failure($reason, 'campaign-course-metadata');
         }
         $expectedroles = [];
+        $phase = 'identities';
         foreach ($catalog['teachers'] as $identity) {
             $expectedroles[$identity['username']] = 'editingteacher';
         }
-        $DB->get_record('user', ['username' => 'student1'], '*', MUST_EXIST);
+        if (!$DB->get_record('user', ['username' => 'student1'])) {
+            return fixture_v3_verification_failure($reason, 'student1');
+        }
         $expectedroles['student1'] = 'student';
         foreach ($catalog['students'] as $identity) {
-            $user = $DB->get_record('user', ['username' => $identity['username']], '*', MUST_EXIST);
+            $user = $DB->get_record('user', ['username' => $identity['username']]);
+            if (!$user) {
+                return fixture_v3_verification_failure($reason, 'student-identity');
+            }
             if ($user->auth !== 'nologin' || $user->firstname !== $identity['firstname'] || $user->lastname !== $identity['lastname'] || $user->email !== $identity['email']) {
-                return false;
+                return fixture_v3_verification_failure($reason, 'student-metadata');
             }
             $expectedroles[$identity['username']] = 'student';
         }
         foreach ($catalog['teachers'] as $identity) {
-            $user = $DB->get_record('user', ['username' => $identity['username']], '*', MUST_EXIST);
+            $user = $DB->get_record('user', ['username' => $identity['username']]);
+            if (!$user) {
+                return fixture_v3_verification_failure($reason, 'teacher-identity');
+            }
             if ($user->auth !== 'nologin' || $user->firstname !== $identity['firstname'] || $user->lastname !== $identity['lastname'] || $user->email !== $identity['email']) {
-                return false;
+                return fixture_v3_verification_failure($reason, 'teacher-metadata');
             }
         }
         $context = context_course::instance($campaign->id);
+        $phase = 'enrolments';
         $enrolled = get_enrolled_users($context, '', 0, 'u.id,u.username');
         if (count($enrolled) !== count($expectedroles)) {
-            return false;
+            return fixture_v3_verification_failure($reason, 'enrolment-count');
         }
         foreach ($enrolled as $user) {
             if (!isset($expectedroles[$user->username])) {
-                return false;
+                return fixture_v3_verification_failure($reason, 'enrolment-identity');
             }
             $roles = $DB->get_fieldset_sql('SELECT r.shortname FROM {role_assignments} ra JOIN {role} r ON r.id = ra.roleid WHERE ra.contextid = ? AND ra.userid = ?', [$context->id, $user->id]);
             if ($roles !== [$expectedroles[$user->username]]) {
-                return false;
+                return fixture_v3_verification_failure($reason, 'enrolment-role');
             }
         }
         $seen = [];
-        foreach ($catalog['assignments'] as $spec) {
-            $row = $DB->get_record_sql("SELECT a.*, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.course = ? AND cm.idnumber = ? AND m.name = 'assign'", [$campaign->id, $spec['idnumber']], MUST_EXIST);
-            if ($row->name !== $spec['title'] || $row->intro !== $spec['intro'] || (int)$row->introformat !== FORMAT_HTML
-                    || (int)$row->duedate !== fixture_timestamp($anchor, $spec['dueoffset'])
-                    || (int)$row->allowsubmissionsfromdate !== fixture_timestamp($anchor, $spec['allowoffset'])
-                    || !fixture_v3_verify_files(context_module::instance($row->cmid)->id, $spec['files'])) {
-                return false;
+        foreach ($catalog['assignments'] as $index => $spec) {
+            $assignment = 'assignment-' . ($index + 1);
+            $phase = $assignment;
+            $row = $DB->get_record_sql("SELECT a.*, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.course = ? AND cm.idnumber = ? AND m.name = 'assign'", [$campaign->id, $spec['idnumber']]);
+            if (!$row) {
+                return fixture_v3_verification_failure($reason, $assignment . '-identity');
+            }
+            if ($row->name !== $spec['title']) {
+                return fixture_v3_verification_failure($reason, $assignment . '-title');
+            }
+            if ($row->intro !== $spec['intro']) {
+                return fixture_v3_verification_failure($reason, $assignment . '-intro-text');
+            }
+            if ((int)$row->introformat !== (int)FORMAT_HTML) {
+                return fixture_v3_verification_failure($reason, $assignment . '-intro-format');
+            }
+            if ((int)$row->duedate !== fixture_timestamp($anchor, $spec['dueoffset'])) {
+                return fixture_v3_verification_failure($reason, $assignment . '-due-date');
+            }
+            if ((int)$row->allowsubmissionsfromdate !== fixture_timestamp($anchor, $spec['allowoffset'])) {
+                return fixture_v3_verification_failure($reason, $assignment . '-allow-date');
+            }
+            $phase = $assignment . '-attachment';
+            if (!fixture_v3_verify_files(context_module::instance($row->cmid)->id, $spec['files'])) {
+                return fixture_v3_verification_failure($reason, $assignment . '-attachment');
             }
             $seen[$spec['idnumber']] = true;
         }
-        return fixture_v3_has_exact_assignments($campaign->id, array_keys($seen));
+        $phase = 'campaign-assignment-set';
+        return fixture_v3_has_exact_assignments((int)$campaign->id, array_keys($seen))
+            || fixture_v3_verification_failure($reason, 'campaign-assignment-set');
     } catch (Throwable) {
-        return false;
+        return fixture_v3_verification_failure($reason, 'verification-exception-' . $phase);
     }
 }
 
@@ -820,8 +861,9 @@ function expand_fixture(): void {
         foreach ($loaded['data']['assignments'] as $spec) {
             fixture_v3_create_assignment($campaign, $spec, $anchor);
         }
-        if (!verify_fixture_v3($loaded['data'], $loaded['digest'], false)) {
-            throw new RuntimeException('rich fixture verification failed during v3 migration');
+        $reason = null;
+        if (!verify_fixture_v3($loaded['data'], $loaded['digest'], false, $reason)) {
+            throw new RuntimeException('rich fixture verification failed during v3 migration: ' . ($reason ?? 'verification-exception'));
         }
         set_config(AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG, $loaded['digest']);
         set_config(AUTOTASK_FIXTURE_CONFIG, '3');
