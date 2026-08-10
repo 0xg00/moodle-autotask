@@ -606,7 +606,10 @@ def test_fixture_v3_rejects_tamper_and_partial_metadata_before_completion() -> N
     assert "hash_equals($digest, $stored)" in fixture
     assert "invalid or duplicate v3 identity" in fixture
     assert "isset($assignmentids[$assignment['idnumber']])" in fixture
-    assert "$DB->count_records('course_modules', ['course' => $campaign->id]) === 4" in fixture
+    assert "function fixture_v3_has_exact_assignments" in fixture
+    assert "m.name = ?" in fixture
+    assert "fixture_v3_has_exact_assignments($campaign->id, array_keys($seen))" in fixture
+    assert "$DB->count_records('course_modules', ['course' => $campaign->id]) === 4" not in fixture
     assert "$user->auth !== 'nologin'" in fixture
 
 
@@ -631,6 +634,44 @@ def test_fixture_v3_catalog_harness_validates_canonical_digest_and_timestamp_con
     zero, positive, digest = result.stdout.strip().split(":")
     assert (zero, positive) == ("0", "102")
     assert re.fullmatch(r"[0-9a-f]{64}", digest)
+
+
+@pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
+def test_fixture_v3_assignment_verifier_accepts_default_announcements_but_rejects_extra_assignments(
+) -> None:
+    php = shutil.which("php")
+    assert php is not None
+    harness = (
+        "define('AUTOTASK_FIXTURE_LIBRARY', true); require $argv[1]; "
+        "class FixtureV3AssignmentDb { public array $modules; "
+        "public function __construct(array $modules) { $this->modules = $modules; } "
+        "public function get_fieldset_sql($sql, $params) { "
+        "if (!str_contains($sql, 'm.name = ?') || $params !== [91, 'assign']) { exit(9); } "
+        "return array_values(array_map(fn($module) => $module['idnumber'], "
+        "array_filter($this->modules, "
+        "fn($module) => $module['name'] === 'assign'))); } } "
+        "$expected = ['central-report-success', 'windows-ssm-success', "
+        "'windows-command-failure', 'ova-import-negative']; "
+        "$DB = new FixtureV3AssignmentDb(["
+        "['name' => 'forum', 'idnumber' => ''], "
+        "['name' => 'assign', 'idnumber' => 'central-report-success'], "
+        "['name' => 'assign', 'idnumber' => 'windows-ssm-success'], "
+        "['name' => 'assign', 'idnumber' => 'windows-command-failure'], "
+        "['name' => 'assign', 'idnumber' => 'ova-import-negative']]); "
+        "if (!fixture_v3_has_exact_assignments(91, $expected)) { exit(1); } "
+        "$DB->modules[] = ['name' => 'assign', 'idnumber' => 'unexpected-assignment']; "
+        "if (fixture_v3_has_exact_assignments(91, $expected)) { exit(2); } "
+        "echo 'fixture-v3-announcements-ok';"
+    )
+    result = subprocess.run(
+        [php, "-r", harness, str(FIXTURE)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fixture-v3-announcements-ok"
 
 
 @pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")

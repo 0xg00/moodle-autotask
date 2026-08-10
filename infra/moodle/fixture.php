@@ -657,6 +657,17 @@ function fixture_v3_verify_files(int $contextid, array $expected): bool {
     return true;
 }
 
+function fixture_v3_has_exact_assignments(int $courseid, array $expected): bool {
+    global $DB;
+    $actual = $DB->get_fieldset_sql(
+        "SELECT cm.idnumber FROM {course_modules} cm JOIN {modules} m ON m.id = cm.module WHERE cm.course = ? AND m.name = ?",
+        [$courseid, 'assign']
+    );
+    sort($actual, SORT_STRING);
+    sort($expected, SORT_STRING);
+    return $actual === $expected;
+}
+
 function verify_fixture_v3(array $catalog, string $digest, bool $requirestored): bool {
     global $DB;
     try {
@@ -718,7 +729,7 @@ function verify_fixture_v3(array $catalog, string $digest, bool $requirestored):
             }
             $seen[$spec['idnumber']] = true;
         }
-        return $DB->count_records('course_modules', ['course' => $campaign->id]) === 4 && count($seen) === 4;
+        return fixture_v3_has_exact_assignments($campaign->id, array_keys($seen));
     } catch (Throwable) {
         return false;
     }
