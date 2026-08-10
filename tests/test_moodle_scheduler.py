@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 
 import moddle_autotask.adapters.moodle.scheduler as scheduler_module
+from moddle_autotask.adapters.moodle.approval_state import _select_mode
 from moddle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot, MoodleAttachment
 from moddle_autotask.adapters.moodle.scheduler import (
     CycleResult,
@@ -21,6 +22,7 @@ from moddle_autotask.adapters.moodle.scheduler import (
     summary_json,
 )
 from moddle_autotask.adapters.moodle.state import MoodleState
+from moddle_autotask.domain.models import ExecutionMode
 
 
 def _assignment(letter: str = "a") -> MoodleAssignmentSnapshot:
@@ -106,6 +108,87 @@ def test_scan_failure_still_drains_persisted_event(tmp_path: Path) -> None:
         clock=lambda: 15,
     )
     assert not result.scan_ok and result.delivered == 1
+
+
+def test_campaign_catalog_drafts_select_the_exact_execution_modes(tmp_path: Path) -> None:
+    assignments = (
+        replace(
+            _assignment("a"),
+            course_shortname="ASIX-CAMPAIGN-01",
+            title="Campaign Report",
+            attachments=(),
+        ),
+        replace(
+            _assignment("b"),
+            course_shortname="ASIX-CAMPAIGN-01",
+            title="Práctica Windows Server validation",
+            attachments=(),
+        ),
+        replace(
+            _assignment("c"),
+            course_shortname="ASIX-CAMPAIGN-01",
+            title="Práctica Windows Server command failure",
+            attachments=(),
+        ),
+        replace(
+            _assignment("d"),
+            course_shortname="ASIX-CAMPAIGN-01",
+            title="OVA import validation",
+        ),
+    )
+    state = MoodleState(tmp_path / "state.sqlite3")
+    modes = []
+    for assignment in assignments:
+        event = state.enqueue(draft_from_assignment(assignment), now=1)
+        assert event is not None
+        modes.append(_select_mode(event))
+    assert modes == [
+        ExecutionMode.CENTRAL,
+        ExecutionMode.HYBRID,
+        ExecutionMode.HYBRID,
+        ExecutionMode.IN_GUEST,
+    ]
+
+
+def test_scheduler_scope_preserves_unselected_events_and_enforces_cycle_cap(tmp_path: Path) -> None:
+    scoped = tuple(
+        replace(_assignment(letter), course_shortname="ASIX-CAMPAIGN-01", attachments=())
+        for letter in "abcde"
+    )
+    unselected = replace(_assignment("f"), course_shortname="OTHER-COURSE", attachments=())
+    state = MoodleState(tmp_path / "state.sqlite3")
+    options = SchedulerOptions(
+        course_shortnames=("ASIX-CAMPAIGN-01",), max_new_events_per_cycle=4
+    )
+    first = once(
+        state, _Service(scoped + (unselected,)), lambda event: None, options, clock=lambda: 1
+    )
+    assert first.enqueued == first.delivered == 4
+    second = once(
+        state, _Service(scoped + (unselected,)), lambda event: None, options, clock=lambda: 2
+    )
+    assert second.enqueued == second.delivered == 1
+    other = once(
+        state,
+        _Service((unselected,)),
+        lambda event: None,
+        SchedulerOptions(course_shortnames=("OTHER-COURSE",)),
+        clock=lambda: 3,
+    )
+    assert other.enqueued == other.delivered == 1
+
+
+def test_scheduler_scope_digest_is_stable_and_binds_allowlist_and_cap() -> None:
+    baseline = SchedulerOptions(course_shortnames=("ASIX-CAMPAIGN-01",), max_new_events_per_cycle=4)
+    assert baseline.scope_digest == SchedulerOptions(
+        course_shortnames=("ASIX-CAMPAIGN-01",), max_new_events_per_cycle=4
+    ).scope_digest
+    assert baseline.scope_digest != SchedulerOptions(
+        course_shortnames=("OTHER-COURSE",), max_new_events_per_cycle=4
+    ).scope_digest
+    assert baseline.scope_digest != SchedulerOptions(
+        course_shortnames=("ASIX-CAMPAIGN-01",), max_new_events_per_cycle=5
+    ).scope_digest
 
 
 def test_multiple_pending_revisions_artifacts_and_retry_keep_stable_id(tmp_path: Path) -> None:
@@ -200,6 +283,7 @@ def test_run_recovers_without_leaking_error() -> None:
             "enqueued": 0,
             "delivered": 0,
             "delivery_failed": 1,
+            "scope_digest": SchedulerOptions(retry_base_seconds=3).scope_digest,
         },
         {
             "kind": "moodle-scheduler-cycle-v1",
@@ -207,6 +291,7 @@ def test_run_recovers_without_leaking_error() -> None:
             "enqueued": 0,
             "delivered": 0,
             "delivery_failed": 0,
+            "scope_digest": "",
         },
     ]
     assert "SENTINEL_SECRET" not in stream.getvalue()
@@ -240,6 +325,7 @@ def test_run_interrupts_cleanly_during_recovery_backoff() -> None:
         "enqueued": 0,
         "delivered": 0,
         "delivery_failed": 1,
+        "scope_digest": SchedulerOptions(retry_base_seconds=3).scope_digest,
     }
     assert "SENTINEL_RECOVERY_SECRET" not in stream.getvalue()
 
@@ -251,7 +337,9 @@ def test_run_interrupts_cleanly_while_emitting_recovery_summary() -> None:
         raise RuntimeError("SENTINEL_EMIT_SECRET")
 
     def emit_summary(result: CycleResult) -> None:
-        assert result == CycleResult(False, 0, 0, 1)
+        assert result == CycleResult(
+            False, 0, 0, 1, SchedulerOptions(retry_base_seconds=3).scope_digest
+        )
         raise KeyboardInterrupt
 
     run(

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 3,
+  "course": {
+    "shortname": "ASIX-CAMPAIGN-01",
+    "fullname": "ASIX Campaign 01",
+    "summary": "Curs fictici determinista de campanya per a proves locals de Moodle Autotask."
+  },
+  "teachers": [
+    {"username": "teacher.ada", "firstname": "Ada", "lastname": "Lovelace", "email": "teacher.ada@example.test"},
+    {"username": "teacher.grace", "firstname": "Grace", "lastname": "Hopper", "email": "teacher.grace@example.test"},
+    {"username": "teacher.luis", "firstname": "Luis", "lastname": "Mora", "email": "teacher.luis@example.test"},
+    {"username": "teacher.nora", "firstname": "Nora", "lastname": "Vidal", "email": "teacher.nora@example.test"}
+  ],
+  "students": [
+    {"username": "student2", "firstname": "Alex", "lastname": "Riu", "email": "student2@example.test"},
+    {"username": "student3", "firstname": "Berta", "lastname": "Sol", "email": "student3@example.test"},
+    {"username": "student4", "firstname": "Carla", "lastname": "Niu", "email": "student4@example.test"},
+    {"username": "student5", "firstname": "Dani", "lastname": "Pau", "email": "student5@example.test"},
+    {"username": "student6", "firstname": "Elia", "lastname": "Bos", "email": "student6@example.test"},
+    {"username": "student7", "firstname": "Ferran", "lastname": "Mar", "email": "student7@example.test"},
+    {"username": "student8", "firstname": "Gina", "lastname": "Roc", "email": "student8@example.test"},
+    {"username": "student9", "firstname": "Hugo", "lastname": "Serra", "email": "student9@example.test"},
+    {"username": "student10", "firstname": "Ivet", "lastname": "Prat", "email": "student10@example.test"},
+    {"username": "student11", "firstname": "Jan", "lastname": "Costa", "email": "student11@example.test"},
+    {"username": "student12", "firstname": "Kira", "lastname": "Forn", "email": "student12@example.test"}
+  ],
+  "assignments": [
+    {
+      "idnumber": "central-report-success",
+      "title": "Campaign Report",
+      "scenario": "CENTRAL",
+      "intro": "<p>Scenario: CENTRAL. Submit the deterministic central campaign report.</p>",
+      "dueoffset": 172800,
+      "allowoffset": 0,
+      "files": {"report.txt": "Write the deterministic central report.\n"}
+    },
+    {
+      "idnumber": "windows-ssm-success",
+      "title": "Práctica Windows Server validation",
+      "scenario": "HYBRID",
+      "intro": "<p>Scenario: HYBRID. Validate the Windows lab through the deterministic SSM scenario.</p>",
+      "dueoffset": 259200,
+      "allowoffset": 0,
+      "files": {"windows-lab.txt": "Validate the Windows lab through SSM.\n"}
+    },
+    {
+      "idnumber": "windows-command-failure",
+      "title": "Práctica Windows Server command failure",
+      "scenario": "HYBRID",
+      "intro": "<p>Scenario: HYBRID. Record the expected deterministic Windows command failure.</p>",
+      "dueoffset": 345600,
+      "allowoffset": 0,
+      "files": {"failure.txt": "Run the deterministic failing Windows command.\n"}
+    },
+    {
+      "idnumber": "ova-import-negative",
+      "title": "OVA import validation",
+      "scenario": "IN_GUEST",
+      "intro": "<p>Scenario: IN_GUEST. Verify the negative OVA import path using metadata only.</p>",
+      "dueoffset": 432000,
+      "allowoffset": 0,
+      "files": {"negative.ova": "AUTOTASK-METADATA-ONLY-OVA\nThis tiny deterministic fixture is metadata-only and is not a real OVA.\n"}
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ SCRIPT = ROOT / "scripts" / "moodle.ps1"
 VERSIONS = ROOT / "infra" / "moodle" / "versions.psd1"
 DOCS = ROOT / "docs" / "local-moodle.md"
 FIXTURE = ROOT / "infra" / "moodle" / "fixture.php"
+CATALOG_V3 = ROOT / "infra" / "moodle" / "catalog-v3.json"
 
 
 def read(path: Path) -> str:
@@ -547,6 +549,154 @@ def test_rich_fixture_is_versioned_idempotent_and_fails_closed_on_partial_state(
     assert "seed_fixture()" in ensure
     assert "rich fixture anchor migration failed" in ensure
     assert "echo fixture_state()" in ensure
+    assert "AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG" in fixture
+    assert "verify_fixture_v3($catalog['data'], $catalog['digest'], true)" in fixture
+
+
+def test_fixture_v3_catalog_is_declarative_and_has_exact_campaign_matrix() -> None:
+    catalog = json.loads(CATALOG_V3.read_text(encoding="utf-8"))
+    assert catalog["schemaVersion"] == 3
+    assert catalog["course"]["shortname"] == "ASIX-CAMPAIGN-01"
+    assert len(catalog["teachers"]) == 4
+    assert len(catalog["students"]) == 11
+    assert all(person["email"].endswith("@example.test") for person in catalog["teachers"])
+    assert all(person["email"].endswith("@example.test") for person in catalog["students"])
+    assert [assignment["idnumber"] for assignment in catalog["assignments"]] == [
+        "central-report-success",
+        "windows-ssm-success",
+        "windows-command-failure",
+        "ova-import-negative",
+    ]
+    assert catalog["assignments"][-1]["files"]["negative.ova"].startswith(
+        "AUTOTASK-METADATA-ONLY-OVA\n"
+    )
+    assert [assignment["title"] for assignment in catalog["assignments"][1:3]] == [
+        "Práctica Windows Server validation",
+        "Práctica Windows Server command failure",
+    ]
+
+
+def test_fixture_v3_migration_paths_are_one_way_idempotent_and_fail_closed() -> None:
+    fixture = read(FIXTURE)
+    expand = fixture.split("function expand_fixture(): void", maxsplit=1)[1].split(
+        "$action = $argv[1]", maxsplit=1
+    )[0]
+    assert "if ($state === 'complete-v3') {\n        return;" in expand
+    assert "if ($state === 'partial')" in expand
+    assert "throw new RuntimeException('rich fixture is partial')" in expand
+    assert "if ($state === 'absent')" in expand
+    assert "seed_fixture()" in expand
+    assert "if ($state === 'complete-v1')" in expand
+    assert "advance_fixture()" in expand
+    assert "if ($state !== 'complete-v2')" in expand
+    assert "v3 fixture identity collision" in expand
+    assert "v3 fixture course collision" in expand
+    assert "set_config(AUTOTASK_FIXTURE_CONFIG, '3')" in expand
+    assert "fixture_state() !== 'complete-v3'" in expand
+
+
+def test_fixture_v3_rejects_tamper_and_partial_metadata_before_completion() -> None:
+    fixture = read(FIXTURE)
+    assert (
+        "fixture_v3_validate_catalog(json_decode($raw, true, 512, JSON_THROW_ON_ERROR))"
+        in fixture
+    )
+    assert "fixture_v3_canonicalize" in fixture
+    assert "hash('sha256', $canonical)" in fixture
+    assert "hash_equals($digest, $stored)" in fixture
+    assert "invalid or duplicate v3 identity" in fixture
+    assert "isset($assignmentids[$assignment['idnumber']])" in fixture
+    assert "$DB->count_records('course_modules', ['course' => $campaign->id]) === 4" in fixture
+    assert "$user->auth !== 'nologin'" in fixture
+
+
+@pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
+def test_fixture_v3_catalog_harness_validates_canonical_digest_and_timestamp_contract() -> None:
+    php = shutil.which("php")
+    assert php is not None
+    harness = (
+        "define('AUTOTASK_FIXTURE_LIBRARY', true); require $argv[1]; "
+        "fixture_v3_load_catalog($argv[2]); $catalog = fixture_v3_catalog(); "
+        "echo fixture_timestamp(100, 0) . ':' . fixture_timestamp(100, 2) . ':' . "
+        "$catalog['digest'];"
+    )
+    result = subprocess.run(
+        [php, "-r", harness, str(FIXTURE), str(CATALOG_V3)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    zero, positive, digest = result.stdout.strip().split(":")
+    assert (zero, positive) == ("0", "102")
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+
+
+@pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
+@pytest.mark.parametrize(
+    "payload",
+    (
+        '{"x":1,"\\u0078":2}',
+        '{"outer":{"x":1,"\\u0078":2}}',
+    ),
+)
+def test_fixture_v3_catalog_harness_rejects_duplicate_object_keys(
+    tmp_path: Path, payload: str
+) -> None:
+    php = shutil.which("php")
+    assert php is not None
+    catalog = tmp_path / "duplicate.json"
+    catalog.write_text(payload, encoding="utf-8")
+    harness = (
+        "define('AUTOTASK_FIXTURE_LIBRARY', true); require $argv[1]; "
+        "fixture_v3_load_catalog($argv[2]);"
+    )
+    result = subprocess.run(
+        [php, "-r", harness, str(FIXTURE), str(catalog)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode != 0
+    assert "duplicate object keys" in result.stderr
+
+
+def test_fixture_v3_transaction_and_v2_partial_contracts_are_explicit() -> None:
+    fixture = read(FIXTURE)
+    state = fixture.split("function fixture_state", maxsplit=1)[1].split(
+        "function create_assignment", maxsplit=1
+    )[0]
+    expand = fixture.split("function expand_fixture(): void", maxsplit=1)[1].split(
+        "if (!defined('AUTOTASK_FIXTURE_LIBRARY')", maxsplit=1
+    )[0]
+    assert "if (fixture_v3_footprint_exists())" in state
+    assert "return 'partial'" in state
+    assert "$transaction = $DB->start_delegated_transaction()" in expand
+    assert "$transaction->allow_commit()" in expand
+    assert "catch (Throwable $error)" in expand
+    assert "$transaction->rollback($error)" in expand
+    assert expand.index("$transaction = $DB->start_delegated_transaction()") < expand.index(
+        "$campaign = create_course"
+    )
+    assert expand.index("set_config(AUTOTASK_FIXTURE_CONFIG, '3')") < expand.index(
+        "$transaction->allow_commit()"
+    )
+    assert "get_config('core', AUTOTASK_FIXTURE_ANCHOR_CONFIG) === false" in expand
+    assert "set_config(AUTOTASK_FIXTURE_ANCHOR_CONFIG, (string)$anchor)" in expand
+    ensure = fixture.split("} elseif ($action === 'ensure')", maxsplit=1)[1].split(
+        "} elseif ($action === 'seed')", maxsplit=1
+    )[0]
+    assert "$state === 'complete-v2' || $state === 'complete-v3'" in ensure
+
+
+def test_bootstrap_seed_accepts_an_exact_complete_v3_fixture() -> None:
+    script = read(SCRIPT)
+    seed = script.split("function Seed-Fixture", maxsplit=1)[1].split(
+        "function Ensure-FixtureAttachment", maxsplit=1
+    )[0]
+    assert "@('complete-v1', 'complete-v2', 'complete-v3')" in seed
 
 
 def test_rich_fixture_verifies_category_course_and_deadline_contracts() -> None:
@@ -561,9 +711,9 @@ def test_rich_fixture_verifies_category_course_and_deadline_contracts() -> None:
     assert "$course->category !== (int)$asix->id" in verify
     assert "Curs fictici i determinista per a proves locals de Moodle Autotask." in verify
     assert "$reservedmodules !== count(fixture_assignments())" in verify
-    assert "$expecteddue = $spec['dueoffset'] === 0 ? 0 : $anchor + $spec['dueoffset']" in verify
+    assert "$expecteddue = fixture_timestamp($anchor, $spec['dueoffset'])" in verify
     assert "$expecteddue += 86400" in verify
-    assert "$expectedallow = $spec['allowoffset'] === 0" in verify
+    assert "$expectedallow = fixture_timestamp($anchor, $spec['allowoffset'])" in verify
     assert "(int)$row->duedate !== $expecteddue" in verify
     assert "(int)$row->allowsubmissionsfromdate !== $expectedallow" in verify
 
@@ -586,16 +736,20 @@ def test_fixture_tool_is_copied_hash_verified_executed_and_removed() -> None:
     tool = script.split("function Invoke-RichFixtureTool", maxsplit=1)[1].split(
         "function Invoke-MoodleDockerWaitForDb", maxsplit=1
     )[0]
-    assert "ValidateSet('state', 'ensure', 'seed', 'advance')" in tool
+    assert "ValidateSet('state', 'ensure', 'seed', 'advance', 'expand')" in tool
     assert "Assert-ContainedNonReparsePath -Path $FixtureToolPath" in tool
+    assert "Assert-ContainedNonReparsePath -Path $FixtureCatalogV3Path" in tool
     assert "Get-FileHash -LiteralPath $FixtureToolPath -Algorithm SHA256" in tool
+    assert "Get-FileHash -LiteralPath $FixtureCatalogV3Path -Algorithm SHA256" in tool
     assert "@('cp', (ConvertTo-BashPath -Path $FixtureToolPath)" in tool
+    assert "@('cp', (ConvertTo-BashPath -Path $FixtureCatalogV3Path)" in tool
     assert "'sha256sum', $containerPath" in tool
+    assert "'sha256sum', $catalogContainerPath" in tool
     assert tool.index("$actualHash -ne $expectedHash") < tool.index(
-        "'php', $containerPath, $FixtureAction"
+        "'php', $containerPath, $FixtureAction, $catalogContainerPath"
     )
-    assert "unlink('$containerPath')" in tool
-    assert "MSYS2_ARG_CONV_EXCL' = '/var/www/html;/tmp/moodle-autotask-fixture.php'" in script
+    assert "unlink(`$path)" in tool
+    assert "/tmp/moodle-autotask-catalog-v3.json" in script
     assert "Invoke-RichFixtureTool -FixtureAction 'ensure'" in script
 
 
@@ -611,6 +765,76 @@ def test_smoke_requires_exact_rich_course_assignment_and_ova_metadata_matrix() -
     assert "$_.name -eq $expectedOvaAssignmentName" in smoke
     assert "$ovaFiles -notcontains 'asix-router-lab.ova'" in smoke
     assert "12 assignments across the base and ASIX fixtures" in smoke
+    assert "$allAssignments.Count -ne 16" in smoke
+    assert "ASIX-CAMPAIGN-01" in smoke
+    assert "ova-import-negative" in smoke
+    assert "cmidnumber" not in smoke
+    assert "Resolve-CampaignAssignmentIdNumbers" in script
+    assert "core_course_get_contents" in script
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_campaign_smoke_resolves_realistic_cmid_payloads_and_rejects_bad_mappings(
+    tmp_path: Path,
+) -> None:
+    script = read(SCRIPT)
+    resolver = script[
+        script.index("function Resolve-CampaignAssignmentIdNumbers") : script.index(
+            "function Invoke-Smoke"
+        )
+    ]
+    driver = tmp_path / "campaign-cmid-resolution.ps1"
+    driver.write_text(
+        "Set-StrictMode -Version Latest\n"
+        + "$ErrorActionPreference = 'Stop'\n"
+        + "function Fail { param([string]$Message) throw $Message }\n"
+        + "$script:mode = 'exact'\n"
+        + "function Invoke-MoodleRest { param($BaseUrl, $Token, $Function, $Parameters)\n"
+        + "  if ($Function -ne 'core_course_get_contents') { throw 'unexpected function' }\n"
+        + "  $modules = @(\n"
+        + "    [PSCustomObject]@{ id = 31; modname = 'assign'; idnumber = 'central-report-success' },\n"  # noqa: E501
+        + "    [PSCustomObject]@{ id = 32; modname = 'assign'; idnumber = 'windows-ssm-success' },\n"  # noqa: E501
+        + "    [PSCustomObject]@{ id = 33; modname = 'assign'; idnumber = 'windows-command-failure' },\n"  # noqa: E501
+        + "    [PSCustomObject]@{ id = 34; modname = 'assign'; idnumber = 'ova-import-negative' }\n"
+        + "  )\n"
+        + "  if ($script:mode -eq 'mismatch') { $modules[1].idnumber = 'wrong-id' }\n"
+        + "  if ($script:mode -eq 'case-mismatch') { $modules[0].idnumber = 'CENTRAL-REPORT-SUCCESS' }\n"  # noqa: E501
+        + "  if ($script:mode -eq 'missing') { $modules = @($modules | Where-Object { $_.id -ne 34 }) }\n"  # noqa: E501
+        + "  return @([PSCustomObject]@{ modules = $modules })\n"
+        + "}\n"
+        + resolver
+        + "$course = [PSCustomObject]@{ id = 17 }\n"
+        + "$expected = @('central-report-success', 'windows-ssm-success', 'windows-command-failure', 'ova-import-negative')\n"  # noqa: E501
+        + "function New-Assignments {\n"
+        + "  $items = @(@(31, 32, 33, 34) | ForEach-Object { [PSCustomObject]@{ cmid = $_; name = 'realistic mod_assign payload' } })\n"  # noqa: E501
+        + "  if ($script:mode -eq 'duplicate') { $items[3].cmid = 33 }\n"
+        + "  return $items\n"
+        + "}\n"
+        + "$resolved = @(Resolve-CampaignAssignmentIdNumbers -CampaignCourse $course -Assignments (New-Assignments) -ExpectedIdNumbers $expected -BaseUrl 'https://example.test' -Token 'token')\n"  # noqa: E501
+        + "$actual = @($resolved | ForEach-Object { $_.IdNumber } | Sort-Object)\n"
+        + "if (($actual -join ',') -ne (($expected | Sort-Object) -join ',')) { throw 'exact mapping failed' }\n"  # noqa: E501
+        + "foreach ($failure in @('mismatch', 'case-mismatch', 'missing', 'duplicate')) {\n"
+        + "  $script:mode = $failure; $rejected = $false\n"
+        + "  try { Resolve-CampaignAssignmentIdNumbers -CampaignCourse $course -Assignments (New-Assignments) -ExpectedIdNumbers $expected -BaseUrl 'https://example.test' -Token 'token' | Out-Null } catch { $rejected = $true }\n"  # noqa: E501
+        + "  if (-not $rejected) { throw \"$failure mapping was accepted\" }\n"
+        + "}\n"
+        + "Write-Output 'campaign-cmid-resolution-ok'\n",
+        encoding="utf-8",
+    )
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("campaign-cmid-resolution-ok")
 
 
 def test_moodle_script_is_ascii_and_windows_powershell_composes_ova_assignment(
@@ -651,6 +875,16 @@ def test_advance_fixture_action_is_explicit_one_way_and_runs_smoke() -> None:
     )[0]
     assert "Invoke-RichFixtureTool -FixtureAction 'advance'" in action
     assert "rich-fixture-advanced" in action
+    assert "Invoke-Smoke" in action
+
+
+def test_expand_fixture_action_is_explicit_and_runs_smoke() -> None:
+    script = read(SCRIPT)
+    action = script.split("    'ExpandFixture' {", maxsplit=1)[1].split(
+        "    'Reset' {", maxsplit=1
+    )[0]
+    assert "Invoke-RichFixtureTool -FixtureAction 'expand'" in action
+    assert "rich-fixture-expanded" in action
     assert "Invoke-Smoke" in action
 
 
@@ -1057,8 +1291,7 @@ def test_git_control_state_and_reset_wwwroot_are_constrained() -> None:
 
 
 @pytest.mark.skipif(
-    shutil.which("powershell") is None and shutil.which("pwsh") is None,
-    reason="PowerShell is required",
+    os.name != "nt", reason="Windows PowerShell native executable behavior is required"
 )
 def test_exttests_container_is_validated_and_stopped_before_source_mutation(tmp_path: Path) -> None:
     powershell = shutil.which("powershell") or shutil.which("pwsh")
@@ -1253,12 +1486,7 @@ def test_trusted_reset_wrapper_uses_runtime_wwwroot_without_moodle_checkout(tmp_
     assert result.stdout.strip() == "reset-wwwroot-ok"
 
 
-@pytest.mark.skipif(
-    shutil.which("powershell") is None
-    and shutil.which("pwsh") is None
-    or shutil.which("git") is None,
-    reason="PowerShell and Git are required",
-)
+@pytest.mark.skipif(os.name != "nt", reason="Windows Git line-ending behavior is required")
 def test_real_no_checkout_clone_allows_only_main_tracking_metadata(tmp_path: Path) -> None:
     source = tmp_path / "source"
     bare_remote = tmp_path / "remote.git"
@@ -1547,12 +1775,7 @@ def test_real_no_checkout_clone_allows_only_main_tracking_metadata(tmp_path: Pat
     assert result.stdout.strip().endswith("clone-control-state-ok")
 
 
-@pytest.mark.skipif(
-    shutil.which("powershell") is None
-    and shutil.which("pwsh") is None
-    or shutil.which("git") is None,
-    reason="PowerShell and Git are required",
-)
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior is required")
 def test_raw_tracked_file_verifier_batches_hundreds_of_paths(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     bulk_directory = repository / "bulk"
@@ -1697,10 +1920,7 @@ def test_raw_tracked_file_verifier_batches_hundreds_of_paths(tmp_path: Path) -> 
     assert reparse_result.stdout.strip().endswith("reparse-rejected-before-hash-ok")
 
 
-@pytest.mark.skipif(
-    shutil.which("powershell") is None and shutil.which("pwsh") is None,
-    reason="PowerShell is not available",
-)
+@pytest.mark.skipif(os.name != "nt", reason="Windows symlink behavior is required")
 def test_legacy_generated_moodle_config_migrates_only_exact_crlf(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     moodle_root = runtime / "moodle"

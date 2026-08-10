@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from moddle_autotask.adapters.moodle.approval_state import ApprovalState, ApprovalStateError
+from moddle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot, MoodleAttachment
+from moddle_autotask.adapters.moodle.scheduler import draft_from_assignment
 from moddle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
@@ -82,6 +84,51 @@ def test_mode_selection_is_deterministic_and_never_auto(tmp_path: Path) -> None:
         event = _event(tmp_path, revision, title=title, attachments=attachments)
         _approve(state, event, now=ord(revision))
         item = state.work_status(event.task_key, event.revision_digest)
+        assert item is not None and item.selected_mode is expected
+
+
+def test_campaign_catalog_drafts_flow_through_approval_with_exact_modes(tmp_path: Path) -> None:
+    attachment = MoodleAttachment(
+        "moodle-attachment-v1:" + "b" * 64,
+        "introattachments",
+        "negative.ova",
+        "/",
+        "https://example.test/pluginfile.php/1/negative.ova",
+        3,
+        1,
+        "application/octet-stream",
+    )
+    entries = (
+        ("a", "Campaign Report", (), ExecutionMode.CENTRAL),
+        ("b", "Práctica Windows Server validation", (), ExecutionMode.HYBRID),
+        ("c", "Práctica Windows Server command failure", (), ExecutionMode.HYBRID),
+        ("d", "OVA import validation", (attachment,), ExecutionMode.IN_GUEST),
+    )
+    notifications = MoodleState(tmp_path / "notifications.sqlite3")
+    approval = ApprovalState(tmp_path / "approval.sqlite3")
+    for index, (letter, title, attachments, expected) in enumerate(entries, start=1):
+        snapshot = MoodleAssignmentSnapshot(
+            "moodle-task-v1:" + letter * 64,
+            "moodle-assignment-v1:" + letter * 64,
+            "https://example.test",
+            index,
+            10,
+            "ASIX Campaign 01",
+            "ASIX-CAMPAIGN-01",
+            index + 100,
+            title,
+            "discarded fixture intro",
+            0,
+            1,
+            0,
+            0,
+            1,
+            attachments,
+        )
+        event = notifications.enqueue(draft_from_assignment(snapshot), now=index)
+        assert event is not None
+        _approve(approval, event, now=index + 10)
+        item = approval.work_status(event.task_key, event.revision_digest)
         assert item is not None and item.selected_mode is expected
 
 

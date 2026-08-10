@@ -2,14 +2,18 @@
 
 declare(strict_types=1);
 
-define('CLI_SCRIPT', true);
-require '/var/www/html/config.php';
-require_once $CFG->dirroot . '/user/lib.php';
-require_once $CFG->dirroot . '/course/lib.php';
-require_once $CFG->dirroot . '/course/modlib.php';
+if (!defined('AUTOTASK_FIXTURE_LIBRARY')) {
+    define('CLI_SCRIPT', true);
+    require '/var/www/html/config.php';
+    require_once $CFG->dirroot . '/user/lib.php';
+    require_once $CFG->dirroot . '/course/lib.php';
+    require_once $CFG->dirroot . '/course/modlib.php';
+}
 
 const AUTOTASK_FIXTURE_CONFIG = 'moddle_autotask_rich_fixture_version';
 const AUTOTASK_FIXTURE_ANCHOR_CONFIG = 'moddle_autotask_rich_fixture_anchor';
+const AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG = 'moddle_autotask_rich_fixture_catalog_v3_sha256';
+const AUTOTASK_FIXTURE_V3_COURSE = 'ASIX-CAMPAIGN-01';
 
 function fixture_courses(): array {
     return [
@@ -144,7 +148,22 @@ function fixture_footprint_exists(): bool {
         return true;
     }
     return $DB->record_exists_select('course_categories', 'idnumber IN (?, ?, ?)', ['AUTOTASK-CF', 'AUTOTASK-INFO', 'AUTOTASK-ASIX'])
-        || $DB->record_exists_select('course_modules', $DB->sql_like('idnumber', '?'), ['autotask-rich-%']);
+        || $DB->record_exists_select('course_modules', $DB->sql_like('idnumber', '?'), ['autotask-rich-%'])
+        || fixture_v3_footprint_exists();
+}
+
+function fixture_v3_footprint_exists(): bool {
+    global $DB;
+    return get_config('core', AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG) !== false
+        || $DB->record_exists('course', ['shortname' => AUTOTASK_FIXTURE_V3_COURSE])
+        || $DB->record_exists_select('user', 'username IN (' . implode(',', array_fill(0, 15, '?')) . ')', fixture_v3_usernames())
+        || $DB->record_exists_select('course_modules', 'idnumber IN (?, ?, ?, ?)', [
+            'central-report-success', 'windows-ssm-success', 'windows-command-failure', 'ova-import-negative',
+        ]);
+}
+
+function fixture_timestamp(int $anchor, int $offset): int {
+    return $offset === 0 ? 0 : $anchor + $offset;
 }
 
 function infer_fixture_anchor(bool $advanced): ?int {
@@ -214,11 +233,11 @@ function verify_fixture(bool $advanced, int $anchor): bool {
             if ($spec['idnumber'] === 'autotask-rich-iso-ova' && $advanced) {
                 $expectedintro .= '<p><strong>Actualització:</strong> afegeix una segona interfície i documenta la ruta de retorn.</p>';
             }
-            $expecteddue = $spec['dueoffset'] === 0 ? 0 : $anchor + $spec['dueoffset'];
+            $expecteddue = fixture_timestamp($anchor, $spec['dueoffset']);
             if ($spec['idnumber'] === 'autotask-rich-iso-ova' && $advanced) {
                 $expecteddue += 86400;
             }
-            $expectedallow = $spec['allowoffset'] === 0 ? 0 : $anchor + $spec['allowoffset'];
+            $expectedallow = fixture_timestamp($anchor, $spec['allowoffset']);
             if ($row->name !== $spec['name'] || $row->intro !== $expectedintro
                     || (int)$row->duedate !== $expecteddue
                     || (int)$row->allowsubmissionsfromdate !== $expectedallow) {
@@ -251,6 +270,17 @@ function fixture_state(): string {
     if ($version === false || $version === '') {
         return fixture_footprint_exists() ? 'partial' : 'absent';
     }
+    if ($version === '3') {
+        $catalog = fixture_v3_catalog();
+        return $catalog !== null && verify_fixture_v3($catalog['data'], $catalog['digest'], true)
+            ? 'complete-v3' : 'partial';
+    }
+    if ($version !== '1' && $version !== '2') {
+        return 'partial';
+    }
+    if (fixture_v3_footprint_exists()) {
+        return 'partial';
+    }
     $advanced = $version === '2';
     $anchor = ($version === '1' || $advanced) ? fixture_anchor($advanced) : null;
     if ($anchor !== null && verify_fixture($advanced, $anchor)) {
@@ -269,8 +299,8 @@ function create_assignment(object $course, array $spec, int $now): void {
         'alwaysshowdescription' => 1, 'submissionattachments' => 0, 'submissiondrafts' => 0,
         'requiresubmissionstatement' => 0, 'sendnotifications' => 0, 'sendlatenotifications' => 0,
         'sendstudentnotifications' => 0,
-        'duedate' => $spec['dueoffset'] === 0 ? 0 : $now + $spec['dueoffset'],
-        'allowsubmissionsfromdate' => $spec['allowoffset'] === 0 ? 0 : $now + $spec['allowoffset'],
+        'duedate' => fixture_timestamp($now, $spec['dueoffset']),
+        'allowsubmissionsfromdate' => fixture_timestamp($now, $spec['allowoffset']),
         'grade' => 100, 'completionsubmit' => 0, 'cutoffdate' => 0, 'gradingduedate' => 0,
         'teamsubmission' => 0, 'requireallteammemberssubmit' => 0, 'teamsubmissiongroupingid' => 0,
         'blindmarking' => 0, 'hidegrader' => 0, 'markingworkflow' => 0, 'markingallocation' => 0,
@@ -354,31 +384,479 @@ function advance_fixture(): void {
     }
 }
 
-$action = $argv[1] ?? '';
-if ($action === 'state') {
-    echo fixture_state();
-} elseif ($action === 'ensure') {
+/** @return list<string> */
+function fixture_v3_usernames(): array {
+    return [
+        'teacher.ada', 'teacher.grace', 'teacher.luis', 'teacher.nora',
+        'student2', 'student3', 'student4', 'student5', 'student6', 'student7',
+        'student8', 'student9', 'student10', 'student11', 'student12',
+    ];
+}
+
+function fixture_v3_assert_exact_keys(array $value, array $keys, string $where): void {
+    $actual = array_keys($value);
+    sort($actual);
+    sort($keys);
+    if ($actual !== $keys) {
+        throw new InvalidArgumentException('invalid v3 catalog keys at ' . $where);
+    }
+}
+
+function fixture_v3_string(mixed $value, string $where): string {
+    if (!is_string($value) || $value === '' || trim($value) !== $value || str_contains($value, "\0")) {
+        throw new InvalidArgumentException('invalid v3 catalog string at ' . $where);
+    }
+    return $value;
+}
+
+function fixture_v3_canonicalize(mixed $value): mixed {
+    if (!is_array($value)) {
+        return $value;
+    }
+    if (array_is_list($value)) {
+        return array_map('fixture_v3_canonicalize', $value);
+    }
+    ksort($value, SORT_STRING);
+    foreach ($value as $key => $item) {
+        $value[$key] = fixture_v3_canonicalize($item);
+    }
+    return $value;
+}
+
+function fixture_v3_validate_catalog(mixed $catalog): array {
+    if (!is_array($catalog)) {
+        throw new InvalidArgumentException('v3 catalog must be an object');
+    }
+    fixture_v3_assert_exact_keys($catalog, ['assignments', 'course', 'schemaVersion', 'students', 'teachers'], 'root');
+    if (($catalog['schemaVersion'] ?? null) !== 3 || !is_array($catalog['course'])
+            || !is_array($catalog['teachers']) || !is_array($catalog['students']) || !is_array($catalog['assignments'])) {
+        throw new InvalidArgumentException('invalid v3 catalog schema');
+    }
+    fixture_v3_assert_exact_keys($catalog['course'], ['fullname', 'shortname', 'summary'], 'course');
+    if (fixture_v3_string($catalog['course']['shortname'], 'course.shortname') !== AUTOTASK_FIXTURE_V3_COURSE) {
+        throw new InvalidArgumentException('invalid v3 campaign course identity');
+    }
+    fixture_v3_string($catalog['course']['fullname'], 'course.fullname');
+    fixture_v3_string($catalog['course']['summary'], 'course.summary');
+    if (count($catalog['teachers']) !== 4 || count($catalog['students']) !== 11 || count($catalog['assignments']) !== 4) {
+        throw new InvalidArgumentException('invalid v3 catalog cardinality');
+    }
+    $usernames = [];
+    foreach (['teachers', 'students'] as $kind) {
+        foreach ($catalog[$kind] as $index => $identity) {
+            if (!is_array($identity)) {
+                throw new InvalidArgumentException('invalid v3 ' . $kind . ' identity');
+            }
+            fixture_v3_assert_exact_keys($identity, ['email', 'firstname', 'lastname', 'username'], $kind . '[' . $index . ']');
+            foreach (['username', 'firstname', 'lastname', 'email'] as $field) {
+                fixture_v3_string($identity[$field], $kind . '[' . $index . '].' . $field);
+            }
+            $username = $identity['username'];
+            if (!preg_match('/^[a-z][a-z0-9.]{1,30}$/', $username)
+                    || !preg_match('/^[a-z0-9.]+@example\\.test$/', $identity['email'])
+                    || isset($usernames[$username])) {
+                throw new InvalidArgumentException('invalid or duplicate v3 identity');
+            }
+            $usernames[$username] = true;
+        }
+    }
+    if (array_keys($usernames) !== fixture_v3_usernames()) {
+        throw new InvalidArgumentException('unexpected v3 identity set');
+    }
+    $assignmentids = [];
+    foreach ($catalog['assignments'] as $index => $assignment) {
+        if (!is_array($assignment)) {
+            throw new InvalidArgumentException('invalid v3 assignment');
+        }
+        fixture_v3_assert_exact_keys($assignment, ['allowoffset', 'dueoffset', 'files', 'idnumber', 'intro', 'scenario', 'title'], 'assignments[' . $index . ']');
+        foreach (['idnumber', 'title', 'intro', 'scenario'] as $field) {
+            fixture_v3_string($assignment[$field], 'assignments[' . $index . '].' . $field);
+        }
+        if (!in_array($assignment['scenario'], ['CENTRAL', 'HYBRID', 'IN_GUEST'], true)
+                || !preg_match('/^[a-z][a-z0-9-]{2,63}$/', $assignment['idnumber'])
+                || isset($assignmentids[$assignment['idnumber']])
+                || !is_int($assignment['dueoffset']) || !is_int($assignment['allowoffset'])
+                || $assignment['dueoffset'] <= 0 || $assignment['allowoffset'] < 0 || $assignment['allowoffset'] > $assignment['dueoffset']
+                || !is_array($assignment['files']) || count($assignment['files']) !== 1) {
+            throw new InvalidArgumentException('invalid v3 assignment metadata');
+        }
+        foreach ($assignment['files'] as $filename => $contents) {
+            if (!is_string($filename) || !preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/', $filename)
+                    || !is_string($contents) || $contents === '' || strlen($contents) > 16384) {
+                throw new InvalidArgumentException('invalid v3 assignment file');
+            }
+        }
+        $assignmentids[$assignment['idnumber']] = true;
+    }
+    if (array_keys($assignmentids) !== [
+        'central-report-success', 'windows-ssm-success', 'windows-command-failure', 'ova-import-negative',
+    ]) {
+        throw new InvalidArgumentException('unexpected v3 assignment identities');
+    }
+    return $catalog;
+}
+
+/** @return array{data: array, digest: string}|null */
+function fixture_v3_catalog(): ?array {
+    return $GLOBALS['moddle_autotask_fixture_v3_catalog'] ?? null;
+}
+
+function fixture_v3_json_whitespace(string $raw, int &$offset): void {
+    while ($offset < strlen($raw) && str_contains(" \t\r\n", $raw[$offset])) {
+        $offset++;
+    }
+}
+
+function fixture_v3_json_string(string $raw, int &$offset): string {
+    if (($raw[$offset] ?? '') !== '"') {
+        throw new InvalidArgumentException('v3 catalog is not valid JSON');
+    }
+    $start = $offset++;
+    $length = strlen($raw);
+    while ($offset < $length) {
+        $character = $raw[$offset++];
+        if ($character === '"') {
+            try {
+                $decoded = json_decode(substr($raw, $start, $offset - $start), true, 512, JSON_THROW_ON_ERROR);
+            } catch (JsonException $error) {
+                throw new InvalidArgumentException('v3 catalog is not valid JSON', 0, $error);
+            }
+            if (!is_string($decoded)) {
+                throw new InvalidArgumentException('v3 catalog is not valid JSON');
+            }
+            return $decoded;
+        }
+        if (ord($character) < 0x20) {
+            throw new InvalidArgumentException('v3 catalog is not valid JSON');
+        }
+        if ($character !== '\\') {
+            continue;
+        }
+        if ($offset >= $length) {
+            throw new InvalidArgumentException('v3 catalog is not valid JSON');
+        }
+        $escape = $raw[$offset++];
+        if (str_contains('"\\/bfnrt', $escape)) {
+            continue;
+        }
+        if ($escape !== 'u' || $offset + 4 > $length || !ctype_xdigit(substr($raw, $offset, 4))) {
+            throw new InvalidArgumentException('v3 catalog is not valid JSON');
+        }
+        $offset += 4;
+    }
+    throw new InvalidArgumentException('v3 catalog is not valid JSON');
+}
+
+function fixture_v3_json_value(string $raw, int &$offset): void {
+    fixture_v3_json_whitespace($raw, $offset);
+    $character = $raw[$offset] ?? '';
+    if ($character === '{') {
+        $offset++;
+        fixture_v3_json_whitespace($raw, $offset);
+        $keys = [];
+        if (($raw[$offset] ?? '') === '}') {
+            $offset++;
+            return;
+        }
+        while (true) {
+            fixture_v3_json_whitespace($raw, $offset);
+            $key = fixture_v3_json_string($raw, $offset);
+            $identity = "\0" . $key;
+            if (isset($keys[$identity])) {
+                throw new InvalidArgumentException('v3 catalog contains duplicate object keys');
+            }
+            $keys[$identity] = true;
+            fixture_v3_json_whitespace($raw, $offset);
+            if (($raw[$offset++] ?? '') !== ':') {
+                throw new InvalidArgumentException('v3 catalog is not valid JSON');
+            }
+            fixture_v3_json_value($raw, $offset);
+            fixture_v3_json_whitespace($raw, $offset);
+            $delimiter = $raw[$offset++] ?? '';
+            if ($delimiter === '}') {
+                return;
+            }
+            if ($delimiter !== ',') {
+                throw new InvalidArgumentException('v3 catalog is not valid JSON');
+            }
+        }
+    }
+    if ($character === '[') {
+        $offset++;
+        fixture_v3_json_whitespace($raw, $offset);
+        if (($raw[$offset] ?? '') === ']') {
+            $offset++;
+            return;
+        }
+        while (true) {
+            fixture_v3_json_value($raw, $offset);
+            fixture_v3_json_whitespace($raw, $offset);
+            $delimiter = $raw[$offset++] ?? '';
+            if ($delimiter === ']') {
+                return;
+            }
+            if ($delimiter !== ',') {
+                throw new InvalidArgumentException('v3 catalog is not valid JSON');
+            }
+        }
+    }
+    if ($character === '"') {
+        fixture_v3_json_string($raw, $offset);
+        return;
+    }
+    foreach (['true', 'false', 'null'] as $literal) {
+        if (substr($raw, $offset, strlen($literal)) === $literal) {
+            $offset += strlen($literal);
+            return;
+        }
+    }
+    if (preg_match('/\G-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/', $raw, $match, 0, $offset)) {
+        $offset += strlen($match[0]);
+        return;
+    }
+    throw new InvalidArgumentException('v3 catalog is not valid JSON');
+}
+
+function fixture_v3_reject_duplicate_json_keys(string $raw): void {
+    $offset = 0;
+    fixture_v3_json_value($raw, $offset);
+    fixture_v3_json_whitespace($raw, $offset);
+    if ($offset !== strlen($raw)) {
+        throw new InvalidArgumentException('v3 catalog is not valid JSON');
+    }
+}
+
+function fixture_v3_load_catalog(string $path): void {
+    if ($path === '' || !is_file($path) || is_link($path) || !is_readable($path)) {
+        throw new InvalidArgumentException('v3 catalog path is invalid');
+    }
+    $raw = file_get_contents($path);
+    if ($raw === false || strlen($raw) > 262144) {
+        throw new InvalidArgumentException('v3 catalog cannot be read');
+    }
+    try {
+        fixture_v3_reject_duplicate_json_keys($raw);
+        $catalog = fixture_v3_validate_catalog(json_decode($raw, true, 512, JSON_THROW_ON_ERROR));
+    } catch (JsonException $error) {
+        throw new InvalidArgumentException('v3 catalog is not valid JSON', 0, $error);
+    }
+    $canonical = json_encode(fixture_v3_canonicalize($catalog), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    $GLOBALS['moddle_autotask_fixture_v3_catalog'] = ['data' => $catalog, 'digest' => hash('sha256', $canonical)];
+}
+
+function fixture_v3_verify_files(int $contextid, array $expected): bool {
+    $actual = get_file_storage()->get_area_files($contextid, 'mod_assign', 'introattachment', 0, 'filename', false);
+    if (count($actual) !== count($expected)) {
+        return false;
+    }
+    foreach ($actual as $file) {
+        if (!isset($expected[$file->get_filename()]) || $file->get_content() !== $expected[$file->get_filename()]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function verify_fixture_v3(array $catalog, string $digest, bool $requirestored): bool {
+    global $DB;
+    try {
+        $anchor = fixture_anchor(true);
+        if ($anchor === null || !verify_fixture(true, $anchor)) {
+            return false;
+        }
+        $stored = get_config('core', AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG);
+        if (($requirestored && (!is_string($stored) || !hash_equals($digest, $stored))) || (!$requirestored && $stored !== false && !hash_equals($digest, (string)$stored))) {
+            return false;
+        }
+        $campaign = $DB->get_record('course', ['shortname' => AUTOTASK_FIXTURE_V3_COURSE], '*', MUST_EXIST);
+        $asix = $DB->get_record('course_categories', ['idnumber' => 'AUTOTASK-ASIX'], '*', MUST_EXIST);
+        if ($campaign->fullname !== $catalog['course']['fullname'] || $campaign->summary !== $catalog['course']['summary']
+                || (int)$campaign->category !== (int)$asix->id) {
+            return false;
+        }
+        $expectedroles = [];
+        foreach ($catalog['teachers'] as $identity) {
+            $expectedroles[$identity['username']] = 'editingteacher';
+        }
+        $DB->get_record('user', ['username' => 'student1'], '*', MUST_EXIST);
+        $expectedroles['student1'] = 'student';
+        foreach ($catalog['students'] as $identity) {
+            $user = $DB->get_record('user', ['username' => $identity['username']], '*', MUST_EXIST);
+            if ($user->auth !== 'nologin' || $user->firstname !== $identity['firstname'] || $user->lastname !== $identity['lastname'] || $user->email !== $identity['email']) {
+                return false;
+            }
+            $expectedroles[$identity['username']] = 'student';
+        }
+        foreach ($catalog['teachers'] as $identity) {
+            $user = $DB->get_record('user', ['username' => $identity['username']], '*', MUST_EXIST);
+            if ($user->auth !== 'nologin' || $user->firstname !== $identity['firstname'] || $user->lastname !== $identity['lastname'] || $user->email !== $identity['email']) {
+                return false;
+            }
+        }
+        $context = context_course::instance($campaign->id);
+        $enrolled = get_enrolled_users($context, '', 0, 'u.id,u.username');
+        if (count($enrolled) !== count($expectedroles)) {
+            return false;
+        }
+        foreach ($enrolled as $user) {
+            if (!isset($expectedroles[$user->username])) {
+                return false;
+            }
+            $roles = $DB->get_fieldset_sql('SELECT r.shortname FROM {role_assignments} ra JOIN {role} r ON r.id = ra.roleid WHERE ra.contextid = ? AND ra.userid = ?', [$context->id, $user->id]);
+            if ($roles !== [$expectedroles[$user->username]]) {
+                return false;
+            }
+        }
+        $seen = [];
+        foreach ($catalog['assignments'] as $spec) {
+            $row = $DB->get_record_sql("SELECT a.*, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.course = ? AND cm.idnumber = ? AND m.name = 'assign'", [$campaign->id, $spec['idnumber']], MUST_EXIST);
+            if ($row->name !== $spec['title'] || $row->intro !== $spec['intro'] || (int)$row->introformat !== FORMAT_HTML
+                    || (int)$row->duedate !== fixture_timestamp($anchor, $spec['dueoffset'])
+                    || (int)$row->allowsubmissionsfromdate !== fixture_timestamp($anchor, $spec['allowoffset'])
+                    || !fixture_v3_verify_files(context_module::instance($row->cmid)->id, $spec['files'])) {
+                return false;
+            }
+            $seen[$spec['idnumber']] = true;
+        }
+        return $DB->count_records('course_modules', ['course' => $campaign->id]) === 4 && count($seen) === 4;
+    } catch (Throwable) {
+        return false;
+    }
+}
+
+function fixture_v3_create_user(array $identity): object {
+    global $DB;
+    $id = user_create_user((object)[
+        'username' => $identity['username'], 'firstname' => $identity['firstname'], 'lastname' => $identity['lastname'],
+        'email' => $identity['email'], 'auth' => 'nologin', 'confirmed' => 1, 'suspended' => 0,
+    ], false, false);
+    return $DB->get_record('user', ['id' => $id], '*', MUST_EXIST);
+}
+
+function fixture_v3_create_assignment(object $course, array $spec, int $anchor): void {
+    $module = (object)[
+        'idnumber' => $spec['idnumber'], 'name' => $spec['title'], 'intro' => $spec['intro'],
+        'dueoffset' => $spec['dueoffset'], 'allowoffset' => $spec['allowoffset'], 'files' => $spec['files'],
+    ];
+    create_assignment($course, [
+        'idnumber' => $module->idnumber, 'name' => $module->name, 'intro' => $module->intro,
+        'dueoffset' => $module->dueoffset, 'allowoffset' => $module->allowoffset, 'files' => $module->files,
+    ], $anchor);
+}
+
+function expand_fixture(): void {
+    global $DB;
+    $loaded = fixture_v3_catalog();
+    if ($loaded === null) {
+        throw new RuntimeException('v3 catalog was not loaded');
+    }
     $state = fixture_state();
+    if ($state === 'complete-v3') {
+        return;
+    }
     if ($state === 'partial') {
         throw new RuntimeException('rich fixture is partial');
     }
     if ($state === 'absent') {
         seed_fixture();
-    } elseif (get_config('core', AUTOTASK_FIXTURE_ANCHOR_CONFIG) === false) {
-        $advanced = $state === 'complete-v2';
-        $anchor = fixture_anchor($advanced);
-        if ($anchor === null || !verify_fixture($advanced, $anchor)) {
-            throw new RuntimeException('rich fixture anchor migration failed');
-        }
-        set_config(AUTOTASK_FIXTURE_ANCHOR_CONFIG, (string)$anchor);
+        $state = fixture_state();
     }
-    echo fixture_state();
-} elseif ($action === 'seed') {
-    seed_fixture();
-    echo 'rich-fixture-seeded';
-} elseif ($action === 'advance') {
-    advance_fixture();
-    echo 'rich-fixture-advanced';
-} else {
-    throw new InvalidArgumentException('unsupported fixture action');
+    if ($state === 'complete-v1') {
+        advance_fixture();
+        $state = fixture_state();
+    }
+    if ($state !== 'complete-v2') {
+        throw new RuntimeException('rich fixture cannot migrate to revision 3');
+    }
+    $anchor = fixture_anchor(true);
+    if ($anchor === null || !verify_fixture(true, $anchor)) {
+        throw new RuntimeException('rich fixture v2 verification failed before migration');
+    }
+    foreach (fixture_v3_usernames() as $username) {
+        if ($DB->record_exists('user', ['username' => $username])) {
+            throw new RuntimeException('v3 fixture identity collision');
+        }
+    }
+    if ($DB->record_exists('course', ['shortname' => AUTOTASK_FIXTURE_V3_COURSE])) {
+        throw new RuntimeException('v3 fixture course collision');
+    }
+    foreach ($loaded['data']['assignments'] as $spec) {
+        if ($DB->record_exists('course_modules', ['idnumber' => $spec['idnumber']])) {
+            throw new RuntimeException('v3 fixture assignment collision');
+        }
+    }
+    $transaction = $DB->start_delegated_transaction();
+    try {
+        if (get_config('core', AUTOTASK_FIXTURE_ANCHOR_CONFIG) === false) {
+            set_config(AUTOTASK_FIXTURE_ANCHOR_CONFIG, (string)$anchor);
+        }
+        $asix = $DB->get_record('course_categories', ['idnumber' => 'AUTOTASK-ASIX'], '*', MUST_EXIST);
+        $campaign = create_course((object)['fullname' => $loaded['data']['course']['fullname'], 'shortname' => AUTOTASK_FIXTURE_V3_COURSE, 'category' => $asix->id, 'summary' => $loaded['data']['course']['summary']]);
+        $manual = enrol_get_plugin('manual');
+        if (!$manual) {
+            throw new RuntimeException('manual enrolment plugin unavailable');
+        }
+        $teacherrole = $DB->get_record('role', ['shortname' => 'editingteacher'], '*', MUST_EXIST);
+        $studentrole = $DB->get_record('role', ['shortname' => 'student'], '*', MUST_EXIST);
+        $instance = $DB->get_record('enrol', ['courseid' => $campaign->id, 'enrol' => 'manual'], '*', MUST_EXIST);
+        foreach ($loaded['data']['teachers'] as $identity) {
+            $manual->enrol_user($instance, fixture_v3_create_user($identity)->id, $teacherrole->id);
+        }
+        $manual->enrol_user($instance, $DB->get_record('user', ['username' => 'student1'], '*', MUST_EXIST)->id, $studentrole->id);
+        foreach ($loaded['data']['students'] as $identity) {
+            $manual->enrol_user($instance, fixture_v3_create_user($identity)->id, $studentrole->id);
+        }
+        foreach ($loaded['data']['assignments'] as $spec) {
+            fixture_v3_create_assignment($campaign, $spec, $anchor);
+        }
+        if (!verify_fixture_v3($loaded['data'], $loaded['digest'], false)) {
+            throw new RuntimeException('rich fixture verification failed during v3 migration');
+        }
+        set_config(AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG, $loaded['digest']);
+        set_config(AUTOTASK_FIXTURE_CONFIG, '3');
+        if (fixture_state() !== 'complete-v3') {
+            throw new RuntimeException('rich fixture verification failed after v3 migration');
+        }
+        $transaction->allow_commit();
+    } catch (Throwable $error) {
+        $transaction->rollback($error);
+    }
+}
+
+if (!defined('AUTOTASK_FIXTURE_LIBRARY')) {
+    $action = $argv[1] ?? '';
+    $catalogpath = $argv[2] ?? '';
+    if (in_array($action, ['state', 'ensure', 'seed', 'advance', 'expand'], true)) {
+        fixture_v3_load_catalog($catalogpath);
+    }
+    if ($action === 'state') {
+        echo fixture_state();
+    } elseif ($action === 'ensure') {
+        $state = fixture_state();
+        if ($state === 'partial') {
+            throw new RuntimeException('rich fixture is partial');
+        }
+        if ($state === 'absent') {
+            seed_fixture();
+        } elseif (get_config('core', AUTOTASK_FIXTURE_ANCHOR_CONFIG) === false) {
+            $advanced = $state === 'complete-v2' || $state === 'complete-v3';
+            $anchor = fixture_anchor($advanced);
+            if ($anchor === null || !verify_fixture($advanced, $anchor)) {
+                throw new RuntimeException('rich fixture anchor migration failed');
+            }
+            set_config(AUTOTASK_FIXTURE_ANCHOR_CONFIG, (string)$anchor);
+        }
+        echo fixture_state();
+    } elseif ($action === 'seed') {
+        seed_fixture();
+        echo 'rich-fixture-seeded';
+    } elseif ($action === 'advance') {
+        advance_fixture();
+        echo 'rich-fixture-advanced';
+    } elseif ($action === 'expand') {
+        expand_fixture();
+        echo 'rich-fixture-expanded';
+    } else {
+        throw new InvalidArgumentException('unsupported fixture action');
+    }
 }

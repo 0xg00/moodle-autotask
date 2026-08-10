@@ -44,6 +44,8 @@ def _parser() -> _SafeArgumentParser:
         child.add_argument("--batch-size", type=int, default=20)
         child.add_argument("--retry-base-seconds", type=int, default=5)
         child.add_argument("--retry-max-seconds", type=int, default=3600)
+        child.add_argument("--course-shortname", action="append", default=[])
+        child.add_argument("--max-new-events-per-cycle", type=int, default=100)
         child.add_argument("--request-timeout-seconds", type=int, default=15)
         child.add_argument("--telegram-config-file", type=Path)
         child.add_argument("--approval-state", type=Path)
@@ -61,8 +63,16 @@ def main(
 ) -> int:
     args = _parser().parse_args(argv)
     try:
+        course_shortnames = tuple(args.course_shortname)
+        if tuple(sorted(set(course_shortnames))) != course_shortnames:
+            raise ValueError("course shortnames must be sorted and unique")
         options = SchedulerOptions(
-            args.lease_seconds, args.batch_size, args.retry_base_seconds, args.retry_max_seconds
+            args.lease_seconds,
+            args.batch_size,
+            args.retry_base_seconds,
+            args.retry_max_seconds,
+            course_shortnames,
+            args.max_new_events_per_cycle,
         )
         if args.command == "run" and not 1 <= args.interval_seconds <= 7 * 86400:
             raise ValueError("interval seconds are invalid")

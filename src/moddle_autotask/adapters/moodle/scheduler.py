@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sys
@@ -30,6 +31,8 @@ class SchedulerOptions:
     batch_size: int = 20
     retry_base_seconds: int = 5
     retry_max_seconds: int = 3600
+    course_shortnames: tuple[str, ...] = ()
+    max_new_events_per_cycle: int = 100
 
     def __post_init__(self) -> None:
         if not isinstance(self.lease_seconds, int) or not 6 <= self.lease_seconds <= 3600:
@@ -43,6 +46,32 @@ class SchedulerOptions:
             or not self.retry_base_seconds <= self.retry_max_seconds <= 86400
         ):
             raise ValueError("retry maximum seconds are invalid")
+        if not isinstance(self.course_shortnames, tuple) or any(
+            not isinstance(item, str) or not item or item != item.upper() or not item.isascii()
+            or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" for character in item)
+            for item in self.course_shortnames
+        ):
+            raise ValueError("course shortnames are invalid")
+        if tuple(sorted(set(self.course_shortnames))) != self.course_shortnames:
+            raise ValueError("course shortnames must be sorted and unique")
+        if (
+            not isinstance(self.max_new_events_per_cycle, int)
+            or not 1 <= self.max_new_events_per_cycle <= 100
+        ):
+            raise ValueError("maximum new events per cycle is invalid")
+
+    @property
+    def scope_digest(self) -> str:
+        payload = json.dumps(
+            {
+                "course_shortnames": self.course_shortnames,
+                "max_new_events_per_cycle": self.max_new_events_per_cycle,
+                "version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +80,7 @@ class CycleResult:
     enqueued: int
     delivered: int
     delivery_failed: int
+    scope_digest: str = ""
 
     @property
     def ok(self) -> bool:
@@ -118,12 +148,19 @@ def once(
     scan_ok = True
     try:
         for assignment in service.assignments():
+            if (
+                selected.course_shortnames
+                and assignment.course_shortname not in selected.course_shortnames
+            ):
+                continue
+            if enqueued >= selected.max_new_events_per_cycle:
+                break
             if state.enqueue(draft_from_assignment(assignment), _clock(clock)) is not None:
                 enqueued += 1
     except Exception:  # Connector errors are deliberately not rendered to stdout/stderr.
         scan_ok = False
     delivered, failed = drain(state, sink, selected, clock=clock, owner=lease_owner)
-    return CycleResult(scan_ok, enqueued, delivered, failed)
+    return CycleResult(scan_ok, enqueued, delivered, failed, selected.scope_digest)
 
 
 def drain(
@@ -215,7 +252,7 @@ def run(
             try:
                 result = cycle(state, service, sink, selected, clock=clock)
             except Exception:
-                result = CycleResult(False, 0, 0, 1)
+                result = CycleResult(False, 0, 0, 1, selected.scope_digest)
             if emit_summary is not None:
                 emit_summary(result)
             wait(
@@ -237,6 +274,7 @@ def summary_json(result: CycleResult, stream: TextIO | None = None) -> None:
                 "enqueued": result.enqueued,
                 "delivered": result.delivered,
                 "delivery_failed": result.delivery_failed,
+                "scope_digest": result.scope_digest,
             },
             sort_keys=True,
             separators=(",", ":"),

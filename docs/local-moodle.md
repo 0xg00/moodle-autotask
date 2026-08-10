@@ -64,6 +64,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action B
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Status
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Smoke
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action AdvanceFixture
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action ExpandFixture
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Down
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Up
 ```
@@ -94,10 +95,37 @@ fixture and is not bootable; it tests lab-artifact routing without distributing 
 No private course content, person, password, or submission from either reference school is copied.
 
 The rich fixture is versioned and fail-closed. An exact v1 or v2 is idempotent; a reserved course,
-category, assignment, or file with unexpected content is `partial` and requires inspection or
-`Reset -Force`. To simulate a teacher updating the OVA task, run `AdvanceFixture` once. It keeps the
-stable task identity, changes its revision fields, and adds `revision-2.txt`; a second advance is
-rejected. Use `Reset -Force` followed by `Bootstrap` to return to v1.
+category, assignment, user, enrolment, file, or digest with unexpected content is `partial` and
+requires inspection or `Reset -Force`. To simulate a teacher updating the OVA task, run
+`AdvanceFixture` once. It keeps the stable task identity, changes its revision fields, and adds
+`revision-2.txt`; a second advance is rejected.
+
+`ExpandFixture` applies the declarative `infra/moodle/catalog-v3.json` catalog. It accepts only an
+exact v1, v2, or absent fixture: absent is seeded and advanced first, v1 is advanced to v2, and v2
+is expanded to v3. An exact v3 is a no-op. The PHP tool validates the complete JSON schema,
+identities, cardinalities, types, duplicate keys, and a canonical SHA-256 digest before it creates
+anything. A small JSON lexer rejects duplicate keys at every object depth after decoding escapes,
+so `"x"` and `"\\u0078"` cannot silently overwrite one another. Canonical JSON recursively sorts
+object keys, preserves array order, and uses unescaped Unicode and slashes. It stores that digest
+only after complete verification. Existing campaign users, course,
+assignments, partial migrations, or a changed catalog digest fail closed and are never overwritten.
+The wrapper copies both the PHP tool and catalog to fixed temporary container paths, verifies each
+SHA-256 value there, and removes both paths in `finally` cleanup.
+
+V3 creates `ASIX-CAMPAIGN-01`, four fictitious `@example.test` teachers with `editingteacher`, and
+11 new fictitious `@example.test` students with `student`; together with the existing `student1`,
+there are exactly 12 students enrolled in that course. Every newly created v3 account uses Moodle's
+non-interactive `nologin` authentication and has no usable password. The four deterministic
+campaign assignments are `central-report-success`, `windows-ssm-success`,
+`windows-command-failure`, and `ova-import-negative`. Its `negative.ova` attachment is a tiny
+text metadata fixture, not a real or bootable OVA. Use `Reset -Force` followed by `Bootstrap` to
+return to v1.
+
+An offset of `0` in either assignment date field means Moodle's no-date sentinel `0`; non-zero
+offsets are added to the stable fixture anchor. The same helper is used for creation and complete
+state verification. V3 creation and its version/digest configuration writes run in one delegated
+Moodle transaction, so an exception rolls them back; a residual v3 user, course module, course, or
+digest under a v1/v2 version is instead reported as `partial`.
 
 It creates only ignored `.runtime/moodle*` paths. `.runtime/moodle-secrets.json` holds generated
 admin and student passwords, while `.runtime/moodle-token.json` holds the mobile token. Neither is
@@ -185,8 +213,11 @@ must be running; the script neither changes Docker Desktop settings nor starts i
 
 The Moodle CLI seeds use supported core/course/manual-enrolment APIs to create `student1`, the
 base `ASIX-LAB` course, the public-structure-inspired ASIX category tree, 11 module courses, and 12
-assignments in total. Smoke verifies every enrollment, the exact rich assignment count, and the
-simulated OVA metadata. The script obtains a token from Moodle's official
+assignments in total. Before expansion, Smoke requires those exact 12 assignments. After
+`ExpandFixture`, Smoke requires the exact 16 assignments, four campaign assignments, and both
+simulated OVA metadata attachments. It resolves campaign assignment `cmid` values against the one
+official `core_course_get_contents` response for the campaign course and fails closed on a missing,
+duplicate, or mismatched module `idnumber`. The script obtains a token from Moodle's official
 `login/token.php` endpoint for service `moodle_mobile_app`, then verifies REST
 `core_webservice_get_site_info`, `core_enrol_get_users_courses`, and
 `core_course_get_contents`. Moodle exception and error responses fail the command.
@@ -221,7 +252,9 @@ credentials. Both commands accept `--lease-seconds` (default `30`, range `6` thr
 `--batch-size` (default `20`, range `1` through `100`), `--retry-base-seconds` (default `5`, range
 `1` through `3600`), and `--retry-max-seconds` (default `3600`, range from the base through
 `86400`). `--request-timeout-seconds` controls each Moodle transport request (default `15`, range
-`1` through `120`); local Docker Desktop bind mounts can require `60` or `120`. The durable outbox
+`1` through `120`); local Docker Desktop bind mounts can require `60` or `120`. The campaign
+controller pins an explicit `60` seconds because its post-restart Moodle site-info request can
+exceed the CLI default; this does not change the CLI default. The durable outbox
 has a fixed safety cap of `1000000` delivery attempts per event; it is
 not a command-line setting. A failed scan or delivery
 leaves events recoverable; `run` retries after the bounded retry-base delay, while successful cycles

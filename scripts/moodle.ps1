@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet('Bootstrap', 'Up', 'Down', 'Status', 'Smoke', 'AdvanceFixture', 'Reset')]
+    [ValidateSet('Bootstrap', 'Up', 'Down', 'Status', 'Smoke', 'AdvanceFixture', 'ExpandFixture', 'Reset')]
     [string]$Action = 'Status',
     [Parameter()]
     [switch]$Force
@@ -45,6 +45,7 @@ $InstallEvidencePath = Join-Path $RuntimeRoot 'moodle-install.json'
 $GitHooksRoot = Join-Path $RuntimeRoot 'moodle-git-hooks'
 $VersionsPath = Join-Path $RepoRoot 'infra/moodle/versions.psd1'
 $FixtureToolPath = Join-Path $RepoRoot 'infra/moodle/fixture.php'
+$FixtureCatalogV3Path = Join-Path $RepoRoot 'infra/moodle/catalog-v3.json'
 $Versions = $null
 if ($Action -eq 'Bootstrap') {
     $Versions = Read-MoodleVersions -Path $VersionsPath
@@ -1190,7 +1191,7 @@ function Get-MoodleDockerEnvironment {
         'COMPOSE_PROJECT_NAME' = $ProjectName
         'MOODLE_DOCKER_WEB_PORT' = $WebPort
         'MOODLE_DOCKER_WEB_HOST' = $BindIp
-        'MSYS2_ARG_CONV_EXCL' = '/var/www/html;/tmp/moodle-autotask-fixture.php'
+        'MSYS2_ARG_CONV_EXCL' = '/var/www/html;/tmp/moodle-autotask-fixture.php;/tmp/moodle-autotask-catalog-v3.json'
     }
 }
 
@@ -1236,34 +1237,44 @@ function Invoke-MoodleDocker {
 }
 
 function Invoke-RichFixtureTool {
-    param([Parameter(Mandatory = $true)][ValidateSet('state', 'ensure', 'seed', 'advance')][string]$FixtureAction)
+    param([Parameter(Mandatory = $true)][ValidateSet('state', 'ensure', 'seed', 'advance', 'expand')][string]$FixtureAction)
     Assert-ContainedNonReparsePath -Path $FixtureToolPath
+    Assert-ContainedNonReparsePath -Path $FixtureCatalogV3Path
     if (-not (Test-Path -LiteralPath $FixtureToolPath -PathType Leaf)) {
         Fail 'The committed rich Moodle fixture tool is missing.'
     }
+    if (-not (Test-Path -LiteralPath $FixtureCatalogV3Path -PathType Leaf)) {
+        Fail 'The committed v3 Moodle fixture catalog is missing.'
+    }
     $item = Get-Item -LiteralPath $FixtureToolPath -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        Fail 'Refusing a reparse-point rich Moodle fixture tool.'
+    $catalogItem = Get-Item -LiteralPath $FixtureCatalogV3Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($catalogItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'Refusing a reparse-point rich Moodle fixture input.'
     }
     $expectedHash = (Get-FileHash -LiteralPath $FixtureToolPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $expectedCatalogHash = (Get-FileHash -LiteralPath $FixtureCatalogV3Path -Algorithm SHA256).Hash.ToLowerInvariant()
     $containerPath = '/tmp/moodle-autotask-fixture.php'
-    $copied = $false
+    $catalogContainerPath = '/tmp/moodle-autotask-catalog-v3.json'
     try {
         Invoke-MoodleDocker -Arguments @('cp', (ConvertTo-BashPath -Path $FixtureToolPath), "webserver:$containerPath") | Out-Null
-        $copied = $true
+        Invoke-MoodleDocker -Arguments @('cp', (ConvertTo-BashPath -Path $FixtureCatalogV3Path), "webserver:$catalogContainerPath") | Out-Null
         $hashOutput = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'sha256sum', $containerPath)
         $actualHash = (($hashOutput | Select-Object -First 1) -split '\s+')[0].Trim().ToLowerInvariant()
+        $catalogHashOutput = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'sha256sum', $catalogContainerPath)
+        $actualCatalogHash = (($catalogHashOutput | Select-Object -First 1) -split '\s+')[0].Trim().ToLowerInvariant()
         if ($actualHash -ne $expectedHash) {
             Fail 'Rich Moodle fixture tool hash changed while copying it into the container.'
         }
-        return Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction)
+        if ($actualCatalogHash -ne $expectedCatalogHash) {
+            Fail 'Rich Moodle fixture catalog hash changed while copying it into the container.'
+        }
+        return Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction, $catalogContainerPath)
     } finally {
-        if ($copied) {
-            try {
-                Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', "if (is_file('$containerPath')) { unlink('$containerPath'); }") | Out-Null
-            } catch {
-                Write-Warning 'Could not remove the verified temporary fixture tool from the Moodle container.'
-            }
+        try {
+            Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', "foreach (['$containerPath', '$catalogContainerPath'] as `$path) { if (is_file(`$path)) { unlink(`$path); } }") | Out-Null
+        } catch {
+            Write-Warning 'Could not remove temporary rich fixture inputs from the Moodle container.'
         }
     }
 }
@@ -1470,7 +1481,7 @@ function Seed-Fixture {
         Fail 'Could not verify complete Moodle fixture state. Run Reset -Force.'
     }
     $richState = ((Invoke-RichFixtureTool -FixtureAction 'ensure') -join "`n").Trim()
-    if ($richState -notin @('complete-v1', 'complete-v2')) {
+    if ($richState -notin @('complete-v1', 'complete-v2', 'complete-v3')) {
         Fail 'Could not verify the rich local Moodle fixture. Run Reset -Force.'
     }
     Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', "$($Layout.CoreCliRoot)/admin/cli/reset_password.php", '--username=student1', "--password=$($Secrets.studentPassword)") | Out-Null
@@ -1541,6 +1552,52 @@ function Get-MoodleToken {
     Fail 'Could not obtain a Moodle mobile token from either detected local public endpoint.'
 }
 
+function Resolve-CampaignAssignmentIdNumbers {
+    param(
+        [Parameter(Mandatory = $true)][object]$CampaignCourse,
+        [Parameter(Mandatory = $true)][object[]]$Assignments,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedIdNumbers,
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][string]$Token
+    )
+    $courseIdText = [string]$CampaignCourse.id
+    if ($courseIdText -notmatch '^[1-9][0-9]*$') {
+        Fail 'Smoke test campaign course ID is invalid.'
+    }
+    $contents = Invoke-MoodleRest -BaseUrl $BaseUrl -Token $Token -Function 'core_course_get_contents' -Parameters @{ courseid = [int]$courseIdText }
+    $modulesByCmid = @{}
+    foreach ($module in @($contents | ForEach-Object { $_.modules })) {
+        if ([string]$module.modname -ne 'assign') {
+            continue
+        }
+        $cmidText = [string]$module.id
+        $idnumber = [string]$module.idnumber
+        if ($cmidText -notmatch '^[1-9][0-9]*$' -or [string]::IsNullOrWhiteSpace($idnumber) -or
+            $modulesByCmid.ContainsKey($cmidText)) {
+            Fail 'Smoke test campaign assignment module metadata is invalid.'
+        }
+        $modulesByCmid[$cmidText] = $idnumber
+    }
+    $resolved = @()
+    $seenCmids = @{}
+    foreach ($assignment in $Assignments) {
+        $cmidText = [string]$assignment.cmid
+        if ($cmidText -notmatch '^[1-9][0-9]*$' -or $seenCmids.ContainsKey($cmidText) -or
+            -not $modulesByCmid.ContainsKey($cmidText)) {
+            Fail 'Smoke test campaign assignment module mapping is invalid.'
+        }
+        $seenCmids[$cmidText] = $true
+        $resolved += [PSCustomObject]@{ Assignment = $assignment; IdNumber = $modulesByCmid[$cmidText] }
+    }
+    $actualIdNumbers = @($resolved | ForEach-Object { [string]$_.IdNumber } | Sort-Object -Unique)
+    if ($resolved.Count -ne $ExpectedIdNumbers.Count -or $actualIdNumbers.Count -ne $ExpectedIdNumbers.Count -or
+        (@($actualIdNumbers | Where-Object { $_ -cnotin $ExpectedIdNumbers }).Count -ne 0) -or
+        (@($ExpectedIdNumbers | Where-Object { $_ -cnotin $actualIdNumbers }).Count -ne 0)) {
+        Fail 'Smoke test campaign assignment ID numbers are invalid.'
+    }
+    return $resolved
+}
+
 function Invoke-Smoke {
     if (-not (Test-Path -LiteralPath $TokenPath -PathType Leaf)) {
         Fail 'No local Moodle token exists. Run Bootstrap first.'
@@ -1594,7 +1651,35 @@ function Invoke-Smoke {
     if ($null -eq $ovaAssignment -or $ovaFiles -notcontains 'asix-router-lab.ova') {
         Fail 'Smoke test did not receive the simulated OVA attachment metadata.'
     }
-    Write-Output "Moodle REST smoke passed for 12 assignments across the base and ASIX fixtures at $baseUrl."
+    $allAssignments = @($assignmentsPayload.courses | ForEach-Object { $_.assignments })
+    $campaignCourse = @($assignmentsPayload.courses | Where-Object { $_.shortname -eq 'ASIX-CAMPAIGN-01' }) | Select-Object -First 1
+    if ($null -eq $campaignCourse) {
+        if ($allAssignments.Count -ne 12) {
+            Fail 'Smoke test did not receive the exact 12 assignments before fixture v3 expansion.'
+        }
+        Write-Output "Moodle REST smoke passed for 12 assignments across the base and ASIX fixtures at $baseUrl."
+        return
+    }
+    $campaignAssignments = @($campaignCourse.assignments)
+    $expectedCampaignIds = @(
+        'central-report-success', 'windows-ssm-success', 'windows-command-failure', 'ova-import-negative'
+    )
+    $resolvedCampaignAssignments = @(
+        Resolve-CampaignAssignmentIdNumbers -CampaignCourse $campaignCourse -Assignments $campaignAssignments -ExpectedIdNumbers $expectedCampaignIds -BaseUrl $baseUrl -Token $tokenData.token
+    )
+    $actualCampaignIds = @($resolvedCampaignAssignments | ForEach-Object { [string]$_.IdNumber } | Sort-Object)
+    if ($allAssignments.Count -ne 16 -or $campaignAssignments.Count -ne 4 -or
+        $resolvedCampaignAssignments.Count -ne 4 -or
+        (@($actualCampaignIds | Where-Object { $_ -cnotin $expectedCampaignIds }).Count -ne 0) -or
+        (@($expectedCampaignIds | Where-Object { $_ -cnotin $actualCampaignIds }).Count -ne 0)) {
+        Fail 'Smoke test did not receive the exact 16 assignments after fixture v3 expansion.'
+    }
+    $negative = @($resolvedCampaignAssignments | Where-Object { $_.IdNumber -eq 'ova-import-negative' }) | Select-Object -First 1
+    $negativeFiles = if ($null -eq $negative) { @() } else { @($negative.Assignment.introattachments | ForEach-Object { [string]$_.filename }) }
+    if ($null -eq $negative -or $negativeFiles -notcontains 'negative.ova') {
+        Fail 'Smoke test did not receive the v3 metadata-only OVA attachment.'
+    }
+    Write-Output "Moodle REST smoke passed for 16 assignments across the base and expanded ASIX fixtures at $baseUrl."
 }
 
 function Assert-ResetTarget {
@@ -1723,6 +1808,17 @@ switch ($Action) {
         $result = ((Invoke-RichFixtureTool -FixtureAction 'advance') -join "`n").Trim()
         if ($result -ne 'rich-fixture-advanced') {
             Fail 'Rich fixture did not advance to revision 2.'
+        }
+        Invoke-Smoke
+    }
+    'ExpandFixture' {
+        Assert-NoMoodleDockerLocalOverride
+        $script:Versions = Read-MoodleVersions -Path $VersionsPath
+        Assert-NormalMoodleDockerExecutionTrust
+        Assert-DockerDaemon
+        $result = ((Invoke-RichFixtureTool -FixtureAction 'expand') -join "`n").Trim()
+        if ($result -ne 'rich-fixture-expanded') {
+            Fail 'Rich fixture did not expand to revision 3.'
         }
         Invoke-Smoke
     }
