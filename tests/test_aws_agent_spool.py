@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import threading
@@ -868,3 +870,48 @@ def test_concurrent_dispatch_intent_has_one_send_command(
     assert len(executor.waits) >= 1
     dispatch = json.loads((jobs / "dispatches" / f"{report_id}.json").read_text("utf-8"))
     assert dispatch["commandId"] == "12345678-1234-1234-1234-123456789abc"
+
+
+@pytest.mark.parametrize("collision_errno", [errno.EEXIST, errno.ENOTEMPTY])
+@pytest.mark.parametrize("tampered", [False, True])
+def test_concurrent_job_publish_converges_only_on_exact_existing_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_errno: int,
+    tampered: bool,
+) -> None:
+    jobs = tmp_path / "jobs"
+    results = tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    original_rename = Path.rename
+
+    def competing_publish(temporary: Path, target: Path) -> Path:
+        assert temporary.parent == jobs
+        assert temporary.name.startswith(".")
+        assert not target.exists()
+        shutil.copytree(temporary, target)
+        if tampered:
+            (target / "job.json").write_bytes(b'{"tampered":true}')
+        raise OSError(collision_errno, os.strerror(collision_errno))
+
+    monkeypatch.setattr(Path, "rename", competing_publish)
+
+    if tampered:
+        with pytest.raises(AgentSpoolError, match="concurrent agent job conflicts"):
+            broker.step(
+                event, _prepared(event, runner), ExecutionMode.CENTRAL, None, _LabExecutor()
+            )
+    else:
+        progress = broker.step(
+            event, _prepared(event, runner), ExecutionMode.CENTRAL, None, _LabExecutor()
+        )
+        assert progress.status == "pending"
+        assert len(runner.calls) == 1
+
+    assert len([path for path in jobs.iterdir() if path.name.startswith(".")]) == 0
+    if tampered:
+        job = next(path for path in jobs.iterdir() if not path.name.startswith("."))
+        assert (job / "job.json").read_bytes() == b'{"tampered":true}'
+    monkeypatch.setattr(Path, "rename", original_rename)

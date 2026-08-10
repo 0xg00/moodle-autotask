@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -328,7 +329,12 @@ class FileAgentBroker:
             try:
                 temporary.rename(target)
                 _fsync_directory(self.jobs_root)
-            except FileExistsError:
+            except OSError as error:
+                if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                assert_no_indirection(target)
+                if not target.is_dir():
+                    raise AgentSpoolError("concurrent agent job is unsafe") from None
                 existing = _read_regular(target / "job.json", _MAX_RESULT_BYTES)
                 if existing != encoded:
                     raise AgentSpoolError("concurrent agent job conflicts") from None
