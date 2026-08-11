@@ -72,6 +72,13 @@ blind second save. Telegram uses long polling over outbound HTTPS;
 the controller exposes no webhook or inbound port. Bot credentials are read only from a protected
 file and never accepted as a command-line value or placed in callback data.
 
+Controller liveness is independent of journal export and CloudWatch Agent: a root-owned
+one-minute systemd publisher evaluates four fixed service heartbeats, exact systemd state,
+and restart-counter stability. A root-owned presence marker is the activation boundary:
+present requires all four applications healthy; absent requires all four disabled and
+inactive. The publisher emits only bounded aggregate/service health measurements through
+the controller instance role; missing measurements are an alarm condition.
+
 The controller's normal lab cleanup deadline is a soft operational target two hours after
 execution. A separate Terraform-owned EventBridge Lambda provides a controller- and SQLite-
 independent hard cost guard: every five minutes it paginates EC2, defensively rechecks the exact

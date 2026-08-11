@@ -34,7 +34,7 @@ def _parser() -> _SafeArgumentParser:
         child.add_argument("--config-file", type=Path, required=True)
         child.add_argument("--state", type=Path, required=True)
         if command == "run":
-            child.add_argument("--poll-timeout-seconds", type=int, default=30)
+            child.add_argument("--poll-timeout-seconds", type=int, default=50)
             child.add_argument("--retry-seconds", type=int, default=5)
     return parser
 

@@ -237,6 +237,64 @@ RestrictSUIDSGID=true
 WantedBy=multi-user.target
 UNIT
 
+# Pre-created files are writable only through the owning service group.  The
+# directory itself is root-owned and non-writable, so applications cannot add
+# or replace heartbeat paths.
+if ! id --user moodle-agent >/dev/null 2>&1; then
+  useradd --system --home-dir /var/lib/moodle-agent --create-home --shell /usr/sbin/nologin moodle-agent
+fi
+install -d -o root -g root -m 0711 /run/${project_name}-health
+install -o root -g ${project_name} -m 0620 /dev/null /run/${project_name}-health/scheduler
+install -o root -g ${project_name} -m 0620 /dev/null /run/${project_name}-health/telegram
+install -o root -g ${project_name} -m 0620 /dev/null /run/${project_name}-health/worker
+install -o root -g moodle-agent -m 0620 /dev/null /run/${project_name}-health/agent
+
+cat >/usr/local/sbin/${project_name}-health-publish <<'HEALTH'
+#!/usr/bin/env bash
+set -euo pipefail
+root=/run/moodle-autotask-health
+test -d "$root" && test ! -L "$root" && test "$(stat -c '%u:%a' "$root")" = 0:711
+token="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)"
+instance="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id)"
+[[ "$instance" =~ ^i-[0-9a-f]+$ ]]
+metrics='['; aggregate=1
+for item in scheduler:moodle-autotask telegram:moodle-autotask worker:moodle-autotask agent:moodle-agent; do
+  service="$${item%%:*}"; group="$${item#*:}"; path="$root/$service"; healthy=1
+  gid="$(getent group "$group" | cut -d: -f3)"; test -n "$gid"; test ! -L "$path"
+  test "$(stat -c '%F:%u:%g:%a:%s' "$path")" = "regular empty file:0:$gid:620:0" || healthy=0
+  ! systemctl is-enabled --quiet "moodle-autotask-$service.service" && ! systemctl is-active --quiet "moodle-autotask-$service.service" || healthy=0
+  [ "$healthy" = 1 ] || aggregate=0
+  metrics+="{\"MetricName\":\"ServiceStateMatchesExpectation\",\"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$instance\"},{\"Name\":\"Service\",\"Value\":\"$service\"}],\"Value\":$healthy},"
+done
+metrics+="{\"MetricName\":\"ControllerStateMatchesExpectation\",\"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$instance\"},{\"Name\":\"Service\",\"Value\":\"aggregate\"}],\"Value\":$aggregate},{\"MetricName\":\"ServicesExpectedRunning\",\"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$instance\"},{\"Name\":\"Service\",\"Value\":\"aggregate\"}],\"Value\":0}]"
+file="$(mktemp "$root/.metrics.XXXXXX")"; trap 'rm -f "$file"' EXIT
+printf %s "$metrics" >"$file"
+aws cloudwatch put-metric-data --region "${region}" --namespace MoodleAutotask/Controller --metric-data "file://$file"
+HEALTH
+chmod 0750 /usr/local/sbin/${project_name}-health-publish
+cat >/etc/systemd/system/${project_name}-health.service <<'UNIT'
+[Unit]
+Description=Moodle Autotask controller health publisher
+After=network-online.target
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/moodle-autotask-health-publish
+UNIT
+cat >/etc/systemd/system/${project_name}-health.timer <<'UNIT'
+[Unit]
+Description=Publish Moodle Autotask controller health every minute
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=moodle-autotask-health.service
+[Install]
+WantedBy=timers.target
+UNIT
+
 systemctl daemon-reload
+systemctl enable --now ${project_name}-health.timer
 touch /var/lib/${project_name}/bootstrap-complete
 chown ${project_name}:${project_name} /var/lib/${project_name}/bootstrap-complete

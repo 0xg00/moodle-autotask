@@ -56,6 +56,25 @@ def test_controller_scheduler_pins_a_campaign_safe_moodle_timeout() -> None:
     assert "--request-timeout-seconds 60" in cloud_init
 
 
+def test_controller_health_is_root_published_and_missing_metric_is_breaching() -> None:
+    cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(encoding="utf-8")
+    iam = (AWS_ROOT / "controller" / "iam.tf").read_text(encoding="utf-8")
+    health = (AWS_ROOT / "controller" / "controller_health.tf").read_text(encoding="utf-8")
+
+    assert "/run/${project_name}-health" in cloud_init
+    assert "${project_name}-health.timer" in cloud_init
+    assert "enable --now ${project_name}-health.timer" in cloud_init
+    assert 'actions   = ["cloudwatch:PutMetricData"]' in iam
+    assert 'variable = "cloudwatch:namespace"' in iam
+    assert 'values   = ["MoodleAutotask/Controller"]' in iam
+    assert 'metric_name         = "ControllerStateMatchesExpectation"' in health
+    assert 'statistic           = "Minimum"' in health
+    assert "period              = 60" in health
+    assert "evaluation_periods  = 5" in health and "datapoints_to_alarm = 3" in health
+    assert 'treat_missing_data  = "breaching"' in health
+    assert 'Service    = "aggregate"' in health
+
+
 def test_controller_scheduler_scope_is_explicit_and_has_no_fixture_hardcode() -> None:
     cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(encoding="utf-8")
     compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")

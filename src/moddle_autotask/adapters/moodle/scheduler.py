@@ -13,6 +13,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, TextIO
 
+from moddle_autotask.health import pulse
+
 from .models import MoodleAssignmentSnapshot
 from .state import MoodleState, NotificationAttachment, NotificationDraft, OutboxClaim
 
@@ -271,17 +273,24 @@ def run(
     selected = options or SchedulerOptions()
     while True:
         try:
+            pulse("scheduler")
             try:
                 result = cycle(state, service, sink, selected, clock=clock)
             except Exception:
                 result = CycleResult(False, 0, 0, 1, selected.scope_digest)
             if emit_summary is not None:
                 emit_summary(result)
-            wait(
+            delay = (
                 interval_seconds
                 if result.ok
                 else min(selected.retry_base_seconds, interval_seconds)
             )
+            while delay > 0:
+                slice_seconds = min(delay, 60)
+                pulse("scheduler")
+                wait(slice_seconds)
+                delay -= slice_seconds
+                pulse("scheduler")
         except KeyboardInterrupt:
             return
 

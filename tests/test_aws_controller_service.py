@@ -39,12 +39,16 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     agent = tmp_path / "etc/systemd/system/moodle-autotask-agent.service"
     scheduler = tmp_path / "etc/systemd/system/moodle-autotask-scheduler.service"
     telegram = tmp_path / "etc/systemd/system/moodle-autotask-telegram.service"
+    health = tmp_path / "usr/local/sbin/moodle-autotask-health-publish"
+    health_unit = tmp_path / "etc/systemd/system/moodle-autotask-health.service"
+    health_timer = tmp_path / "etc/systemd/system/moodle-autotask-health.timer"
     refresh_text = refresh.read_text(encoding="utf-8")
     scheduler_text = scheduler.read_text(encoding="utf-8")
     telegram_text = telegram.read_text(encoding="utf-8")
     codex_installer_text = codex_installer.read_text(encoding="utf-8")
     codex_login_text = codex_login.read_text(encoding="utf-8")
     agent_text = agent.read_text(encoding="utf-8")
+    health_text = health.read_text(encoding="utf-8")
 
     assert "moodle-autotask/development/moodle-token" in refresh_text
     assert "moodle-autotask/development/telegram-config" in refresh_text
@@ -60,6 +64,16 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "ASIX-CAMPAIGN-01" not in scheduler_text
     assert "--max-new-events-per-cycle" not in scheduler_text
     assert "moodle-autotask-telegram run" in telegram_text
+    assert "MoodleAutotask/Controller" in health_text
+    assert "cloudwatch put-metric-data" in health_text
+    assert "ControllerStateMatchesExpectation" in health_text
+    assert "ServicesExpectedRunning" in health_text
+    assert "ServiceStateMatchesExpectation" in health_text
+    assert "NRestarts" in health_text and "moodle-autotask-health" in health_text
+    assert "ExecStartPre=/usr/local/sbin/moodle-autotask-health-prepare" in (
+        health_unit.read_text(encoding="utf-8")
+    )
+    assert "OnUnitActiveSec=60s" in health_timer.read_text(encoding="utf-8")
     assert "rust-v0.147.0/codex-x86_64-unknown-linux-musl.tar.gz" in codex_installer_text
     assert "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36" in (
         codex_installer_text

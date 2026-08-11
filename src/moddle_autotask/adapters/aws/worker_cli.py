@@ -15,6 +15,7 @@ from moddle_autotask.adapters.moodle.approval_state import ApprovalState
 from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
 from moddle_autotask.adapters.moodle.submission import MoodleSubmissionClient
 from moddle_autotask.adapters.moodle.telegram import TelegramClient, TelegramConfig
+from moddle_autotask.health import pulse
 
 from .agent_spool import FileAgentBroker
 from .artifacts import AwsMoodleArtifactPreparer
@@ -108,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         owner = f"{socket.gethostname()}:{os.getpid()}"
         while True:
+            pulse("worker")
             cycle = process_one(
                 state,
                 provider,

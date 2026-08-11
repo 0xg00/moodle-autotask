@@ -276,6 +276,30 @@ one ephemeral Codex request:
 
 ## Verify operations
 
+## Controller application health
+
+The controller has a root-owned `moodle-autotask-health.service` oneshot and a
+60-second timer. It sends one bounded `PutMetricData` batch in the
+`MoodleAutotask/Controller` namespace, with only `InstanceId` and `Service`
+dimensions. `ControllerStateMatchesExpectation`, `ServicesExpectedRunning`, and
+one `ServiceStateMatchesExpectation` series for scheduler, Telegram receiver,
+worker, and agent are intentionally free of
+task, Moodle, Telegram, and user content. IMDSv2, AWS CLI, and IAM failures
+make the publisher fail, so the Terraform alarm treats missing metrics as
+breaching.
+
+The four applications only update the mtime of fixed, root-owned empty files
+under `/run/moodle-autotask-health`; they cannot create the directory or
+replace paths. With `/var/lib/moodle-autotask/health-enabled` absent, all four
+application units must be disabled and inactive. `Activate` starts and enables
+all four, waits for their first pulse, then atomically creates that marker and
+enables the health timer. `Deactivate` stops and disables every application,
+verifies that state, then removes the marker. The health alarm is created only
+after the application deployment: deploy the application first, then Terraform.
+Fresh cloud-init enables a bootstrap publisher which reports healthy only while
+all four application services are disabled and inactive. Deployment replaces it
+with the canonical publisher before activation.
+
 Wait until the instance appears as `Online` in Systems Manager, then use the output command:
 
 ```powershell

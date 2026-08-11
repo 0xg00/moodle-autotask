@@ -70,6 +70,8 @@ def install_controller_services(
     agent = _agent_unit()
     scheduler = _scheduler_unit()
     telegram = _telegram_unit()
+    health = _health_publisher_script(region)
+    health_prepare = _health_prepare_script()
     _write(root, Path("usr/local/sbin/moodle-autotask-refresh-config"), refresh, 0o750)
     _write(
         root,
@@ -107,6 +109,20 @@ def install_controller_services(
         root,
         Path("etc/systemd/system/moodle-autotask-telegram.service"),
         telegram,
+        0o644,
+    )
+    _write(root, Path("usr/local/sbin/moodle-autotask-health-publish"), health, 0o750)
+    _write(root, Path("usr/local/sbin/moodle-autotask-health-prepare"), health_prepare, 0o750)
+    _write(
+        root,
+        Path("etc/systemd/system/moodle-autotask-health.service"),
+        _health_unit(),
+        0o644,
+    )
+    _write(
+        root,
+        Path("etc/systemd/system/moodle-autotask-health.timer"),
+        _health_timer_unit(),
         0o644,
     )
 
@@ -440,6 +456,138 @@ def _codex_login_unit() -> str:
     )
 
 
+def _health_publisher_script(region: str) -> str:
+    selected_region = shlex.quote(region)
+    return f'''#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+root=/run/moodle-autotask-health
+marker=/var/lib/moodle-autotask/health-enabled
+state=/var/lib/moodle-autotask/health-state
+services=(scheduler telegram worker agent)
+thresholds=(180 180 3900 2100)
+safe_dir() {{ test -d "$1" && test ! -L "$1" && test "$(stat -c '%u:%a' "$1")" = "$2"; }}
+safe_dir "$root" '0:711'
+if [ -e "$state" ] || [ -L "$state" ]; then
+  safe_dir "$state" '0:700'
+else
+  install -d -o root -g root -m 0700 "$state"
+fi
+expected=0
+if [ -e "$marker" ] || [ -L "$marker" ]; then
+  test -f "$marker" && test ! -L "$marker" && test ! -s "$marker"
+  test "$(stat -c '%u:%a' "$marker")" = '0:600'
+  expected=1
+fi
+token="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \\
+  -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \\
+  http://169.254.169.254/latest/api/token)"
+instance="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \\
+  -H "X-aws-ec2-metadata-token: $token" \\
+  http://169.254.169.254/latest/meta-data/instance-id)"
+[[ "$instance" =~ ^i-[0-9a-f]+$ ]]
+now="$(date +%s)"; aggregate=1; metric_data='['
+for index in "${{!services[@]}}"; do
+  service="${{services[$index]}}"
+  threshold="${{thresholds[$index]}}"
+  unit="moodle-autotask-$service.service"; healthy=1
+  group=moodle-autotask; [ "$service" = agent ] && group=moodle-agent
+  pulse="$root/$service"; gid="$(getent group "$group" | cut -d: -f3)"
+  test -n "$gid"; test ! -L "$pulse"
+  metadata="$(stat -c '%F:%u:%g:%a:%s:%Y' "$pulse" 2>/dev/null || true)"; mtime="${{metadata##*:}}"
+  [[ "$metadata" = regular\\ empty\\ file:0:$gid:620:0:* && "$mtime" =~ ^[0-9]+$ ]] || healthy=0
+  mapfile -t details < <(systemctl show "$unit" --property=ActiveState \\
+    --property=SubState --property=NRestarts --value 2>/dev/null || true)
+  restarts="${{details[2]:-invalid}}"
+  if [ "$expected" -eq 1 ]; then
+    systemctl is-enabled --quiet "$unit" && [ "${{details[0]:-}}" = active ] \\
+      && [ "${{details[1]:-}}" = running ] || healthy=0
+    [ $((now-mtime)) -le "$threshold" ] 2>/dev/null || healthy=0
+    [[ "$restarts" =~ ^[0-9]+$ ]] || healthy=0
+    restart_file="$state/$service"; changed=$((now-300))
+    if [ -e "$restart_file" ] || [ -L "$restart_file" ]; then
+      test -f "$restart_file" && test ! -L "$restart_file" \\
+        && test "$(stat -c '%u:%a' "$restart_file")" = '0:600'
+      read -r prior changed <"$restart_file" || healthy=0
+      [[ "$prior" =~ ^[0-9]+$ && "$changed" =~ ^[0-9]+$ ]] || healthy=0
+      [ "$prior" = "$restarts" ] || changed="$now"
+    fi
+    temporary="$(mktemp "$state/.$service.XXXXXX")"
+    printf '%s %s\\n' "$restarts" "$changed" >"$temporary"
+    chmod 0600 "$temporary"; chown root:root "$temporary"
+    mv -f "$temporary" "$restart_file"
+    [ $((now-changed)) -ge 300 ] || healthy=0
+  else
+    ! systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit" || healthy=0
+  fi
+  [ "$healthy" -eq 1 ] || aggregate=0
+  metric_data+="{{\\\"MetricName\\\":\\\"ServiceStateMatchesExpectation\\\",\\\"Dimensions\\\":[{{\\\"Name\\\":\\\"InstanceId\\\",\\\"Value\\\":\\\"$instance\\\"}},{{\\\"Name\\\":\\\"Service\\\",\\\"Value\\\":\\\"$service\\\"}}],\\\"Value\\\":$healthy}},"
+done
+metric_data+="{{\\\"MetricName\\\":\\\"ControllerStateMatchesExpectation\\\",\\\"Dimensions\\\":[{{\\\"Name\\\":\\\"InstanceId\\\",\\\"Value\\\":\\\"$instance\\\"}},{{\\\"Name\\\":\\\"Service\\\",\\\"Value\\\":\\\"aggregate\\\"}}],\\\"Value\\\":$aggregate}},{{\\\"MetricName\\\":\\\"ServicesExpectedRunning\\\",\\\"Dimensions\\\":[{{\\\"Name\\\":\\\"InstanceId\\\",\\\"Value\\\":\\\"$instance\\\"}},{{\\\"Name\\\":\\\"Service\\\",\\\"Value\\\":\\\"aggregate\\\"}}],\\\"Value\\\":$expected}}]"
+temp="$(mktemp "$root/.metrics.XXXXXX")"; trap 'rm -f "$temp"' EXIT
+printf '%s' "$metric_data" >"$temp"
+aws cloudwatch put-metric-data --region {selected_region} \\
+  --namespace MoodleAutotask/Controller --metric-data "file://$temp"
+'''
+
+
+def _health_prepare_script() -> str:
+    return """#!/usr/bin/env bash
+set -euo pipefail
+root=/run/moodle-autotask-health
+if [ -e "$root" ] || [ -L "$root" ]; then
+  test -d "$root" && test ! -L "$root" && test "$(stat -c '%u:%a' "$root")" = '0:711'
+else
+  install -d -o root -g root -m 0711 "$root"
+fi
+for item in scheduler:moodle-autotask telegram:moodle-autotask \\
+  worker:moodle-autotask agent:moodle-agent; do
+  name="${item%%:*}"; group="${item#*:}"; path="$root/$name"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    test -f "$path" && test ! -L "$path" && test ! -s "$path"
+    test "$(stat -c '%u:%G:%a' "$path")" = "0:$group:620"
+  else
+    install -o root -g "$group" -m 0620 /dev/null "$path"
+  fi
+done
+"""
+
+
+def _health_unit() -> str:
+    return """[Unit]
+Description=Moodle Autotask controller health publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/moodle-autotask-health-publish
+ExecStartPre=/usr/local/sbin/moodle-autotask-health-prepare
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/moodle-autotask-health /var/lib/moodle-autotask
+"""
+
+
+def _health_timer_unit() -> str:
+    return """[Unit]
+Description=Publish Moodle Autotask controller health every minute
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=moodle-autotask-health.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
 def _scheduler_unit() -> str:
     command = " ".join(
         (
@@ -479,7 +627,8 @@ def _scheduler_unit() -> str:
             "ProtectKernelModules=true",
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
-            "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock",
+            "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock "
+            "/run/moodle-autotask-health",
             "RestrictSUIDSGID=true",
             "",
             "[Install]",
@@ -529,7 +678,8 @@ def _agent_unit() -> str:
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
             "ReadOnlyPaths=/var/spool/moodle-autotask/jobs /etc/codex",
-            "ReadWritePaths=/var/lib/moodle-agent /var/spool/moodle-autotask/results",
+            "ReadWritePaths=/var/lib/moodle-agent /var/spool/moodle-autotask/results "
+            "/run/moodle-autotask-health",
             "IPAddressDeny=169.254.169.254/32",
             "IPAddressDeny=fd00:ec2::254/128",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
@@ -574,7 +724,8 @@ def _telegram_unit() -> str:
             "ProtectKernelModules=true",
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
-            "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock",
+            "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock "
+            "/run/moodle-autotask-health",
             "RestrictSUIDSGID=true",
             "",
             "[Install]",
@@ -654,7 +805,7 @@ def _worker_unit(
             "ProtectKernelTunables=true",
             "ProtectSystem=strict",
             "ReadWritePaths=/var/lib/moodle-autotask /etc/moodle-autotask /run/lock "
-            "/var/spool/moodle-autotask/jobs",
+            "/var/spool/moodle-autotask/jobs /run/moodle-autotask-health",
             "RestrictSUIDSGID=true",
             "",
             "[Install]",

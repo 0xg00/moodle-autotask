@@ -61,6 +61,19 @@ data "aws_iam_policy_document" "controller" {
       aws_secretsmanager_secret.telegram_config.arn,
     ]
   }
+
+  statement {
+    sid       = "PublishControllerHealthOnly"
+    effect    = "Allow"
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["MoodleAutotask/Controller"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "controller" {

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Never, cast
 
 from moddle_autotask.adapters.moodle.path_safety import assert_no_indirection
+from moddle_autotask.health import pulse
 
 from .agent_spool import (
     AgentSpoolError,
@@ -84,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             args.timeout_seconds,
         )
         while True:
+            pulse("agent")
             result = runner.process_one()
             print(
                 json.dumps(

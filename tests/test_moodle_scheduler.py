@@ -297,6 +297,69 @@ def test_run_recovers_without_leaking_error() -> None:
     assert "SENTINEL_SECRET" not in stream.getvalue()
 
 
+def test_run_pulses_before_its_first_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    def cycle(*args: object, **kwargs: object) -> CycleResult:
+        assert events == ["pulse"]
+        events.append("cycle")
+        return CycleResult(True, 0, 0, 0)
+
+    def wait(value: float) -> None:
+        assert value == 1
+        events.append("wait")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scheduler_module, "pulse", lambda service: events.append("pulse"))
+    run(
+        cast(MoodleState, object()),
+        cast(Any, object()),
+        cast(Any, object()),
+        interval_seconds=1,
+        wait=wait,
+        cycle=cycle,
+    )
+    assert events == ["pulse", "cycle", "pulse", "wait"]
+
+
+def test_run_pulses_around_each_long_wait_slice(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    waits: list[float] = []
+
+    def cycle(*args: object, **kwargs: object) -> CycleResult:
+        events.append("cycle")
+        return CycleResult(True, 0, 0, 0)
+
+    def wait(value: float) -> None:
+        waits.append(value)
+        events.append(f"wait-{value:g}")
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(scheduler_module, "pulse", lambda service: events.append("pulse"))
+    run(
+        cast(MoodleState, object()),
+        cast(Any, object()),
+        cast(Any, object()),
+        interval_seconds=125,
+        wait=wait,
+        cycle=cycle,
+    )
+    assert waits == [60, 60, 5]
+    assert events == [
+        "pulse",
+        "cycle",
+        "pulse",
+        "wait-60",
+        "pulse",
+        "pulse",
+        "wait-60",
+        "pulse",
+        "pulse",
+        "wait-5",
+    ]
+
+
 def test_run_interrupts_cleanly_during_recovery_backoff() -> None:
     stream = StringIO()
     waits: list[float] = []

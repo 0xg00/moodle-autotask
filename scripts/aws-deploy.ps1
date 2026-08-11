@@ -193,16 +193,68 @@ function New-SchedulerConfigGuardCommand {
     )
 
     return (@'
-scheduler_was_active=false; telegram_was_active=false; worker_was_active=false; agent_was_active=false; agent_unit_was_present=false; legacy_three_was_active=false; scheduler_config_backup=""; scheduler_config_candidate=""; scheduler_config_backup_complete=false
+scheduler_was_active=false; telegram_was_active=false; worker_was_active=false; agent_was_active=false; scheduler_was_enabled=false; telegram_was_enabled=false; worker_was_enabled=false; agent_was_enabled=false; agent_unit_was_present=false; legacy_three_was_active=false; scheduler_config_backup=""; scheduler_config_candidate=""; scheduler_config_backup_complete=false; scheduler_config_prior_absent=false; health_marker=/var/lib/moodle-autotask/health-enabled; health_marker_was_present=false; health_marker_prior_absent=false; health_marker_backup=""; health_marker_candidate=""; health_marker_backup_complete=false
 if systemctl is-active --quiet moodle-autotask-scheduler.service; then scheduler_was_active=true; fi
 if systemctl is-active --quiet moodle-autotask-telegram.service; then telegram_was_active=true; fi
 if systemctl is-active --quiet moodle-autotask-worker.service; then worker_was_active=true; fi
 if systemctl cat moodle-autotask-agent.service >/dev/null 2>&1; then agent_unit_was_present=true; fi
 if systemctl is-active --quiet moodle-autotask-agent.service; then agent_was_active=true; fi
+if systemctl is-enabled --quiet moodle-autotask-scheduler.service; then scheduler_was_enabled=true; fi
+if systemctl is-enabled --quiet moodle-autotask-telegram.service; then telegram_was_enabled=true; fi
+if systemctl is-enabled --quiet moodle-autotask-worker.service; then worker_was_enabled=true; fi
+if systemctl is-enabled --quiet moodle-autotask-agent.service; then agent_was_enabled=true; fi
 if [ "$agent_unit_was_present" = false ] && [ "$scheduler_was_active" = true ] && [ "$telegram_was_active" = true ] && [ "$worker_was_active" = true ]; then legacy_three_was_active=true; fi
-restore_scheduler_config() { result=$?; trap - EXIT; if [ -n "$scheduler_config_candidate" ]; then rm -f "$scheduler_config_candidate" || true; fi; if [ "$scheduler_config_backup_complete" = true ]; then systemctl stop moodle-autotask-scheduler.service || true; mv -f "$scheduler_config_backup" __CONFIG_PATH__ || true; fi; if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service || true; fi; if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service || true; fi; if [ "$worker_was_active" = true ]; then systemctl start moodle-autotask-worker.service || true; fi; if [ "$agent_was_active" = true ]; then systemctl start moodle-autotask-agent.service || true; fi; exit "$result"; }; trap restore_scheduler_config EXIT
-if [ -e __CONFIG_PATH__ ] || [ -L __CONFIG_PATH__ ]; then test -f __CONFIG_PATH__ && test ! -L __CONFIG_PATH__ || exit 1; scheduler_config_candidate=$(mktemp "$(dirname __CONFIG_PATH__)/.scheduler.candidate.XXXXXX"); cp -p __CONFIG_PATH__ "$scheduler_config_candidate"; scheduler_config_backup="$scheduler_config_candidate"; scheduler_config_candidate=""; scheduler_config_backup_complete=true; fi
+restore_scheduler_config() { result=$?; trap - EXIT; systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; if [ -n "$scheduler_config_candidate" ]; then rm -f "$scheduler_config_candidate" || true; fi; if [ -n "$health_marker_candidate" ]; then rm -f "$health_marker_candidate" || true; fi; if [ "$scheduler_config_backup_complete" = true ]; then mv -f "$scheduler_config_backup" __CONFIG_PATH__ || true; elif [ "$scheduler_config_prior_absent" = true ]; then rm -f __CONFIG_PATH__ || true; fi; for service in scheduler telegram worker agent; do eval "enabled=\$${service}_was_enabled"; if [ "$enabled" = true ]; then systemctl enable "moodle-autotask-$service.service" || true; else systemctl disable "moodle-autotask-$service.service" || true; fi; done; restore_controller_install || true; if [ "$health_marker_was_present" = true ] && [ "$health_marker_backup_complete" = true ]; then mv -f "$health_marker_backup" "$health_marker" || true; elif [ "$health_marker_prior_absent" = true ]; then rm -f "$health_marker" || true; fi; if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service || true; fi; if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service || true; fi; if [ "$worker_was_active" = true ]; then systemctl start moodle-autotask-worker.service || true; fi; if [ "$agent_was_active" = true ]; then systemctl start moodle-autotask-agent.service || true; fi; cleanup_controller_install || true; restore_release_set || true; exit "$result"; }; trap restore_scheduler_config EXIT
+if [ -e "$health_marker" ] || [ -L "$health_marker" ]; then test -f "$health_marker" && test ! -L "$health_marker" && test ! -s "$health_marker" && test "$(stat -c '%u:%a' "$health_marker")" = 0:600 || exit 1; health_marker_was_present=true; health_marker_candidate=$(mktemp /var/lib/moodle-autotask/.health-marker.previous.XXXXXX); cp -p "$health_marker" "$health_marker_candidate"; health_marker_backup="$health_marker_candidate"; health_marker_candidate=""; health_marker_backup_complete=true; else health_marker_prior_absent=true; fi
+if [ -e __CONFIG_PATH__ ] || [ -L __CONFIG_PATH__ ]; then test -f __CONFIG_PATH__ && test ! -L __CONFIG_PATH__ || exit 1; scheduler_config_candidate=$(mktemp "$(dirname __CONFIG_PATH__)/.scheduler.candidate.XXXXXX"); cp -p __CONFIG_PATH__ "$scheduler_config_candidate"; scheduler_config_backup="$scheduler_config_candidate"; scheduler_config_candidate=""; scheduler_config_backup_complete=true; else scheduler_config_prior_absent=true; fi
 '@).Replace('__CONFIG_PATH__', $ConfigPath)
+}
+
+function New-ControllerInstallGuardCommand {
+    return @'
+if ! declare -F restore_release_set >/dev/null; then restore_release_set() { :; }; fi
+controller_guard_dir=""; controller_guard_complete=false; controller_current=""; controller_current_present=false; health_timer_was_enabled=false; health_timer_was_active=false
+controller_paths=(/usr/local/sbin/moodle-autotask-refresh-config /usr/local/sbin/moodle-autotask-install-codex /usr/local/sbin/moodle-autotask-health-publish /usr/local/sbin/moodle-autotask-health-prepare /etc/codex/requirements.toml /etc/systemd/system/moodle-autotask-codex-login.service /etc/systemd/system/moodle-autotask-agent.service /etc/systemd/system/moodle-autotask-scheduler.service /etc/systemd/system/moodle-autotask-worker.service /etc/systemd/system/moodle-autotask-telegram.service /etc/systemd/system/moodle-autotask-health.service /etc/systemd/system/moodle-autotask-health.timer)
+controller_modes=(750 750 750 750 644 644 644 644 644 644 644 644)
+if [ -e /opt/moodle-autotask/current ] || [ -L /opt/moodle-autotask/current ]; then test -L /opt/moodle-autotask/current; controller_current="$(readlink /opt/moodle-autotask/current)"; [[ "$controller_current" =~ ^/opt/moodle-autotask/releases/[0-9a-f]{64}$ ]] && test -d "$controller_current" && test ! -L "$controller_current" || exit 1; controller_current_present=true; fi
+if systemctl is-enabled --quiet moodle-autotask-health.timer; then health_timer_was_enabled=true; fi
+if systemctl is-active --quiet moodle-autotask-health.timer; then health_timer_was_active=true; fi
+controller_guard_dir="$(mktemp -d /var/lib/moodle-autotask/.controller-install.previous.XXXXXX)"; chmod 0700 "$controller_guard_dir"; chown root:root "$controller_guard_dir"
+cleanup_controller_guard_candidate() { test -d "$controller_guard_dir" && test ! -L "$controller_guard_dir" && test "$(stat -c '%u:%a' "$controller_guard_dir")" = 0:700 || return; for index in "${!controller_paths[@]}"; do rm -f "$controller_guard_dir/$index" "$controller_guard_dir/$index.present"; done; rmdir "$controller_guard_dir" || true; }; trap 'cleanup_controller_guard_candidate; restore_release_set' EXIT
+for index in "${!controller_paths[@]}"; do path="${controller_paths[$index]}"; mode="${controller_modes[$index]}"; if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" && test "$(stat -c '%u:%a:%h' "$path")" = "0:$mode:1" || exit 1; cp -p "$path" "$controller_guard_dir/$index"; cmp -s "$path" "$controller_guard_dir/$index" && test "$(stat -c '%u:%a' "$controller_guard_dir/$index")" = "0:$mode" || exit 1; printf 1 >"$controller_guard_dir/$index.present"; else printf 0 >"$controller_guard_dir/$index.present"; fi; done
+controller_guard_complete=true
+trap - EXIT
+restore_controller_install() { if [ "$controller_guard_complete" = true ]; then for index in "${!controller_paths[@]}"; do path="${controller_paths[$index]}"; present="$(cat "$controller_guard_dir/$index.present")"; if [ "$present" = 1 ]; then if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" || return 1; fi; temporary="$(mktemp "$(dirname "$path")/.restore.XXXXXX")"; cp -p "$controller_guard_dir/$index" "$temporary"; mv -f "$temporary" "$path"; else if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" || return 1; rm -f "$path"; fi; fi; done; if [ "$controller_current_present" = true ]; then ln -sfn "$controller_current" /opt/moodle-autotask/current.restore; mv -Tf /opt/moodle-autotask/current.restore /opt/moodle-autotask/current; else rm -f /opt/moodle-autotask/current; fi; systemctl daemon-reload || return 1; if [ "$health_timer_was_enabled" = true ]; then systemctl enable moodle-autotask-health.timer || return 1; else systemctl disable moodle-autotask-health.timer || return 1; fi; if [ "$health_timer_was_active" = true ]; then systemctl start moodle-autotask-health.timer || return 1; else systemctl stop moodle-autotask-health.timer || return 1; fi; fi; }
+cleanup_controller_install() { cleanup_controller_guard_candidate; }
+'@
+}
+
+function New-ReleaseGuardCommand {
+    param(
+        [ValidatePattern('^/[A-Za-z0-9._/-]+$')]
+        [string]$ReleaseRoot
+    )
+
+    return (@'
+release_root=__RELEASE_ROOT__; release_parent="$(dirname "$release_root")"; release_was_present=false; release_parent_was_present=false; release_current=""; release_current_present=false; release_set_before=""
+release_set() { find "$release_parent" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort; }
+restore_release_set() { if [ "$release_was_present" = false ] && { [ -e "$release_root" ] || [ -L "$release_root" ]; }; then test -d "$release_root" && test ! -L "$release_root" && test "$(stat -c '%u:%g:%a' "$release_root")" = 0:0:755 || return 1; rm -rf -- "$release_root"; fi; if [ "$release_parent_was_present" = false ]; then rmdir "$release_parent" 2>/dev/null || true; fi; if [ "$release_current_present" = true ]; then ln -sfn "$release_current" /opt/moodle-autotask/current.release-restore; mv -Tf /opt/moodle-autotask/current.release-restore /opt/moodle-autotask/current; else rm -f /opt/moodle-autotask/current; fi; if [ -d "$release_parent" ]; then test "$(release_set)" = "$release_set_before"; else test -z "$release_set_before"; fi; }
+restore_release_on_exit() { result=$?; trap - EXIT; restore_release_set || true; exit "$result"; }
+if [ -e "$release_parent" ] || [ -L "$release_parent" ]; then test -d "$release_parent" && test ! -L "$release_parent" && test "$(stat -c '%u:%g:%a' "$release_parent")" = 0:0:755 || exit 1; release_parent_was_present=true; release_set_before="$(release_set)"; while IFS= read -r release_name; do [ -z "$release_name" ] && continue; [[ "$release_name" =~ ^[0-9a-f]{64}$ ]] || exit 1; release_path="$release_parent/$release_name"; test -d "$release_path" && test ! -L "$release_path" && test "$(stat -c '%u:%g:%a' "$release_path")" = 0:0:755 || exit 1; done <<<"$release_set_before"; fi
+if [ -e /opt/moodle-autotask/current ] || [ -L /opt/moodle-autotask/current ]; then test -L /opt/moodle-autotask/current; release_current="$(readlink /opt/moodle-autotask/current)"; [[ "$release_current" =~ ^/opt/moodle-autotask/releases/[0-9a-f]{64}$ ]] && test -d "$release_current" && test ! -L "$release_current" || exit 1; release_current_present=true; fi
+if [ -e "$release_root" ] || [ -L "$release_root" ]; then test -d "$release_root" && test ! -L "$release_root" && test "$(stat -c '%u:%g:%a' "$release_root")" = 0:0:755 || exit 1; test -d "$release_root/venv" && test ! -L "$release_root/venv" && test "$(stat -c '%u:%g:%a' "$release_root/venv")" = 0:0:755 || exit 1; test -d "$release_root/venv/bin" && test ! -L "$release_root/venv/bin" && test "$(stat -c '%u:%g:%a' "$release_root/venv/bin")" = 0:0:755 || exit 1; for command in moodle-autotask-scheduler moodle-autotask-telegram moodle-autotask-worker moodle-autotask-agent; do test -f "$release_root/venv/bin/$command" && test ! -L "$release_root/venv/bin/$command" && test -x "$release_root/venv/bin/$command" || exit 1; done; release_was_present=true; fi
+trap restore_release_on_exit EXIT
+'@).Replace('__RELEASE_ROOT__', $ReleaseRoot)
+}
+
+function New-ActivationGuardCommand {
+    return @'
+activation_marker=/var/lib/moodle-autotask/health-enabled; activation_marker_present=false; activation_marker_absent=false; activation_marker_backup=""; activation_marker_candidate=""; activation_marker_complete=false; activation_services=(scheduler telegram worker agent)
+for service in "${activation_services[@]}"; do eval "activation_${service}_active=false"; eval "activation_${service}_enabled=false"; systemctl is-active --quiet "moodle-autotask-$service.service" && eval "activation_${service}_active=true"; systemctl is-enabled --quiet "moodle-autotask-$service.service" && eval "activation_${service}_enabled=true"; done
+activation_timer_active=false; activation_timer_enabled=false; systemctl is-active --quiet moodle-autotask-health.timer && activation_timer_active=true; systemctl is-enabled --quiet moodle-autotask-health.timer && activation_timer_enabled=true
+restore_activation() { result=$?; trap - EXIT; systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; for service in "${activation_services[@]}"; do eval "enabled=\$activation_${service}_enabled"; eval "active=\$activation_${service}_active"; if [ "$enabled" = true ]; then systemctl enable "moodle-autotask-$service.service" || true; else systemctl disable "moodle-autotask-$service.service" || true; fi; [ "$active" = true ] && systemctl start "moodle-autotask-$service.service" || true; done; if [ "$activation_marker_present" = true ] && [ "$activation_marker_complete" = true ]; then mv -f "$activation_marker_backup" "$activation_marker" || true; elif [ "$activation_marker_absent" = true ]; then rm -f "$activation_marker" || true; fi; if [ "$activation_timer_enabled" = true ]; then systemctl enable moodle-autotask-health.timer || true; else systemctl disable moodle-autotask-health.timer || true; fi; if [ "$activation_timer_active" = true ]; then systemctl start moodle-autotask-health.timer || true; else systemctl stop moodle-autotask-health.timer || true; fi; rm -f "$activation_marker_candidate" "$activation_marker_backup" || true; exit "$result"; }; trap restore_activation EXIT
+if [ -e "$activation_marker" ] || [ -L "$activation_marker" ]; then test -f "$activation_marker" && test ! -L "$activation_marker" && test ! -s "$activation_marker" && test "$(stat -c '%u:%a' "$activation_marker")" = 0:600 || exit 1; activation_marker_present=true; activation_marker_candidate=$(mktemp /var/lib/moodle-autotask/.activation-marker.XXXXXX); cp -p "$activation_marker" "$activation_marker_candidate"; activation_marker_backup="$activation_marker_candidate"; activation_marker_candidate=""; activation_marker_complete=true; else activation_marker_absent=true; fi
+'@
 }
 
 if ($Action -eq 'Deploy') {
@@ -449,21 +501,31 @@ if ($Action -eq 'CodexSmoke') {
 }
 
 if ($Action -eq 'Activate') {
+    $activationGuardCommand = New-ActivationGuardCommand
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Activate application services' -Commands @(
         'set -eu',
+        $activationGuardCommand,
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-scheduler',
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-telegram',
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-worker',
         'test -x /opt/moodle-autotask/current/venv/bin/moodle-autotask-agent',
         'test -x /usr/local/sbin/moodle-autotask-refresh-config',
+        'test -x /usr/local/sbin/moodle-autotask-health-publish',
+        'test -x /usr/local/sbin/moodle-autotask-health-prepare',
         '/usr/local/sbin/moodle-autotask-refresh-config',
         'systemctl daemon-reload',
+        '/usr/local/sbin/moodle-autotask-health-prepare',
+        'for pulse in scheduler telegram worker agent; do path="/run/moodle-autotask-health/$pulse"; test -f "$path" && test ! -L "$path" && test ! -s "$path" && test "$(stat -c %u:%a "$path")" = 0:620; touch -d @0 -- "$path"; done; activation_started=$(date +%s)',
         'if ! systemctl enable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service; then systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; exit 1; fi',
         'if ! systemctl start moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service; then systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true; exit 1; fi',
         'systemctl is-active --quiet moodle-autotask-scheduler.service',
         'systemctl is-active --quiet moodle-autotask-telegram.service',
         'systemctl is-active --quiet moodle-autotask-worker.service',
         'systemctl is-active --quiet moodle-autotask-agent.service',
+        'deadline=$(( $(date +%s) + 240 )); while [ "$(date +%s)" -lt "$deadline" ]; do ready=true; for pulse in scheduler telegram worker agent; do test -f "/run/moodle-autotask-health/$pulse" && test ! -L "/run/moodle-autotask-health/$pulse" && test ! -s "/run/moodle-autotask-health/$pulse" && test "$(stat -c %Y "/run/moodle-autotask-health/$pulse")" -ge "$activation_started" || ready=false; systemctl is-enabled --quiet "moodle-autotask-$pulse.service" && test "$(systemctl show "moodle-autotask-$pulse.service" -p ActiveState --value)" = active && test "$(systemctl show "moodle-autotask-$pulse.service" -p SubState --value)" = running || ready=false; done; $ready && break; sleep 5; done; $ready',
+        'install -d -o root -g root -m 0700 /var/lib/moodle-autotask; temporary=$(mktemp /var/lib/moodle-autotask/.health-enabled.XXXXXX); chmod 0600 "$temporary"; chown root:root "$temporary"; mv -f "$temporary" /var/lib/moodle-autotask/health-enabled',
+        'systemctl enable --now moodle-autotask-health.timer',
+        'trap - EXIT; rm -f "$activation_marker_candidate" "$activation_marker_backup"',
         "echo 'activated-environment=$Environment'"
     )
     exit 0
@@ -472,8 +534,11 @@ if ($Action -eq 'Activate') {
 if ($Action -eq 'Deactivate') {
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Deactivate application services' -Commands @(
         'set -eu',
-        'systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true',
-        'systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service || true',
+        'systemctl stop moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service',
+        'systemctl disable moodle-autotask-scheduler.service moodle-autotask-telegram.service moodle-autotask-worker.service moodle-autotask-agent.service',
+        '! systemctl is-active --quiet moodle-autotask-scheduler.service; ! systemctl is-active --quiet moodle-autotask-telegram.service; ! systemctl is-active --quiet moodle-autotask-worker.service; ! systemctl is-active --quiet moodle-autotask-agent.service',
+        '! systemctl is-enabled --quiet moodle-autotask-scheduler.service; ! systemctl is-enabled --quiet moodle-autotask-telegram.service; ! systemctl is-enabled --quiet moodle-autotask-worker.service; ! systemctl is-enabled --quiet moodle-autotask-agent.service',
+        'if [ -e /var/lib/moodle-autotask/health-enabled ] || [ -L /var/lib/moodle-autotask/health-enabled ]; then test -f /var/lib/moodle-autotask/health-enabled && test ! -L /var/lib/moodle-autotask/health-enabled && test ! -s /var/lib/moodle-autotask/health-enabled; rm -f /var/lib/moodle-autotask/health-enabled; fi',
         'echo services-deactivated'
     )
     exit 0
@@ -605,17 +670,21 @@ $releaseRoot = "/opt/moodle-autotask/releases/$wheelDigest"
 $remoteWheel = "/tmp/$($wheel.Name)"
 $schedulerConfigInstallCommand = New-SchedulerConfigInstallCommand -Base64Config $schedulerConfigBase64
 $schedulerConfigGuardCommand = New-SchedulerConfigGuardCommand
+$controllerInstallGuardCommand = New-ControllerInstallGuardCommand
+$releaseGuardCommand = New-ReleaseGuardCommand -ReleaseRoot $releaseRoot
 Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy $commitSha" -Commands @(
     'set -eu',
     "aws s3 cp '$artifactUri' '$remoteWheel' --only-show-errors",
     "echo '$wheelDigest  $remoteWheel' | sha256sum --check --strict",
-    "install -d -o root -g root -m 0755 '$releaseRoot'",
-    "python3 -m venv '$releaseRoot/venv'",
-    "'$releaseRoot/venv/bin/pip' install --disable-pip-version-check --no-deps '$remoteWheel'",
+    $releaseGuardCommand,
+    "if [ `"`$release_was_present`" = false ]; then install -d -o root -g root -m 0755 '$releaseRoot'; fi",
+    "if [ `"`$release_was_present`" = false ]; then python3 -m venv '$releaseRoot/venv'; fi",
+    "if [ `"`$release_was_present`" = false ]; then '$releaseRoot/venv/bin/pip' install --disable-pip-version-check --no-deps '$remoteWheel'; fi",
     "'$releaseRoot/venv/bin/moodle-autotask-scheduler' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-telegram' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-worker' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-agent' --help >/dev/null",
+    $controllerInstallGuardCommand,
     $schedulerConfigGuardCommand,
     'if [ "$scheduler_was_active" = true ]; then systemctl stop moodle-autotask-scheduler.service; fi',
     'if [ "$telegram_was_active" = true ]; then systemctl stop moodle-autotask-telegram.service; fi',
@@ -632,8 +701,10 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     'if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service; fi',
     'if [ "$worker_was_active" = true ]; then systemctl start moodle-autotask-worker.service; fi',
     'if [ "$agent_was_active" = true ] || [ "$legacy_three_was_active" = true ]; then systemctl enable --now moodle-autotask-agent.service; fi',
+    'if [ "$health_marker_was_present" = true ] || { [ "$health_marker_was_present" = false ] && [ "$scheduler_was_active" = true ] && [ "$telegram_was_active" = true ] && [ "$worker_was_active" = true ] && { [ "$agent_was_active" = true ] || [ "$legacy_three_was_active" = true ]; }; }; then /usr/local/sbin/moodle-autotask-health-prepare; for pulse in scheduler telegram worker agent; do path="/run/moodle-autotask-health/$pulse"; test -f "$path" && test ! -L "$path" && test ! -s "$path"; touch -d @0 -- "$path"; done; activation_started=$(date +%s); deadline=$((activation_started+240)); ready=false; while [ "$(date +%s)" -lt "$deadline" ]; do ready=true; for pulse in scheduler telegram worker agent; do systemctl is-enabled --quiet "moodle-autotask-$pulse.service" && test "$(systemctl show "moodle-autotask-$pulse.service" -p ActiveState --value)" = active && test "$(systemctl show "moodle-autotask-$pulse.service" -p SubState --value)" = running && test ! -L "/run/moodle-autotask-health/$pulse" && test "$(stat -c %Y "/run/moodle-autotask-health/$pulse")" -ge "$activation_started" || ready=false; done; $ready && break; sleep 5; done; $ready; temporary=$(mktemp /var/lib/moodle-autotask/.health-enabled.XXXXXX); chmod 0600 "$temporary"; chown root:root "$temporary"; mv -f "$temporary" /var/lib/moodle-autotask/health-enabled; systemctl enable --now moodle-autotask-health.timer; fi',
+    'systemctl enable --now moodle-autotask-health.timer',
     "rm -f '$remoteWheel'",
-    'trap - EXIT; if [ -n "$scheduler_config_candidate" ]; then rm -f "$scheduler_config_candidate"; fi; if [ -n "$scheduler_config_backup" ]; then rm -f "$scheduler_config_backup"; fi',
+    'trap - EXIT; cleanup_controller_install; if [ -n "$scheduler_config_candidate" ]; then rm -f "$scheduler_config_candidate"; fi; if [ -n "$scheduler_config_backup" ]; then rm -f "$scheduler_config_backup"; fi; if [ -n "$health_marker_candidate" ]; then rm -f "$health_marker_candidate"; fi; if [ -n "$health_marker_backup" ]; then rm -f "$health_marker_backup"; fi',
     "echo 'deployed-commit=$commitSha'",
     "echo 'deployed-sha256=$wheelDigest'"
 )

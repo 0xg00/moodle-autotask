@@ -132,4 +132,5 @@ def test_parser_defaults_are_bounded() -> None:
     parsed = _parser().parse_args(
         ["run", "--config-file", "telegram.json", "--state", "approval.sqlite3"]
     )
-    assert parsed.poll_timeout_seconds == 30 and parsed.retry_seconds == 5
+    assert parsed.poll_timeout_seconds == 50 and parsed.poll_timeout_seconds <= 55
+    assert parsed.retry_seconds == 5

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from moddle_autotask.health import pulse
+
 from .approval_state import (
     ApprovalButtons,
     ApprovalState,
@@ -374,6 +376,7 @@ def run_polling(
     while True:
         try:
             try:
+                pulse("telegram")
                 process_updates(config, client, state, timeout_seconds=timeout_seconds)
             except TelegramError:
                 wait(retry_seconds)
