@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import cast
 
 from moddle_autotask.domain.models import Digest, ExecutionMode, LabHandle
 
@@ -72,6 +73,26 @@ class ExecutionNotification:
     summary: str
     report_markdown: str
     provenance: dict[str, object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionRecord:
+    """Read-only evidence that a completed execution may enter local retention planning."""
+
+    event_id: str
+    task_key: str
+    revision_digest: str
+    selected_mode: ExecutionMode
+    work_status: str
+    succeeded: bool
+    outbox_created_at: int
+    delivered_at: int | None
+    scratch_eligible_at: int
+    evidence_eligible_at: int | None
+    central_job_ids: tuple[str, ...]
+    bundle_digest: str | None
+    lab_phase_ids: tuple[str, ...] = ()
+    dispatch_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +764,78 @@ class ApprovalState:
             raise ApprovalStateError("execution completion is corrupt") from error
         except sqlite3.Error as error:
             raise ApprovalStateError("could not persist execution completion") from error
+
+    def retention_records(
+        self, now: int, scratch_ttl: int, evidence_ttl: int, limit: int
+    ) -> tuple[RetentionRecord, ...]:
+        """Return only durable completion/outbox facts; this method never mutates state.
+
+        Local collectors use these records to decide whether a separately
+        durable tombstone may be prepared.  In particular, delivery age is
+        never inferred from the execution timestamp.
+        """
+        moment = _now(now)
+        if type(scratch_ttl) is not int or not 1 <= scratch_ttl <= 90 * 24 * 3600:
+            raise ValueError("scratch retention TTL is invalid")
+        if type(evidence_ttl) is not int or not 1 <= evidence_ttl <= 90 * 24 * 3600:
+            raise ValueError("evidence retention TTL is invalid")
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("retention record limit is invalid")
+        try:
+            with self._connect() as connection:
+                if not _valid_schema(connection, _SCHEMA_VERSION):
+                    raise ApprovalStateError("approval state schema is corrupt")
+                joined = (
+                    " FROM execution_outbox o JOIN work_items w ON w.event_id = o.event_id "
+                    "JOIN requests r ON r.event_id = o.event_id "
+                )
+                impossible = connection.execute(
+                    "SELECT 1" + joined
+                    + "WHERE (w.selected_mode = 'central' AND w.status != 'cleaned') "
+                    "OR (w.selected_mode != 'central' AND w.status IN ('pending','lab_pending')) "
+                    "LIMIT 1"
+                ).fetchone()
+                malformed = connection.execute(
+                    "SELECT 1" + joined
+                    + "WHERE w.selected_mode = 'central' AND w.status = 'cleaned' AND ("
+                    "json_valid(o.payload) != 1 OR "
+                    "CASE WHEN json_valid(o.payload) THEN "
+                    "COALESCE(json_type(o.payload, '$.succeeded'), 'missing') "
+                    "ELSE 'invalid' END NOT IN ('true','false') OR "
+                    "CASE WHEN json_valid(o.payload) THEN "
+                    "COALESCE(json_type(o.payload, '$.summary'), 'missing') "
+                    "ELSE 'invalid' END != 'text' OR "
+                    "CASE WHEN json_valid(o.payload) THEN "
+                    "COALESCE(json_type(o.payload, '$.reportMarkdown'), 'missing') "
+                    "ELSE 'invalid' END != 'text' OR "
+                    "CASE WHEN json_valid(o.payload) THEN CASE WHEN "
+                    "json_type(o.payload, '$.succeeded') = 'false' THEN CASE WHEN "
+                    "(SELECT COUNT(*) FROM json_each(o.payload)) != 3 OR "
+                    "(SELECT COUNT(DISTINCT key) FROM json_each(o.payload)) != 3 OR "
+                    "(SELECT COUNT(*) FROM json_each(o.payload) "
+                    "WHERE key IN ('succeeded','summary','reportMarkdown')) != 3 "
+                    "THEN 1 ELSE 0 END ELSE 0 END ELSE 1 END = 1) LIMIT 1"
+                ).fetchone()
+                if impossible is not None or malformed is not None:
+                    raise ApprovalStateError("retention record is corrupt")
+                rows = connection.execute(
+                    "SELECT r.event_id, r.task_key, r.revision_digest, r.payload, "
+                    "w.selected_mode, w.status, o.payload, o.created_at, o.delivered_at"
+                    + joined
+                    + "WHERE w.selected_mode = 'central' AND w.status = 'cleaned' "
+                    "AND json_valid(o.payload) = 1 "
+                    "AND json_type(o.payload, '$.succeeded') = 'true' "
+                    "ORDER BY o.created_at, o.event_id LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                records = [
+                    _retention_record(row, moment, scratch_ttl, evidence_ttl) for row in rows
+                ]
+        except ApprovalStateError:
+            raise
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not read retention records") from error
+        return tuple(records)
 
     def pending_execution_notification(self) -> ExecutionNotification | None:
         try:
@@ -1814,6 +1907,89 @@ def _validate_execution_provenance(value: dict[str, object]) -> None:
     ).encode("utf-8")
     if sha256(canonical).hexdigest() != value["artifactManifestDigest"]:
         raise ApprovalStateError("execution provenance is invalid")
+
+
+def _retention_record(
+    row: tuple[object, ...], now: int, scratch_ttl: int, evidence_ttl: int
+) -> RetentionRecord:
+    if len(row) != 9:
+        raise ApprovalStateError("retention record is corrupt")
+    event_id, task_key, revision_digest, event_payload, mode, status, payload, created, delivered = row
+    if (
+        not isinstance(event_id, str)
+        or not isinstance(task_key, str)
+        or not isinstance(revision_digest, str)
+        or not isinstance(event_payload, str)
+        or mode not in {item.value for item in ExecutionMode}
+        or status not in {"pending", "lab_pending", "ready", "failed", "cleaned"}
+        or not isinstance(payload, str)
+        or type(created) is not int
+        or created < 0
+        or (delivered is not None and (type(delivered) is not int or delivered < created))
+    ):
+        raise ApprovalStateError("retention record is corrupt")
+    event = _event_from_json(event_payload)
+    if (event.event_id, event.task_key, event.revision_digest) != (event_id, task_key, revision_digest):
+        raise ApprovalStateError("retention record is corrupt")
+    try:
+        outcome = json.loads(payload, object_pairs_hook=_retention_json_object)
+    except json.JSONDecodeError as error:
+        raise ApprovalStateError("retention record is corrupt") from error
+    if not isinstance(outcome, dict) or any(not isinstance(key, str) for key in outcome):
+        raise ApprovalStateError("retention record is corrupt")
+    required = {"succeeded", "summary", "reportMarkdown"}
+    if not required <= set(outcome) or not isinstance(outcome.get("succeeded"), bool):
+        raise ApprovalStateError("retention record is corrupt")
+    succeeded = cast(bool, outcome["succeeded"])
+    job_ids: tuple[str, ...] = ()
+    bundle_digest: str | None = None
+    if mode == ExecutionMode.CENTRAL.value and succeeded:
+        if set(outcome) != required | {"kind", "provenance"}:
+            raise ApprovalStateError("retention record is corrupt")
+        if outcome.get("kind") != "moodle-execution-outcome-v2" or not isinstance(
+            outcome.get("provenance"), dict
+        ):
+            raise ApprovalStateError("retention record is corrupt")
+        provenance = cast(dict[str, object], outcome["provenance"])
+        _validate_execution_provenance(provenance)
+        job_ids = tuple(cast(list[str], provenance["jobIds"]))
+        bundle_digest = cast(str, provenance["artifactBundleDigest"])
+    elif set(outcome) != required:
+        raise ApprovalStateError("retention record is corrupt")
+    valid_completion = (
+        (mode == ExecutionMode.CENTRAL.value and status == "cleaned")
+        or (
+            mode in {ExecutionMode.IN_GUEST.value, ExecutionMode.HYBRID.value}
+            and status in ({"ready", "cleaned"} if succeeded else {"failed", "cleaned"})
+        )
+    )
+    if not valid_completion:
+        raise ApprovalStateError("retention record is corrupt")
+    scratch_at = created + scratch_ttl
+    evidence_at = None if delivered is None else delivered + evidence_ttl
+    return RetentionRecord(
+        event_id,
+        task_key,
+        revision_digest,
+        ExecutionMode(mode),
+        status,
+        succeeded,
+        created,
+        delivered,
+        scratch_at,
+        evidence_at,
+        job_ids,
+        bundle_digest,
+    )
+
+
+def _retention_json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if not isinstance(key, str) or key in value:
+            raise ApprovalStateError("retention record is corrupt")
+        value[key] = item
+    return value
 
 
 def _validate_outcome_manifest(manifest: dict[str, object]) -> None:
