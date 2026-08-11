@@ -480,6 +480,10 @@ def test_lab_boundary_uses_separate_roles_and_no_ingress() -> None:
 
     assert "ec2:RunInstances" not in controller_policy
     assert 'actions   = ["sts:AssumeRole"]' in labs
+    read_lab_state = labs.split('sid    = "ReadLabState"', 1)[1].split(
+        'sid       = "ReadApprovedWindowsImage"', 1
+    )[0]
+    assert '"ec2:DescribeVolumes"' in read_lab_state
     assert "aws_iam_role.controller.arn" in labs
     assert 'resources = [aws_iam_role.lab_instance.arn]' in labs
     assert 'variable = "iam:PassedToService"' in labs

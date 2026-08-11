@@ -55,6 +55,7 @@ data "aws_iam_policy_document" "lab_provisioner" {
     actions = [
       "ec2:DescribeInstances",
       "ec2:DescribeInstanceStatus",
+      "ec2:DescribeVolumes",
       "ssm:DescribeInstanceInformation",
     ]
     resources = ["*"]

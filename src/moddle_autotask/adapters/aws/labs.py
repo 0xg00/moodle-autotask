@@ -8,7 +8,7 @@ import re
 import subprocess
 import time
 from base64 import b64decode, b64encode
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Protocol, cast
@@ -25,6 +25,7 @@ _ROLE_ARN_PATTERN = re.compile(
 _SUBNET_PATTERN = re.compile(r"^subnet-[0-9a-f]{8,17}$")
 _SECURITY_GROUP_PATTERN = re.compile(r"^sg-[0-9a-f]{8,17}$")
 _INSTANCE_PATTERN = re.compile(r"^i-[0-9a-f]{8,17}$")
+_VOLUME_PATTERN = re.compile(r"^vol-[0-9a-f]{8,17}$")
 _IMAGE_PATTERN = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _COMMAND_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -46,6 +47,8 @@ _TERMINAL_COMMAND_STATUSES = frozenset(
 _COMMAND_TIMEOUT_SECONDS = 1800
 _COMMAND_POLL_SECONDS = 2
 _MAX_SSM_TRANSCRIPT_BYTES = 12_000
+_TEARDOWN_TIMEOUT_SECONDS = 300
+_TEARDOWN_POLL_SECONDS = 2
 
 
 class AwsLabError(RuntimeError):
@@ -179,9 +182,18 @@ class _Session:
 class AwsEc2LabProvider:
     """Implements LabProvider using a fixed AWS launch profile and short-lived role sessions."""
 
-    def __init__(self, config: AwsLabConfig, runner: JsonCommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        config: AwsLabConfig,
+        runner: JsonCommandRunner | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._config = config
         self._runner = runner or AwsCliJsonRunner(timeout_seconds=30)
+        self._clock = clock
+        self._sleeper = sleeper
 
     def provision(self, request: LabProvisionRequest, *, idempotency_key: str) -> LabHandle:
         provision_key = self._provision_key(request, idempotency_key)
@@ -281,22 +293,58 @@ class AwsEc2LabProvider:
     def teardown(self, handle: LabHandle, *, idempotency_key: str) -> None:
         self._require_non_blank(idempotency_key, "idempotency key")
         instance_id, provision_key = self._parse_handle(handle)
+        deadline = self._clock() + _TEARDOWN_TIMEOUT_SECONDS
         instance = self._owned_instance(instance_id, provision_key)
-        if instance is None:
-            return
-        state = self._nested_string(instance, "State", "Name")
-        if state in {"shutting-down", "terminated"}:
-            return
-        session = self._assume_role(provision_key)
-        self._aws(
-            session,
-            "ec2",
-            "terminate-instances",
-            "--region",
-            self._config.region,
-            "--instance-ids",
-            instance_id,
-        )
+        if instance is not None:
+            state = self._nested_string(instance, "State", "Name")
+            if state not in {"shutting-down", "terminated"}:
+                if state not in {"pending", "running", "stopping", "stopped"}:
+                    raise AwsLabError("AWS returned an invalid lab instance state")
+                try:
+                    session = self._assume_role(provision_key)
+                    self._aws(
+                        session,
+                        "ec2",
+                        "terminate-instances",
+                        "--region",
+                        self._config.region,
+                        "--instance-ids",
+                        instance_id,
+                    )
+                except AwsLabError as error:
+                    # A lost terminate response is ambiguous.  Reconcile it below; if AWS did
+                    # not actually start termination, preserve the original provider error.
+                    try:
+                        self._wait_for_teardown(instance_id, provision_key, deadline)
+                    except AwsLabError:
+                        raise error from None
+                    return
+        self._wait_for_teardown(instance_id, provision_key, deadline)
+
+    def _wait_for_teardown(self, instance_id: str, provision_key: str, deadline: float) -> None:
+        while True:
+            self._require_before_teardown_deadline(deadline)
+            instance = self._owned_instance(instance_id, provision_key)
+            volumes = self._owned_volumes(provision_key)
+            instance_finished = instance is None
+            if instance is not None:
+                state = self._nested_string(instance, "State", "Name")
+                if state not in {
+                    "pending",
+                    "running",
+                    "stopping",
+                    "stopped",
+                    "shutting-down",
+                    "terminated",
+                }:
+                    raise AwsLabError("AWS returned an invalid lab instance state")
+                instance_finished = state == "terminated"
+            volumes_finished = all(
+                self._required_string(volume, "State") == "deleted" for volume in volumes
+            )
+            if instance_finished and volumes_finished:
+                return
+            self._sleep_until_teardown_deadline(deadline)
 
     def run_powershell(
         self, handle: LabHandle, commands: tuple[str, ...], *, execution_key: str
@@ -558,6 +606,15 @@ class AwsEc2LabProvider:
         if remaining > 0:
             time.sleep(min(_COMMAND_POLL_SECONDS, remaining))
 
+    def _sleep_until_teardown_deadline(self, deadline: float) -> None:
+        remaining = deadline - self._clock()
+        if remaining > 0:
+            self._sleeper(min(_TEARDOWN_POLL_SECONDS, remaining))
+
+    def _require_before_teardown_deadline(self, deadline: float) -> None:
+        if self._clock() >= deadline:
+            raise AwsLabError("lab teardown did not finish")
+
     def _reconcile_with_key(self, provision_key: str) -> LabHandle | None:
         session = self._assume_role(provision_key)
         response = self._aws(
@@ -602,19 +659,44 @@ class AwsEc2LabProvider:
             return None
         if len(instances) != 1:
             raise AwsLabError("AWS returned an ambiguous lab identity")
-        tags = {
-            self._required_string(tag, "Key"): self._required_string(tag, "Value")
-            for tag in self._list_field(instances[0], "Tags")
-        }
-        expected = {
+        tags = self._tag_values(instances[0])
+        expected = self._ownership_tags(provision_key)
+        if any(tags.get(key) != value for key, value in expected.items()):
+            raise AwsLabError("instance does not belong to the requested lab")
+        return instances[0]
+
+    def _owned_volumes(self, provision_key: str) -> list[dict[str, object]]:
+        session = self._assume_role(provision_key)
+        response = self._aws(
+            session,
+            "ec2",
+            "describe-volumes",
+            "--region",
+            self._config.region,
+            "--filters",
+            f"Name=tag:Project,Values={self._config.project_name}",
+            f"Name=tag:Environment,Values={self._config.environment}",
+            "Name=tag:Role,Values=lab",
+            f"Name=tag:ProvisionKey,Values={provision_key}",
+        )
+        volumes = self._list_field(response, "Volumes")
+        expected = self._ownership_tags(provision_key)
+        for volume in volumes:
+            volume_id = self._required_string(volume, "VolumeId")
+            if _VOLUME_PATTERN.fullmatch(volume_id) is None:
+                raise AwsLabError("AWS returned an invalid lab volume ID")
+            tags = self._tag_values(volume)
+            if any(tags.get(key) != value for key, value in expected.items()):
+                raise AwsLabError("volume does not belong to the requested lab")
+        return volumes
+
+    def _ownership_tags(self, provision_key: str) -> dict[str, str]:
+        return {
             "Project": self._config.project_name,
             "Environment": self._config.environment,
             "Role": "lab",
             "ProvisionKey": provision_key,
         }
-        if any(tags.get(key) != value for key, value in expected.items()):
-            raise AwsLabError("instance does not belong to the requested lab")
-        return instances[0]
 
     def _assume_role(self, provision_key: str, *, deadline: float | None = None) -> _Session:
         self._require_before_deadline(deadline)
@@ -731,6 +813,16 @@ class AwsEc2LabProvider:
         if not isinstance(field, list):
             raise AwsLabError(f"AWS response has an invalid {key}")
         return [cls._mapping(item) for item in field]
+
+    @classmethod
+    def _tag_values(cls, value: object) -> dict[str, str]:
+        tags: dict[str, str] = {}
+        for tag in cls._list_field(value, "Tags"):
+            key = cls._required_string(tag, "Key")
+            if key in tags:
+                raise AwsLabError("AWS response has duplicate resource tags")
+            tags[key] = cls._required_string(tag, "Value")
+        return tags
 
     @classmethod
     def _reservation_instances(cls, value: object) -> list[dict[str, object]]:

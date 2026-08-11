@@ -30,6 +30,11 @@ from moddle_autotask.ports.contracts import LabReadiness
 class _FakeRunner:
     calls: list[tuple[tuple[str, ...], Mapping[str, str] | None]] = field(default_factory=list)
     instances: list[dict[str, object]] = field(default_factory=list)
+    volumes: list[dict[str, object]] = field(default_factory=list)
+    instance_states: list[str | None] = field(default_factory=list)
+    volume_states: list[str | None] = field(default_factory=list)
+    terminate_response_lost: bool = False
+    bypass_volume_filters: bool = False
     online: bool = True
     duplicate: bool = False
     command_output: str = ""
@@ -57,6 +62,9 @@ class _FakeRunner:
             tag_specs = json.loads(tags_json)
             assert isinstance(tag_specs, list)
             instance_tags = tag_specs[0]["Tags"]
+            volume_tags = next(
+                spec["Tags"] for spec in tag_specs if spec["ResourceType"] == "volume"
+            )
             self.instances = [
                 {
                     "InstanceId": "i-0123456789abcdef0",
@@ -64,8 +72,22 @@ class _FakeRunner:
                     "Tags": instance_tags,
                 }
             ]
+            self.volumes = [
+                {
+                    "VolumeId": "vol-0123456789abcdef0",
+                    "State": "in-use",
+                    "Tags": volume_tags,
+                }
+            ]
             return {"Instances": self.instances}
         if operation == ("ec2", "describe-instances"):
+            if self.instance_states:
+                state = self.instance_states.pop(0)
+                if state is None:
+                    self.instances = []
+                else:
+                    for instance in self.instances:
+                        instance["State"] = {"Name": state}
             selected = list(self.instances)
             instance_filter = next(
                 (
@@ -102,6 +124,38 @@ class _FakeRunner:
             if self.duplicate and selected:
                 selected.append(dict(selected[0]))
             return {"Reservations": [{"Instances": selected}] if selected else []}
+        if operation == ("ec2", "describe-volumes"):
+            if self.volume_states:
+                state = self.volume_states.pop(0)
+                if state is None:
+                    self.volumes = []
+                else:
+                    for volume in self.volumes:
+                        volume["State"] = state
+            provision_filter = next(
+                (
+                    argument.removeprefix("Name=tag:ProvisionKey,Values=")
+                    for argument in arguments
+                    if argument.startswith("Name=tag:ProvisionKey,Values=")
+                ),
+                None,
+            )
+            selected = list(self.volumes)
+            if provision_filter is not None and not self.bypass_volume_filters:
+                filtered_volumes: list[dict[str, object]] = []
+                for volume in selected:
+                    raw_tags = volume.get("Tags")
+                    if not isinstance(raw_tags, list):
+                        continue
+                    if any(
+                        isinstance(tag, dict)
+                        and tag.get("Key") == "ProvisionKey"
+                        and tag.get("Value") == provision_filter
+                        for tag in raw_tags
+                    ):
+                        filtered_volumes.append(volume)
+                selected = filtered_volumes
+            return {"Volumes": selected}
         if operation == ("ssm", "describe-instance-information"):
             information = [{"PingStatus": "Online"}] if self.online else []
             return {"InstanceInformationList": information}
@@ -148,7 +202,10 @@ class _FakeRunner:
             }
         if operation == ("ec2", "terminate-instances"):
             for instance in self.instances:
-                instance["State"] = {"Name": "shutting-down"}
+                instance["State"] = {"Name": "terminated"}
+            self.volumes = []
+            if self.terminate_response_lost:
+                raise AwsLabError("AWS CLI operation failed with exit code 255")
             return {"TerminatingInstances": []}
         raise AssertionError(f"unexpected AWS call: {arguments}")
 
@@ -303,6 +360,133 @@ def test_teardown_validates_ownership_and_is_idempotent() -> None:
     provider.teardown(handle, idempotency_key="cleanup")
     provider.teardown(handle, idempotency_key="cleanup")
     assert sum(call[0][:2] == ("ec2", "terminate-instances") for call in runner.calls) == 1
+
+
+def test_teardown_waits_for_termination_after_the_terminate_request() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-wait")
+    runner.instance_states = ["running", "pending", "terminated"]
+
+    provider.teardown(handle, idempotency_key="cleanup")
+
+    assert sum(call[0][:2] == ("ec2", "terminate-instances") for call in runner.calls) == 1
+    assert sum(call[0][:2] == ("ec2", "describe-instances") for call in runner.calls) == 4
+
+
+def test_teardown_reconciles_an_already_shutting_down_owned_instance() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-shutting-down")
+    runner.instance_states = ["shutting-down", "terminated"]
+    runner.volumes = []
+
+    provider.teardown(handle, idempotency_key="cleanup")
+
+    assert not any(call[0][:2] == ("ec2", "terminate-instances") for call in runner.calls)
+
+
+def test_teardown_reconciles_a_lost_terminate_response() -> None:
+    runner = _FakeRunner(terminate_response_lost=True)
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-response-loss")
+
+    provider.teardown(handle, idempotency_key="cleanup")
+
+    assert sum(call[0][:2] == ("ec2", "terminate-instances") for call in runner.calls) == 1
+
+
+def test_teardown_succeeds_when_the_owned_instance_and_volumes_are_already_absent() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-absent")
+    runner.instances = []
+    runner.volumes = []
+
+    provider.teardown(handle, idempotency_key="cleanup")
+
+    assert not any(call[0][:2] == ("ec2", "terminate-instances") for call in runner.calls)
+
+
+def test_teardown_waits_for_exact_tagged_volumes_to_disappear() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-volumes")
+    runner.instance_states = ["terminated", "terminated", "terminated"]
+    runner.volume_states = ["in-use", "deleting", None]
+
+    provider.teardown(handle, idempotency_key="cleanup")
+
+    volume_polls = [call for call, _ in runner.calls if call[:2] == ("ec2", "describe-volumes")]
+    assert len(volume_polls) == 3
+    assert all(
+        any("Name=tag:ProvisionKey,Values=" in item for item in poll) for poll in volume_polls
+    )
+
+
+def test_teardown_times_out_with_a_bounded_reconciliation_call_count() -> None:
+    runner = _FakeRunner()
+    clock = [0.0]
+    provider = AwsEc2LabProvider(
+        _config(),
+        runner,
+        clock=lambda: clock[0],
+        sleeper=lambda _: clock.__setitem__(0, 300.0),
+    )
+    handle = provider.provision(_request(), idempotency_key="cleanup-timeout")
+    runner.instance_states = ["terminated"]
+    runner.volume_states = ["deleting"]
+
+    with pytest.raises(AwsLabError, match="teardown did not finish"):
+        provider.teardown(handle, idempotency_key="cleanup")
+
+    assert sum(call[0][:2] == ("ec2", "describe-volumes") for call in runner.calls) == 1
+    assert sum(call[0][:2] == ("ec2", "describe-instances") for call in runner.calls) == 3
+
+
+@pytest.mark.parametrize("bad_tags", [[], [{"Key": "Role", "Value": "controller"}]])
+def test_teardown_fails_closed_for_malformed_or_wrong_tagged_volumes(
+    bad_tags: list[dict[str, str]],
+) -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-volume-tags")
+    runner.instances[0]["State"] = {"Name": "terminated"}
+    runner.volumes[0]["Tags"] = bad_tags
+    runner.bypass_volume_filters = True
+
+    with pytest.raises(AwsLabError, match="volume does not belong|missing Tags"):
+        provider.teardown(handle, idempotency_key="cleanup")
+
+
+def test_teardown_fails_closed_for_a_malformed_volume_shape() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-malformed-volume")
+    runner.instances[0]["State"] = {"Name": "terminated"}
+    del runner.volumes[0]["State"]
+
+    with pytest.raises(AwsLabError, match="invalid State"):
+        provider.teardown(handle, idempotency_key="cleanup")
+
+
+def test_teardown_propagates_provider_errors_when_reconciliation_cannot_confirm_cleanup() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner, sleeper=lambda _: None)
+    handle = provider.provision(_request(), idempotency_key="cleanup-provider-error")
+    runner.instances[0]["State"] = {"Name": "terminated"}
+    original_run_json = runner.run_json
+
+    def fail_volume_read(
+        arguments: tuple[str, ...], *, extra_environment: Mapping[str, str] | None = None
+    ) -> object:
+        if arguments[:2] == ("ec2", "describe-volumes"):
+            raise AwsLabError("temporary EC2 read failure")
+        return original_run_json(arguments, extra_environment=extra_environment)
+
+    runner.run_json = fail_volume_read  # type: ignore[method-assign]
+    with pytest.raises(AwsLabError, match="temporary EC2 read failure"):
+        provider.teardown(handle, idempotency_key="cleanup")
 
 
 def test_powershell_uses_owned_instance_official_document_and_guest_marker() -> None:
