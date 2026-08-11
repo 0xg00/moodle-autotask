@@ -45,7 +45,8 @@ def test_controller_scheduler_scope_is_explicit_and_has_no_fixture_hardcode() ->
     for source in (cloud_init, compute, variables, deploy):
         assert "ASIX-CAMPAIGN-01" not in source
     assert "--scheduler-config-file /etc/${project_name}/scheduler.json" in cloud_init
-    assert "scheduler_config_base64" in compute and "base64encode(jsonencode" in compute
+    assert "scheduler_config_base64 = base64encode(" in compute
+    assert "var.scheduler_all_courses ? jsonencode({" in compute
     assert "scheduler_course_shortnames" in variables and "scheduler_all_courses" in variables
     assert "scheduler_max_new_events_per_cycle" in variables
     assert "length(base64encode(shortname))" in variables

@@ -5,15 +5,15 @@ locals {
     telegram_secret_arn = aws_secretsmanager_secret.telegram_config.arn
     project_name        = var.project_name
     scheduler_interval  = 86400
-    scheduler_config_base64 = base64encode(jsonencode(
-      var.scheduler_all_courses ? {
+    scheduler_config_base64 = base64encode(
+      var.scheduler_all_courses ? jsonencode({
         allCourses           = true
         maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
-        } : {
+        }) : jsonencode({
         courseShortnames     = var.scheduler_course_shortnames
         maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
-      }
-    ))
+      })
+    )
   })
 }
 
