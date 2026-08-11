@@ -101,9 +101,9 @@ variable "scheduler_course_shortnames" {
       for shortname in var.scheduler_course_shortnames :
       length(shortname) > 0 &&
       (length(base64encode(shortname)) / 4 * 3 -
-        (endswith(base64encode(shortname), "==") ? 2 : endswith(base64encode(shortname), "=") ? 1 : 0)) <= 255 &&
+      (endswith(base64encode(shortname), "==") ? 2 : endswith(base64encode(shortname), "=") ? 1 : 0)) <= 255 &&
       !can(regex("[\\x00-\\x1F\\x7F]", shortname))
-    ]) && length(distinct(var.scheduler_course_shortnames)) == length(var.scheduler_course_shortnames) && length(var.scheduler_course_shortnames) <= 64 && sum([
+      ]) && length(distinct(var.scheduler_course_shortnames)) == length(var.scheduler_course_shortnames) && length(var.scheduler_course_shortnames) <= 64 && sum([
       for shortname in var.scheduler_course_shortnames :
       length(base64encode(shortname)) / 4 * 3 -
       (endswith(base64encode(shortname), "==") ? 2 : endswith(base64encode(shortname), "=") ? 1 : 0)

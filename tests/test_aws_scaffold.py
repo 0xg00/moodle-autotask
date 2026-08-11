@@ -379,14 +379,15 @@ def test_remote_deploy_recovery_keeps_migrated_legacy_config(
     state = tmp_path / "state"
     script = f"""set -eu
 state={state!s}; mkdir -p "$state"; touch "$state/scheduler" "$state/telegram" "$state/worker"
+service_name() {{ service=${{1#moodle-autotask-}}; printf '%s' "${{service%.service}}"; }}
 systemctl() {{
   command=$1; shift
   case "$command" in
-    is-active) test -f "$state/${{2%%.service}}"; return ;;
+    is-active) service=$(service_name "$2"); test -f "$state/$service"; return ;;
     cat) return 1 ;;
-    stop) service=${{1%%.service}} ;;
-    start) service=${{1%%.service}} ;;
-    enable) test "$1" = --now; service=${{2%%.service}} ;;
+    stop) service=$(service_name "$1") ;;
+    start) service=$(service_name "$1") ;;
+    enable) test "$1" = --now; service=$(service_name "$2") ;;
     *) return 2 ;;
   esac
   if [ "$command" = {failed_command!r} ] && [ "$service" = {failed_service!r} ] &&
@@ -433,12 +434,13 @@ def test_remote_deploy_recovery_restores_existing_config_after_install_failure(
     script = f"""set -eu
 state={state!s}; mkdir -p "$state"
 touch "$state/scheduler" "$state/telegram" "$state/worker" "$state/agent"
+service_name() {{ service=${{1#moodle-autotask-}}; printf '%s' "${{service%.service}}"; }}
 systemctl() {{
   case "$1" in
-    is-active) test -f "$state/${{3%%.service}}" ;;
+    is-active) service=$(service_name "$3"); test -f "$state/$service" ;;
     cat) return 0 ;;
-    stop) rm -f "$state/${{2%%.service}}" ;;
-    start) touch "$state/${{2%%.service}}" ;;
+    stop) service=$(service_name "$2"); rm -f "$state/$service" ;;
+    start) service=$(service_name "$2"); touch "$state/$service" ;;
     *) return 0 ;;
   esac
 }}
@@ -460,20 +462,21 @@ false
 def _all_active_systemctl_fake(state: Path, *, fail_stop_agent: bool = False) -> str:
     return f"""state={state!s}; mkdir -p "$state"
 touch "$state/scheduler" "$state/telegram" "$state/worker" "$state/agent"
+service_name() {{ service=${{1#moodle-autotask-}}; printf '%s' "${{service%.service}}"; }}
 systemctl() {{
   command=$1
   case "$command" in
-    is-active) test -f "$state/${{3%%.service}}"; return ;;
+    is-active) service=$(service_name "$3"); test -f "$state/$service"; return ;;
     cat) return 0 ;;
     stop)
-      service=${{2%%.service}}
+      service=$(service_name "$2")
       if [ {str(fail_stop_agent).lower()} = true ] && [ "$service" = agent ] &&
          [ ! -f "$state/failed-stop-agent" ]; then
         touch "$state/failed-stop-agent"; return 1
       fi
       rm -f "$state/$service"; return
       ;;
-    start) touch "$state/${{2%%.service}}"; return ;;
+    start) service=$(service_name "$2"); touch "$state/$service"; return ;;
     *) return 2 ;;
   esac
 }}

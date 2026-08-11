@@ -9,7 +9,7 @@ locals {
       var.scheduler_all_courses ? {
         allCourses           = true
         maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
-      } : {
+        } : {
         courseShortnames     = var.scheduler_course_shortnames
         maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
       }
