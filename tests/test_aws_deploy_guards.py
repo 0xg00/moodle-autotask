@@ -34,6 +34,7 @@ _CONTROLLER_FILES = (
     ("etc/systemd/system/moodle-autotask-health.service", 0o644),
     ("etc/systemd/system/moodle-autotask-health.timer", 0o644),
 )
+_BASH_TRANSPORT = 'if [ -z "${BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi'
 
 
 def _function_payload(name: str) -> str:
@@ -55,6 +56,17 @@ def _action_literals(action: str, following: str) -> list[str]:
     return [value.replace("''", "'") for value in values]
 
 
+def _transported_commands(commands: list[str]) -> list[str]:
+    """Model the exact SSM command list built by Send-ControllerCommand."""
+    source = _DEPLOY.read_text(encoding="utf-8")
+    assert (
+        "$bashTransport = 'if [ -z \"${BASH_VERSION:-}\" ]; then exec /bin/bash "
+        "\"$0\" \"$@\"; fi'"
+    ) in source
+    assert "$parameters = @{ commands = @($bashTransport) + $Commands }" in source
+    return [_BASH_TRANSPORT, *commands]
+
+
 def _activate_payload() -> str:
     commands = _action_literals("Activate", "if ($Action -eq 'Deactivate')")
     guard = _function_payload("New-ActivationGuardCommand")
@@ -66,11 +78,74 @@ def _activate_payload() -> str:
     assert activation.index("$activationGuardCommand") < activation.index(
         "moodle-autotask-refresh-config"
     )
-    return "\n".join((commands[0], guard, *commands[1:]))
+    return "\n".join(_transported_commands([commands[0], guard, *commands[1:]]))
 
 
 def _deactivate_payload() -> str:
-    return "\n".join(_action_literals("Deactivate", "$gitStatus ="))
+    return "\n".join(_transported_commands(_action_literals("Deactivate", "$gitStatus =")))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX /bin/sh invocation")
+def test_ssm_bash_transport_reexecs_once_and_preserves_status_traps_and_arguments(
+    tmp_path: Path,
+) -> None:
+    """Run an exact SSM-style command script from /bin/sh, as the agent does."""
+    exit_trap = (
+        'trap \'status=$?; printf "trap-status=%s\\n" "$status" '
+        '>> "$SSM_TRANSPORT_LOG"; exit "$status"\' EXIT'
+    )
+    commands = _transported_commands(
+        [
+            "set -eu",
+            'test -n "${BASH_VERSION:-}"',
+            'arguments=("$@")',
+            'test "${arguments[0]}" = "argument with spaces"',
+            'test "${arguments[1]}" = "quote\'and"\'$dollar\'',
+            'printf "%s\\n" "$BASHPID" >> "$SSM_TRANSPORT_LOG"',
+            exit_trap,
+            "exit 23",
+        ]
+    )
+    script = tmp_path / "_script.sh"
+    log = tmp_path / "transport.log"
+    script.write_text("\n".join(commands) + "\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        ["/bin/sh", str(script), "argument with spaces", "quote'and$dollar"],
+        check=False,
+        capture_output=True,
+        env=os.environ | {"SSM_TRANSPORT_LOG": str(log)},
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 23
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert lines[0].isdigit()
+    assert lines[1] == "trap-status=23"
+
+
+def test_every_controller_ssm_action_uses_the_bash_first_command_contract() -> None:
+    source = _DEPLOY.read_text(encoding="utf-8")
+    transport = source.index("$bashTransport =")
+    parameters = source.index("$parameters = @{ commands = @($bashTransport) + $Commands }")
+
+    assert transport < parameters
+    assert source.count("exec /bin/bash") == 1
+    assert source.count("Send-ControllerCommand -TargetInstanceId") == 6
+    actions = (
+        ("Status", "if ($Action -eq 'CodexLogin')"),
+        ("CodexLogin", "if ($Action -eq 'CodexSmoke')"),
+        ("CodexSmoke", "if ($Action -eq 'Activate')"),
+        ("Activate", "if ($Action -eq 'Deactivate')"),
+        ("Deactivate", "$gitStatus ="),
+    )
+    for action, following in actions:
+        assert _action_literals(action, following)[0] == "set -eu"
+    deploy = source[source.rindex("Send-ControllerCommand -TargetInstanceId") :]
+    assert re.search(r"-Commands @\(\s*'set -eu',", deploy)
+    assert _transported_commands(["set -eu"])[0] == _BASH_TRANSPORT
 
 
 def _scheduler_guard_payload(config: Path) -> str:

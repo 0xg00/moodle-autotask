@@ -407,7 +407,10 @@ function Send-ControllerCommand {
         [string]$Comment
     )
 
-    $parameters = @{ commands = $Commands } | ConvertTo-Json -Compress
+    # AWS-RunShellScript starts its generated script with /bin/sh. Re-exec the
+    # complete script under Bash before any command payload can use Bash syntax.
+    $bashTransport = 'if [ -z "${BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi'
+    $parameters = @{ commands = @($bashTransport) + $Commands } | ConvertTo-Json -Compress
     $parametersPath = Join-Path $runtimeRoot "ssm-$([Guid]::NewGuid().ToString('N')).json"
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($parametersPath, $parameters, $utf8NoBom)
