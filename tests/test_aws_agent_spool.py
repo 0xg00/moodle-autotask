@@ -803,6 +803,107 @@ def test_lab_plan_executes_once_then_waits_for_final_report(tmp_path: Path) -> N
     )
 
 
+def test_noncentral_broker_jobs_run_through_codex_with_bound_guest_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs, results = tmp_path / "jobs", tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    prepared = _prepared(event, runner)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    executor = _LabExecutor()
+    prompts: dict[str, str] = {}
+
+    def fake_run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        workspace = Path(arguments[arguments.index("-C") + 1])
+        job = json.loads((jobs / workspace.name / "job.json").read_text(encoding="utf-8"))
+        phase = job["phase"]
+        prompts[phase] = arguments[-1]
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "succeeded": True,
+                    "summary": "done",
+                    "reportMarkdown": "# Informe" if phase == "lab_report" else "",
+                    "powershellCommands": ["Write-Output 'ok'"] if phase == "lab_plan" else [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
+    agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
+    handle = LabHandle("lab:test")
+
+    assert broker.step(event, prepared, ExecutionMode.HYBRID, handle, executor).status == "pending"
+    assert agent.process_one() == "processed"
+    assert broker.step(event, prepared, ExecutionMode.HYBRID, handle, executor).status == "pending"
+    assert agent.process_one() == "processed"
+    assert (
+        broker.step(event, prepared, ExecutionMode.HYBRID, handle, executor).status == "succeeded"
+    )
+
+    transfer = {"guestPaths": list(prepared.guest_input_paths), "transferDigest": "e" * 64}
+    encoded_transfer = json.dumps(transfer, ensure_ascii=False, separators=(",", ":"))
+    assert encoded_transfer in prompts["lab_plan"]
+    assert encoded_transfer in prompts["lab_report"]
+
+
+def test_noncentral_runner_rejects_forged_guest_transfer_and_context(
+    tmp_path: Path,
+) -> None:
+    jobs, results = tmp_path / "jobs", tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    prepared = _prepared(event, runner)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    executor = _LabExecutor()
+    handle = LabHandle("lab:test")
+    assert broker.step(event, prepared, ExecutionMode.HYBRID, handle, executor).status == "pending"
+    plan = _job_for_phase(jobs, "lab_plan")
+    original_plan = json.loads((plan / "job.json").read_text(encoding="utf-8"))
+
+    def rejects_plan(mutator: Callable[[dict[str, object]], None]) -> None:
+        payload = json.loads(json.dumps(original_plan))
+        mutator(payload)
+        (plan / "job.json").write_bytes(_canonical(payload))
+        with pytest.raises(AgentSpoolError):
+            _load_job(plan)
+
+    def remove_paths(payload: dict[str, object]) -> None:
+        cast(dict[str, object], payload["guestInputTransfer"]).pop("guestPaths")
+
+    rejects_plan(remove_paths)
+    rejects_plan(
+        lambda payload: cast(dict[str, object], payload["guestInputTransfer"]).__setitem__(
+            "unexpected", True
+        )
+    )
+    rejects_plan(
+        lambda payload: cast(dict[str, object], payload["guestInputTransfer"]).__setitem__(
+            "transferDigest", "f" * 64
+        )
+    )
+    rejects_plan(
+        lambda payload: cast(dict[str, object], payload["guestInputTransfer"]).__setitem__(
+            "guestPaths",
+            ["C:\\ProgramData\\MoodleAutotask\\inputs\\" + "e" * 64 + "\\..\\forged.txt"],
+        )
+    )
+    (plan / "job.json").write_bytes(_canonical(original_plan))
+    _write_result(results, plan, commands=["Write-Output 'ok'"])
+    assert broker.step(event, prepared, ExecutionMode.HYBRID, handle, executor).status == "pending"
+    report = _job_for_phase(jobs, "lab_report")
+    report_payload = json.loads((report / "job.json").read_text(encoding="utf-8"))
+    cast(dict[str, object], report_payload["context"])["transferDigest"] = "f" * 64
+    (report / "job.json").write_bytes(_canonical(report_payload))
+    with pytest.raises(AgentSpoolError):
+        _load_job(report)
+
+
 def test_lab_dispatch_crash_before_command_id_persistence_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

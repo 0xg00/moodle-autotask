@@ -360,7 +360,8 @@ def _load_job(directory: Path) -> dict[str, object]:
     ):
         raise AgentSpoolError("agent job identity is invalid")
     _attachments(job)
-    context_digest = _context_digest(phase, job.get("context"))
+    transfer = _guest_input_transfer(phase, job)
+    context_digest = _context_digest(phase, job.get("context"), transfer)
     expected_id = hashlib.sha256(
         _canonical(
             {
@@ -518,27 +519,75 @@ def _identity(value: object, prefix: str) -> bool:
     )
 
 
-def _context_digest(phase: str, context: object) -> str | None:
-    if phase in {"central", "lab_plan"}:
+def _guest_input_transfer(
+    phase: str, job: dict[str, object]
+) -> tuple[str, tuple[str, ...]] | None:
+    if phase == "central":
+        if "guestInputTransfer" in job:
+            raise AgentSpoolError("central job guest input transfer is invalid")
+        return None
+    transfer = job.get("guestInputTransfer")
+    if not isinstance(transfer, dict) or set(transfer) != {"transferDigest", "guestPaths"}:
+        raise AgentSpoolError("agent job guest input transfer is invalid")
+    digest = transfer.get("transferDigest")
+    paths = transfer.get("guestPaths")
+    if (
+        not isinstance(digest, str)
+        or _DIGEST.fullmatch(digest) is None
+        or not isinstance(paths, list)
+        or len(paths) > 32
+    ):
+        raise AgentSpoolError("agent job guest input transfer is invalid")
+    root = f"C:\\ProgramData\\MoodleAutotask\\inputs\\{digest}\\"
+    validated: list[str] = []
+    for path in paths:
+        if (
+            not isinstance(path, str)
+            or len(path.encode("utf-8")) > 512
+            or not path.startswith(root)
+            or not _safe_filename(path.removeprefix(root))
+        ):
+            raise AgentSpoolError("agent job guest input paths are invalid")
+        validated.append(path)
+    if len({path.casefold() for path in validated}) != len(validated):
+        raise AgentSpoolError("agent job guest input paths are invalid")
+    return digest, tuple(validated)
+
+
+def _context_digest(
+    phase: str, context: object, transfer: tuple[str, tuple[str, ...]] | None
+) -> str | None:
+    if phase == "central":
         if context is not None:
             raise AgentSpoolError("agent job context is invalid")
         return None
+    if transfer is None:
+        raise AgentSpoolError("agent job guest input transfer is invalid")
+    transfer_digest, _paths = transfer
+    if phase == "lab_plan":
+        if context is not None:
+            raise AgentSpoolError("agent job context is invalid")
+        return transfer_digest
     if not isinstance(context, dict) or set(context) != {
         "planDigest",
         "labSucceeded",
         "transcript",
+        "transferDigest",
     }:
         raise AgentSpoolError("agent job context is invalid")
     digest = context.get("planDigest")
     if (
         not isinstance(digest, str)
         or _DIGEST.fullmatch(digest) is None
+        or context.get("transferDigest") != transfer_digest
         or not isinstance(context.get("labSucceeded"), bool)
         or not isinstance(context.get("transcript"), str)
         or len(cast(str, context["transcript"]).encode("utf-8")) > _MAX_JOB_BYTES
     ):
         raise AgentSpoolError("agent job context is invalid")
-    return digest
+    return hashlib.sha256(
+        _canonical({"planDigest": digest, "transferDigest": transfer_digest})
+    ).hexdigest()
 
 
 def _load_model_result(path: Path, phase: str) -> dict[str, object]:
@@ -1346,8 +1395,17 @@ def _prompt(job: dict[str, object]) -> str:
             "powershellCommands debe ser [], reportMarkdown debe documentar el trabajo y "
             "succeeded sólo puede ser true si el resultado está completo y verificable."
         )
+    transfer = _guest_input_transfer(phase, job)
+    assert transfer is not None
+    transfer_digest, guest_paths = transfer
+    guest_inputs = json.dumps(
+        {"guestPaths": guest_paths, "transferDigest": transfer_digest},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     if phase == "lab_plan":
         return base + (
+            f"Inputs ya transferidos al laboratorio (identidad inmutable):\n{guest_inputs}\n\n"
             "Prepara un plan ejecutable para Windows Server aislado. Devuelve comandos "
             "PowerShell no interactivos, idempotentes y autocontenidos en powershellCommands. "
             "No incluyas secretos. reportMarkdown puede explicar el plan, pero aún no afirmes "
@@ -1357,6 +1415,7 @@ def _prompt(job: dict[str, object]) -> str:
     if not isinstance(context, dict):
         raise AgentSpoolError("lab report job has no execution context")
     return base + (
+        f"Inputs transferidos al laboratorio (identidad inmutable):\n{guest_inputs}\n\n"
         "Los comandos ya fueron ejecutados en el laboratorio. Analiza el siguiente resultado "
         "y redacta el informe final. powershellCommands debe ser []. Marca succeeded según "
         f"la evidencia real. Contexto de ejecución:\n{json.dumps(context, ensure_ascii=False)}"
