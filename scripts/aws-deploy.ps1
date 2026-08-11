@@ -23,7 +23,13 @@ param(
     [int]$LabRootVolumeSizeGiB = 80,
 
     [ValidatePattern('^$|^i-[0-9a-f]{8,17}$')]
-    [string]$InstanceId = ''
+    [string]$InstanceId = '',
+
+    [string[]]$CourseShortname = @(),
+
+    [switch]$AllCourses,
+
+    [int]$MaxNewEventsPerCycle = 0
 )
 
 Set-StrictMode -Version Latest
@@ -31,6 +37,181 @@ $ErrorActionPreference = 'Stop'
 $env:AWS_CLI_FILE_ENCODING = 'UTF-8'
 $env:AWS_CLI_OUTPUT_ENCODING = 'UTF-8'
 $env:AWS_PAGER = ''
+
+function New-SchedulerConfigJson {
+    param(
+        [string[]]$SelectedCourseShortnames,
+
+        [Parameter(Mandatory)]
+        [bool]$UseAllCourses,
+
+        [Parameter(Mandatory)]
+        [int]$EventCap
+    )
+
+    if (($UseAllCourses -and $SelectedCourseShortnames.Count -gt 0) -or
+        (-not $UseAllCourses -and $SelectedCourseShortnames.Count -eq 0)) {
+        throw 'Deploy requires exactly one scheduler scope: -CourseShortname or -AllCourses.'
+    }
+    if ($EventCap -lt 1 -or $EventCap -gt 100) {
+        throw 'Deploy requires -MaxNewEventsPerCycle from 1 through 100.'
+    }
+    if ($SelectedCourseShortnames.Count -gt 64) {
+        throw 'At most 64 course shortnames are allowed.'
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $totalUtf8Bytes = 0
+    foreach ($shortname in $SelectedCourseShortnames) {
+        if ($null -eq $shortname) {
+            throw 'Course shortnames must be non-empty and free of ASCII controls.'
+        }
+        try {
+            $shortnameBytes = $strictUtf8.GetByteCount($shortname)
+        }
+        catch [ArgumentException] {
+            throw 'Course shortnames must be valid UTF-8 text.'
+        }
+        if ($shortnameBytes -eq 0 -or $shortnameBytes -gt 255 -or
+            $shortname -match '[\x00-\x1F\x7F]') {
+            throw 'Course shortnames must be non-empty and free of ASCII controls.'
+        }
+        if (-not $seen.Add($shortname)) {
+            throw 'Course shortnames must be exactly unique.'
+        }
+        $totalUtf8Bytes += $shortnameBytes
+    }
+    if ($totalUtf8Bytes -gt 2048) {
+        throw 'Course shortnames exceed the 2048 UTF-8 byte limit.'
+    }
+    if ($UseAllCourses) {
+        $json = [ordered]@{ allCourses = $true; maxNewEventsPerCycle = $EventCap } |
+            ConvertTo-Json -Compress
+    }
+    else {
+        $json = [ordered]@{ courseShortnames = @($SelectedCourseShortnames); maxNewEventsPerCycle = $EventCap } |
+            ConvertTo-Json -Compress
+    }
+    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 16384) {
+        throw 'Scheduler configuration exceeds the 16 KiB limit.'
+    }
+    return $json
+}
+
+function New-SchedulerConfigInstallCommand {
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9+/]+={0,2}$')]
+        [string]$Base64Config
+    )
+
+    return @"
+python3 - '$Base64Config' <<'PY'
+import base64
+import grp
+import json
+import os
+import stat
+import sys
+import tempfile
+
+encoded = sys.argv[1]
+target = "/etc/moodle-autotask/scheduler.json"
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+try:
+    raw = base64.b64decode(encoded, validate=True)
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+    raise SystemExit("invalid scheduler configuration") from error
+keys = set(value) if isinstance(value, dict) else set()
+courses = value.get("courseShortnames") if isinstance(value, dict) else None
+all_courses = value.get("allCourses") if isinstance(value, dict) else None
+cap = value.get("maxNewEventsPerCycle") if isinstance(value, dict) else None
+valid_courses = (
+    keys == {"courseShortnames", "maxNewEventsPerCycle"}
+    and isinstance(courses, list) and courses
+    and len(courses) <= 64
+    and all(isinstance(item, str) and item and len(item.encode("utf-8")) <= 255 and not any(ord(char) <= 0x1f or ord(char) == 0x7f for char in item) for item in courses)
+    and sum(len(item.encode("utf-8")) for item in courses) <= 2048
+    and len(set(courses)) == len(courses)
+)
+if not (valid_courses or (keys == {"allCourses", "maxNewEventsPerCycle"} and all_courses is True)):
+    raise SystemExit("scheduler scope must be explicit and unambiguous")
+if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 100:
+    raise SystemExit("invalid scheduler event cap")
+if len(raw) > 16 * 1024:
+    raise SystemExit("scheduler configuration is too large")
+try:
+    old = os.lstat(target)
+except FileNotFoundError:
+    old = None
+if old is not None and (not stat.S_ISREG(old.st_mode) or stat.S_ISLNK(old.st_mode)):
+    raise SystemExit("scheduler config target is unsafe")
+directory = os.path.dirname(target)
+parent = os.lstat(directory)
+if (
+    not stat.S_ISDIR(parent.st_mode)
+    or stat.S_ISLNK(parent.st_mode)
+    or parent.st_uid != 0
+    or stat.S_IMODE(parent.st_mode) & 0o022
+):
+    raise SystemExit("scheduler config directory is unsafe")
+fd, temporary = tempfile.mkstemp(prefix=".scheduler.", dir=directory)
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chown(temporary, 0, grp.getgrnam("moodle-autotask").gr_gid)
+    os.chmod(temporary, 0o640)
+    os.replace(temporary, target)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+"@
+}
+
+function New-SchedulerConfigGuardCommand {
+    param(
+        [ValidatePattern('^/[A-Za-z0-9._/-]+$')]
+        [string]$ConfigPath = '/etc/moodle-autotask/scheduler.json'
+    )
+
+    return (@'
+scheduler_was_active=false; telegram_was_active=false; worker_was_active=false; agent_was_active=false; agent_unit_was_present=false; legacy_three_was_active=false; scheduler_config_backup=""; scheduler_config_candidate=""; scheduler_config_backup_complete=false
+if systemctl is-active --quiet moodle-autotask-scheduler.service; then scheduler_was_active=true; fi
+if systemctl is-active --quiet moodle-autotask-telegram.service; then telegram_was_active=true; fi
+if systemctl is-active --quiet moodle-autotask-worker.service; then worker_was_active=true; fi
+if systemctl cat moodle-autotask-agent.service >/dev/null 2>&1; then agent_unit_was_present=true; fi
+if systemctl is-active --quiet moodle-autotask-agent.service; then agent_was_active=true; fi
+if [ "$agent_unit_was_present" = false ] && [ "$scheduler_was_active" = true ] && [ "$telegram_was_active" = true ] && [ "$worker_was_active" = true ]; then legacy_three_was_active=true; fi
+restore_scheduler_config() { result=$?; trap - EXIT; if [ -n "$scheduler_config_candidate" ]; then rm -f "$scheduler_config_candidate" || true; fi; if [ "$scheduler_config_backup_complete" = true ]; then systemctl stop moodle-autotask-scheduler.service || true; mv -f "$scheduler_config_backup" __CONFIG_PATH__ || true; fi; if [ "$scheduler_was_active" = true ]; then systemctl start moodle-autotask-scheduler.service || true; fi; if [ "$telegram_was_active" = true ]; then systemctl start moodle-autotask-telegram.service || true; fi; if [ "$worker_was_active" = true ]; then systemctl start moodle-autotask-worker.service || true; fi; if [ "$agent_was_active" = true ]; then systemctl start moodle-autotask-agent.service || true; fi; exit "$result"; }; trap restore_scheduler_config EXIT
+if [ -e __CONFIG_PATH__ ] || [ -L __CONFIG_PATH__ ]; then test -f __CONFIG_PATH__ && test ! -L __CONFIG_PATH__ || exit 1; scheduler_config_candidate=$(mktemp "$(dirname __CONFIG_PATH__)/.scheduler.candidate.XXXXXX"); cp -p __CONFIG_PATH__ "$scheduler_config_candidate"; scheduler_config_backup="$scheduler_config_candidate"; scheduler_config_candidate=""; scheduler_config_backup_complete=true; fi
+'@).Replace('__CONFIG_PATH__', $ConfigPath)
+}
+
+if ($Action -eq 'Deploy') {
+    $schedulerConfigJson = New-SchedulerConfigJson -SelectedCourseShortnames $CourseShortname `
+        -UseAllCourses $AllCourses.IsPresent -EventCap $MaxNewEventsPerCycle
+    $schedulerConfigBase64 = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($schedulerConfigJson)
+    )
+}
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $runtimeRoot = Join-Path $repoRoot '.runtime\aws-deploy'
@@ -422,6 +603,8 @@ Invoke-Aws -Arguments @('s3', 'cp', $wheel.FullName, $artifactUri, '--only-show-
 
 $releaseRoot = "/opt/moodle-autotask/releases/$wheelDigest"
 $remoteWheel = "/tmp/$($wheel.Name)"
+$schedulerConfigInstallCommand = New-SchedulerConfigInstallCommand -Base64Config $schedulerConfigBase64
+$schedulerConfigGuardCommand = New-SchedulerConfigGuardCommand
 Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy $commitSha" -Commands @(
     'set -eu',
     "aws s3 cp '$artifactUri' '$remoteWheel' --only-show-errors",
@@ -433,12 +616,12 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     "'$releaseRoot/venv/bin/moodle-autotask-telegram' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-worker' --help >/dev/null",
     "'$releaseRoot/venv/bin/moodle-autotask-agent' --help >/dev/null",
-    'scheduler_was_active=false; if systemctl is-active --quiet moodle-autotask-scheduler.service; then scheduler_was_active=true; systemctl stop moodle-autotask-scheduler.service; fi',
-    'telegram_was_active=false; if systemctl is-active --quiet moodle-autotask-telegram.service; then telegram_was_active=true; systemctl stop moodle-autotask-telegram.service; fi',
-    'worker_was_active=false; if systemctl is-active --quiet moodle-autotask-worker.service; then worker_was_active=true; systemctl stop moodle-autotask-worker.service; fi',
-    'agent_unit_was_present=false; if systemctl cat moodle-autotask-agent.service >/dev/null 2>&1; then agent_unit_was_present=true; fi',
-    'agent_was_active=false; if systemctl is-active --quiet moodle-autotask-agent.service; then agent_was_active=true; systemctl stop moodle-autotask-agent.service; fi',
-    'legacy_three_was_active=false; if [ "$agent_unit_was_present" = false ] && [ "$scheduler_was_active" = true ] && [ "$telegram_was_active" = true ] && [ "$worker_was_active" = true ]; then legacy_three_was_active=true; fi',
+    $schedulerConfigGuardCommand,
+    'if [ "$scheduler_was_active" = true ]; then systemctl stop moodle-autotask-scheduler.service; fi',
+    'if [ "$telegram_was_active" = true ]; then systemctl stop moodle-autotask-telegram.service; fi',
+    'if [ "$worker_was_active" = true ]; then systemctl stop moodle-autotask-worker.service; fi',
+    'if [ "$agent_was_active" = true ]; then systemctl stop moodle-autotask-agent.service; fi',
+    $schedulerConfigInstallCommand,
     "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
     'mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current',
     "'/opt/moodle-autotask/current/venv/bin/moodle-autotask-controller' install --region '$Region' --environment '$Environment' --provisioner-role-arn '$labRoleArn' --subnet-id '$labSubnetId' --security-group-id '$labSecurityGroupId' --instance-profile-name '$labInstanceProfileName' --image-id '$labImageId' --artifact-bucket '$artifactBucket' --image-importer-role-arn '$imageImporterRoleArn' --vmimport-role-name '$vmImportRoleName' --instance-type '$LabInstanceType' --root-volume-size-gib '$LabRootVolumeSizeGiB'",
@@ -450,6 +633,7 @@ Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment "Deploy 
     'if [ "$worker_was_active" = true ]; then systemctl start moodle-autotask-worker.service; fi',
     'if [ "$agent_was_active" = true ] || [ "$legacy_three_was_active" = true ]; then systemctl enable --now moodle-autotask-agent.service; fi',
     "rm -f '$remoteWheel'",
+    'trap - EXIT; if [ -n "$scheduler_config_candidate" ]; then rm -f "$scheduler_config_candidate"; fi; if [ -n "$scheduler_config_backup" ]; then rm -f "$scheduler_config_backup"; fi',
     "echo 'deployed-commit=$commitSha'",
     "echo 'deployed-sha256=$wheelDigest'"
 )

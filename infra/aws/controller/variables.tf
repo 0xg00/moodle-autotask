@@ -90,3 +90,46 @@ variable "additional_tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "scheduler_course_shortnames" {
+  description = "Explicit Moodle course shortnames for scheduler discovery; empty only with scheduler_all_courses."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for shortname in var.scheduler_course_shortnames :
+      length(shortname) > 0 &&
+      (length(base64encode(shortname)) / 4 * 3 -
+        (endswith(base64encode(shortname), "==") ? 2 : endswith(base64encode(shortname), "=") ? 1 : 0)) <= 255 &&
+      !can(regex("[\\x00-\\x1F\\x7F]", shortname))
+    ]) && length(distinct(var.scheduler_course_shortnames)) == length(var.scheduler_course_shortnames) && length(var.scheduler_course_shortnames) <= 64 && sum([
+      for shortname in var.scheduler_course_shortnames :
+      length(base64encode(shortname)) / 4 * 3 -
+      (endswith(base64encode(shortname), "==") ? 2 : endswith(base64encode(shortname), "=") ? 1 : 0)
+    ]) <= 2048
+    error_message = "scheduler_course_shortnames must be exact unique non-empty names without ASCII controls (64 names, 2048 UTF-8 bytes total, 255 per name)."
+  }
+
+  validation {
+    condition     = (var.scheduler_all_courses && length(var.scheduler_course_shortnames) == 0) || (!var.scheduler_all_courses && length(var.scheduler_course_shortnames) > 0)
+    error_message = "Set exactly one scheduler scope: non-empty scheduler_course_shortnames or scheduler_all_courses=true."
+  }
+}
+
+variable "scheduler_all_courses" {
+  description = "Deliberately discover assignments in every course; cannot be combined with scheduler_course_shortnames."
+  type        = bool
+  default     = false
+}
+
+variable "scheduler_max_new_events_per_cycle" {
+  description = "Bounded number of new approval events created in one scheduler cycle."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.scheduler_max_new_events_per_cycle >= 1 && var.scheduler_max_new_events_per_cycle <= 100 && floor(var.scheduler_max_new_events_per_cycle) == var.scheduler_max_new_events_per_cycle
+    error_message = "scheduler_max_new_events_per_cycle must be an integer from 1 through 100."
+  }
+}

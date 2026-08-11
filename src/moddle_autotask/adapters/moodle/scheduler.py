@@ -16,6 +16,9 @@ from typing import Protocol, TextIO
 from .models import MoodleAssignmentSnapshot
 from .state import MoodleState, NotificationAttachment, NotificationDraft, OutboxClaim
 
+MAX_SCHEDULER_COURSES = 64
+MAX_SCHEDULER_COURSE_UTF8_BYTES = 2048
+
 
 class NotificationSink(Protocol):
     def __call__(self, event: object) -> None: ...
@@ -46,14 +49,30 @@ class SchedulerOptions:
             or not self.retry_base_seconds <= self.retry_max_seconds <= 86400
         ):
             raise ValueError("retry maximum seconds are invalid")
-        if not isinstance(self.course_shortnames, tuple) or any(
-            not isinstance(item, str) or not item or item != item.upper() or not item.isascii()
-            or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" for character in item)
-            for item in self.course_shortnames
+        if not isinstance(self.course_shortnames, tuple) or len(
+            self.course_shortnames
+        ) > MAX_SCHEDULER_COURSES:
+            raise ValueError("course shortnames are invalid")
+        if any(
+                not isinstance(item, str)
+                or not item
+                or any(
+                    ord(character) <= 0x1F or ord(character) == 0x7F for character in item
+                )
+                for item in self.course_shortnames
         ):
             raise ValueError("course shortnames are invalid")
-        if tuple(sorted(set(self.course_shortnames))) != self.course_shortnames:
-            raise ValueError("course shortnames must be sorted and unique")
+        try:
+            course_bytes = tuple(item.encode("utf-8") for item in self.course_shortnames)
+        except UnicodeEncodeError as error:
+            raise ValueError("course shortnames are invalid") from error
+        if any(len(item) > 255 for item in course_bytes):
+            raise ValueError("course shortnames are invalid")
+        if sum(len(item) for item in course_bytes) > MAX_SCHEDULER_COURSE_UTF8_BYTES:
+            raise ValueError("course shortnames are too large")
+        if len(set(self.course_shortnames)) != len(self.course_shortnames):
+            raise ValueError("course shortnames must be unique")
+        object.__setattr__(self, "course_shortnames", tuple(sorted(self.course_shortnames)))
         if (
             not isinstance(self.max_new_events_per_cycle, int)
             or not 1 <= self.max_new_events_per_cycle <= 100

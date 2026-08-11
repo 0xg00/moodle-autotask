@@ -20,6 +20,7 @@ from .scheduler import (
     run,
     summary_json,
 )
+from .scheduler_config import load_scheduler_config
 from .service import MoodleService
 from .state import MoodleState
 from .telegram import TelegramApprovalSink, TelegramClient, TelegramConfig
@@ -45,7 +46,8 @@ def _parser() -> _SafeArgumentParser:
         child.add_argument("--retry-base-seconds", type=int, default=5)
         child.add_argument("--retry-max-seconds", type=int, default=3600)
         child.add_argument("--course-shortname", action="append", default=[])
-        child.add_argument("--max-new-events-per-cycle", type=int, default=100)
+        child.add_argument("--max-new-events-per-cycle", type=int)
+        child.add_argument("--scheduler-config-file", type=Path)
         child.add_argument("--request-timeout-seconds", type=int, default=15)
         child.add_argument("--telegram-config-file", type=Path)
         child.add_argument("--approval-state", type=Path)
@@ -63,17 +65,30 @@ def main(
 ) -> int:
     args = _parser().parse_args(argv)
     try:
-        course_shortnames = tuple(args.course_shortname)
-        if tuple(sorted(set(course_shortnames))) != course_shortnames:
-            raise ValueError("course shortnames must be sorted and unique")
-        options = SchedulerOptions(
-            args.lease_seconds,
-            args.batch_size,
-            args.retry_base_seconds,
-            args.retry_max_seconds,
-            course_shortnames,
-            args.max_new_events_per_cycle,
-        )
+        if args.scheduler_config_file is not None:
+            if args.course_shortname or args.max_new_events_per_cycle is not None:
+                raise ValueError("scheduler config cannot be combined with scope arguments")
+            configured = load_scheduler_config(args.scheduler_config_file)
+            options = SchedulerOptions(
+                args.lease_seconds,
+                args.batch_size,
+                args.retry_base_seconds,
+                args.retry_max_seconds,
+                configured.course_shortnames,
+                configured.max_new_events_per_cycle,
+            )
+        else:
+            course_shortnames = tuple(args.course_shortname)
+            if tuple(sorted(set(course_shortnames))) != course_shortnames:
+                raise ValueError("course shortnames must be sorted and unique")
+            options = SchedulerOptions(
+                args.lease_seconds,
+                args.batch_size,
+                args.retry_base_seconds,
+                args.retry_max_seconds,
+                course_shortnames,
+                100 if args.max_new_events_per_cycle is None else args.max_new_events_per_cycle,
+            )
         if args.command == "run" and not 1 <= args.interval_seconds <= 7 * 86400:
             raise ValueError("interval seconds are invalid")
         if not 1 <= args.request_timeout_seconds <= 120:

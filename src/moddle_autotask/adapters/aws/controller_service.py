@@ -451,8 +451,7 @@ def _scheduler_unit() -> str:
             "--approval-state /var/lib/moodle-autotask/approval.sqlite3",
             "--interval-seconds 86400",
             "--request-timeout-seconds 60",
-            "--course-shortname ASIX-CAMPAIGN-01",
-            "--max-new-events-per-cycle 4",
+            "--scheduler-config-file /etc/moodle-autotask/scheduler.json",
         )
     )
     return "\n".join(

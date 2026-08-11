@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 
 from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.scheduler import CycleResult
+from moddle_autotask.adapters.moodle.scheduler import CycleResult, SchedulerOptions
 from moddle_autotask.adapters.moodle.scheduler_cli import _parser, main
 from moddle_autotask.adapters.moodle.service import MoodleService
 
@@ -315,3 +315,44 @@ def test_scheduler_constructs_telegram_sink_only_when_requested(
         == 0
     )
     assert seen == [sink]
+
+
+def test_scheduler_config_file_is_exclusive_and_sets_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "scheduler.json"
+    config.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.load_scheduler_config",
+        lambda path: SchedulerOptions(course_shortnames=("ASIX",), max_new_events_per_cycle=4),
+    )
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
+        lambda path: MoodleConnectionConfig("https://example.test", "safe"),
+    )
+    monkeypatch.setattr(
+        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
+    )
+    seen: list[object] = []
+
+    def once_runner(*args: object) -> CycleResult:
+        seen.append(args[-1])
+        return CycleResult(True, 0, 0, 0)
+
+    assert main(
+        [
+            "once", "--state", str(tmp_path / "state"), "--token-file", str(tmp_path / "token"),
+            "--scheduler-config-file", str(config),
+        ],
+        service_factory=lambda config: cast(MoodleService, object()),
+        once_runner=once_runner,
+    ) == 0
+    assert isinstance(seen[0], SchedulerOptions)
+    assert seen[0].course_shortnames == ("ASIX",)
+    assert main(
+        [
+            "once", "--state", str(tmp_path / "state"), "--token-file", str(tmp_path / "token"),
+            "--scheduler-config-file", str(config), "--course-shortname", "OTHER",
+        ],
+        service_factory=lambda config: cast(MoodleService, object()),
+    ) == 1

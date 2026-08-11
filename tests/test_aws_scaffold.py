@@ -1,4 +1,11 @@
+import json
+import os
+import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 AWS_ROOT = ROOT / "infra" / "aws"
@@ -27,6 +34,130 @@ def test_controller_scheduler_pins_a_campaign_safe_moodle_timeout() -> None:
 
     assert "moodle-autotask-scheduler run" in cloud_init
     assert "--request-timeout-seconds 60" in cloud_init
+
+
+def test_controller_scheduler_scope_is_explicit_and_has_no_fixture_hardcode() -> None:
+    cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(encoding="utf-8")
+    compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")
+    variables = (AWS_ROOT / "controller" / "variables.tf").read_text(encoding="utf-8")
+    deploy = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
+
+    for source in (cloud_init, compute, variables, deploy):
+        assert "ASIX-CAMPAIGN-01" not in source
+    assert "--scheduler-config-file /etc/${project_name}/scheduler.json" in cloud_init
+    assert "scheduler_config_base64" in compute and "base64encode(jsonencode" in compute
+    assert "scheduler_course_shortnames" in variables and "scheduler_all_courses" in variables
+    assert "scheduler_max_new_events_per_cycle" in variables
+    assert "length(base64encode(shortname))" in variables
+    assert "length(base64encode(local.controller_user_data)) <= 21848" in compute
+    assert "New-SchedulerConfigJson" in deploy
+    assert "Deploy requires exactly one scheduler scope" in deploy
+    assert "os.replace(temporary, target)" in cloud_init
+    assert "os.replace(temporary, target)" in deploy
+    assert "os.chmod(temporary, 0o640)" in cloud_init and "os.chmod(temporary, 0o640)" in deploy
+    assert "len(courses) <= 64" in cloud_init and "2048" in cloud_init
+    assert deploy.index("$schedulerConfigInstallCommand,") < deploy.index(
+        "moodle-autotask-controller' install"
+    )
+    assert deploy.index("trap restore_scheduler_config EXIT") < deploy.index(
+        "moodle-autotask-controller' install"
+    )
+    deploy_block = deploy.split(
+        'Send-ControllerCommand -TargetInstanceId $controllerInstanceId', 1
+    )[1]
+    assert deploy_block.index("$schedulerConfigGuardCommand,") < deploy_block.index(
+        'if [ "$scheduler_was_active" = true ]; then systemctl stop'
+    )
+
+
+def test_controller_tfvars_example_is_rejected_until_scope_is_selected() -> None:
+    example = (AWS_ROOT / "controller" / "terraform.tfvars.example").read_text(
+        encoding="utf-8"
+    )
+    assert "scheduler_course_shortnames       = []" in example
+    assert "scheduler_all_courses             = false" in example
+
+
+def test_deploy_scope_renderer_preserves_exact_unicode_and_rejects_limits() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    path = (ROOT / "scripts" / "aws-deploy.ps1").as_posix().replace("'", "''")
+    harness = f"""
+$source = [IO.File]::ReadAllText('{path}')
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$pattern = '(?s)function New-SchedulerConfigJson \\{{.*?\\r?\\n\\}}\\r?\\n\\r?\\n'
+$match = [regex]::Match($source, $pattern + 'function New-SchedulerConfigInstallCommand')
+if (-not $match.Success) {{ throw 'could not extract scope renderer' }}
+$definition = $match.Value -replace '\\r?\\nfunction New-SchedulerConfigInstallCommand$', ''
+Invoke-Expression $definition
+$names = @(
+    [string]::Concat('Stra', [char]0x00DF, 'e'), 'STRASSE',
+    [string]::Concat([char]0x200E, 'format name'),
+    [string]::Concat('A', [char]0xD83D, [char]0xDE00)
+)
+New-SchedulerConfigJson -SelectedCourseShortnames $names -UseAllCourses $false -EventCap 4
+"""
+    rendered = subprocess.run(
+        [powershell, "-NoProfile", "-Command", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    assert json.loads(rendered.stdout)["courseShortnames"] == [
+        "Straße",
+        "STRASSE",
+        "\u200eformat name",
+        "A😀",
+    ]
+    oversized = (
+        harness
+        + "\nNew-SchedulerConfigJson -SelectedCourseShortnames "
+        + "@(1..65 | ForEach-Object { [string]$_ }) -UseAllCourses $false -EventCap 4"
+    )
+    rejected = subprocess.run(
+        [powershell, "-NoProfile", "-Command", oversized],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    assert rejected.returncode != 0 and "At most 64" in rejected.stderr
+    surrogate = harness + (
+        "\nNew-SchedulerConfigJson -SelectedCourseShortnames @([string][char]0xD800) "
+        "-UseAllCourses $false -EventCap 4"
+    )
+    invalid_unicode = subprocess.run(
+        [powershell, "-NoProfile", "-Command", surrogate],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    assert invalid_unicode.returncode != 0 and "valid UTF-8" in invalid_unicode.stderr
+    deploy_rejected = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-Command",
+            (
+                f"& '{path}' -Action Deploy -AccountId 123456789012 "
+                "-CourseShortname @(0..64 | ForEach-Object { [string]$_ }) "
+                "-MaxNewEventsPerCycle 4"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    assert deploy_rejected.returncode != 0
+    assert "At most 64" in deploy_rejected.stderr
 
 
 def test_state_and_artifact_storage_are_private_and_encrypted() -> None:
@@ -215,3 +346,212 @@ def test_controller_bootstrap_installs_bubblewrap() -> None:
     assert cloud_init.index("apt-get update") < cloud_init.index(
         "apt-get install -y bubblewrap "
     )
+
+
+def _scheduler_guard_command(config: Path) -> str:
+    deploy = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
+    match = re.search(
+        r"function New-SchedulerConfigGuardCommand.*?return \(@'\n(.*?)\n'@\)",
+        deploy,
+        re.DOTALL,
+    )
+    assert match is not None
+    return match.group(1).replace("__CONFIG_PATH__", str(config))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX bash service fake")
+@pytest.mark.parametrize(
+    ("failed_command", "failed_service"),
+    (
+        ("stop", "scheduler"),
+        ("stop", "telegram"),
+        ("stop", "worker"),
+        ("start", "scheduler"),
+        ("start", "telegram"),
+        ("start", "worker"),
+        ("enable", "agent"),
+    ),
+)
+def test_remote_deploy_recovery_keeps_migrated_legacy_config(
+    tmp_path: Path, failed_command: str, failed_service: str
+) -> None:
+    config = tmp_path / "scheduler.json"
+    state = tmp_path / "state"
+    script = f"""set -eu
+state={state!s}; mkdir -p "$state"; touch "$state/scheduler" "$state/telegram" "$state/worker"
+systemctl() {{
+  command=$1; shift
+  case "$command" in
+    is-active) test -f "$state/${{2%%.service}}"; return ;;
+    cat) return 1 ;;
+    stop) service=${{1%%.service}} ;;
+    start) service=${{1%%.service}} ;;
+    enable) test "$1" = --now; service=${{2%%.service}} ;;
+    *) return 2 ;;
+  esac
+  if [ "$command" = {failed_command!r} ] && [ "$service" = {failed_service!r} ] &&
+     [ ! -f "$state/failed-$service" ]; then
+    touch "$state/failed-$service"; return 1
+  fi
+  if [ "$command" = stop ]; then rm -f "$state/$service"; else touch "$state/$service"; fi
+}}
+{_scheduler_guard_command(config)}
+systemctl stop moodle-autotask-scheduler.service
+systemctl stop moodle-autotask-telegram.service
+systemctl stop moodle-autotask-worker.service
+systemctl stop moodle-autotask-agent.service
+printf migrated > {config!s}; chmod 640 {config!s}
+systemctl start moodle-autotask-scheduler.service
+systemctl start moodle-autotask-telegram.service
+systemctl start moodle-autotask-worker.service
+systemctl enable --now moodle-autotask-agent.service
+trap - EXIT
+"""
+    completed = subprocess.run(["bash", "-c", script], check=False, timeout=15)
+    assert completed.returncode != 0
+    assert (state / f"failed-{failed_service}").is_file()
+    if failed_command == "stop":
+        assert not config.exists()
+    else:
+        assert config.read_bytes() == b"migrated"
+        assert (config.stat().st_mode & 0o777) == 0o640
+    assert (state / "scheduler").is_file()
+    assert (state / "telegram").is_file()
+    assert (state / "worker").is_file()
+    assert not (state / "agent").exists()
+    assert not tuple(tmp_path.glob(".scheduler.previous.*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX bash service fake")
+def test_remote_deploy_recovery_restores_existing_config_after_install_failure(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "scheduler.json"
+    config.write_bytes(b"previous")
+    config.chmod(0o600)
+    state = tmp_path / "state"
+    script = f"""set -eu
+state={state!s}; mkdir -p "$state"
+touch "$state/scheduler" "$state/telegram" "$state/worker" "$state/agent"
+systemctl() {{
+  case "$1" in
+    is-active) test -f "$state/${{3%%.service}}" ;;
+    cat) return 0 ;;
+    stop) rm -f "$state/${{2%%.service}}" ;;
+    start) touch "$state/${{2%%.service}}" ;;
+    *) return 0 ;;
+  esac
+}}
+{_scheduler_guard_command(config)}
+printf migrated > {config!s}; chmod 640 {config!s}
+false
+"""
+    completed = subprocess.run(["bash", "-c", script], check=False, timeout=15)
+    assert completed.returncode != 0
+    assert config.read_bytes() == b"previous"
+    assert (config.stat().st_mode & 0o777) == 0o600
+    assert (state / "scheduler").is_file()
+    assert (state / "telegram").is_file()
+    assert (state / "worker").is_file()
+    assert (state / "agent").is_file()
+    assert not tuple(tmp_path.glob(".scheduler.previous.*"))
+
+
+def _all_active_systemctl_fake(state: Path, *, fail_stop_agent: bool = False) -> str:
+    return f"""state={state!s}; mkdir -p "$state"
+touch "$state/scheduler" "$state/telegram" "$state/worker" "$state/agent"
+systemctl() {{
+  command=$1
+  case "$command" in
+    is-active) test -f "$state/${{3%%.service}}"; return ;;
+    cat) return 0 ;;
+    stop)
+      service=${{2%%.service}}
+      if [ {str(fail_stop_agent).lower()} = true ] && [ "$service" = agent ] &&
+         [ ! -f "$state/failed-stop-agent" ]; then
+        touch "$state/failed-stop-agent"; return 1
+      fi
+      rm -f "$state/$service"; return
+      ;;
+    start) touch "$state/${{2%%.service}}"; return ;;
+    *) return 2 ;;
+  esac
+}}
+"""
+
+
+def _assert_all_services_active(state: Path) -> None:
+    for service in ("scheduler", "telegram", "worker", "agent"):
+        assert (state / service).is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX bash service fake")
+def test_remote_guard_restores_existing_config_after_stop_agent_failure(tmp_path: Path) -> None:
+    config = tmp_path / "scheduler.json"
+    config.write_bytes(b"previous")
+    config.chmod(0o600)
+    state = tmp_path / "state"
+    script = f"""set -eu
+{_all_active_systemctl_fake(state, fail_stop_agent=True)}
+{_scheduler_guard_command(config)}
+systemctl stop moodle-autotask-scheduler.service
+systemctl stop moodle-autotask-telegram.service
+systemctl stop moodle-autotask-worker.service
+systemctl stop moodle-autotask-agent.service
+"""
+    completed = subprocess.run(["bash", "-c", script], check=False, timeout=15)
+    assert completed.returncode != 0
+    assert (state / "failed-stop-agent").is_file()
+    assert config.read_bytes() == b"previous"
+    assert (config.stat().st_mode & 0o777) == 0o600
+    _assert_all_services_active(state)
+    assert not tuple(tmp_path.glob(".scheduler.candidate.*"))
+    assert not tuple(tmp_path.glob(".scheduler.previous.*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX bash service fake")
+def test_remote_guard_rejects_dangling_symlink_without_temp_or_state_loss(tmp_path: Path) -> None:
+    config = tmp_path / "scheduler.json"
+    config.symlink_to(tmp_path / "missing-target")
+    state = tmp_path / "state"
+    script = f"""set -eu
+{_all_active_systemctl_fake(state)}
+{_scheduler_guard_command(config)}
+"""
+    completed = subprocess.run(["bash", "-c", script], check=False, timeout=15)
+    assert completed.returncode != 0
+    assert config.is_symlink()
+    _assert_all_services_active(state)
+    assert not tuple(tmp_path.glob(".scheduler.candidate.*"))
+    assert not tuple(tmp_path.glob(".scheduler.previous.*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX bash service fake")
+@pytest.mark.parametrize("failing_tool", ("mktemp", "cp"))
+def test_remote_guard_cleans_candidate_after_backup_tool_failure(
+    tmp_path: Path, failing_tool: str
+) -> None:
+    config = tmp_path / "scheduler.json"
+    config.write_bytes(b"previous")
+    config.chmod(0o600)
+    state = tmp_path / "state"
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    wrapper = tools / failing_tool
+    if failing_tool == "mktemp":
+        wrapper.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    else:
+        wrapper.write_text("#!/bin/sh\nprintf partial > \"$3\"\nexit 1\n", encoding="utf-8")
+    wrapper.chmod(0o700)
+    script = f"""set -eu
+PATH={tools!s}:$PATH
+{_all_active_systemctl_fake(state)}
+{_scheduler_guard_command(config)}
+"""
+    completed = subprocess.run(["bash", "-c", script], check=False, timeout=15)
+    assert completed.returncode != 0
+    assert config.read_bytes() == b"previous"
+    assert (config.stat().st_mode & 0o777) == 0o600
+    _assert_all_services_active(state)
+    assert not tuple(tmp_path.glob(".scheduler.candidate.*"))
+    assert not tuple(tmp_path.glob(".scheduler.previous.*"))

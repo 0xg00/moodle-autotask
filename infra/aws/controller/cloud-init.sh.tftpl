@@ -33,6 +33,85 @@ install -d -o root -g root -m 0755 /opt/${project_name}
 install -d -o ${project_name} -g ${project_name} -m 0750 /var/lib/${project_name}
 install -d -o root -g ${project_name} -m 0750 /etc/${project_name}
 
+python3 - '${scheduler_config_base64}' /etc/${project_name}/scheduler.json ${project_name} <<'PY'
+import base64
+import grp
+import json
+import os
+import stat
+import sys
+import tempfile
+
+encoded, target, group = sys.argv[1:]
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+try:
+    raw = base64.b64decode(encoded, validate=True)
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+    raise SystemExit("invalid scheduler configuration") from error
+keys = set(value) if isinstance(value, dict) else set()
+courses = value.get("courseShortnames") if isinstance(value, dict) else None
+all_courses = value.get("allCourses") if isinstance(value, dict) else None
+cap = value.get("maxNewEventsPerCycle") if isinstance(value, dict) else None
+if (
+    (keys == {"courseShortnames", "maxNewEventsPerCycle"}
+     and isinstance(courses, list) and courses
+     and len(courses) <= 64
+     and all(isinstance(item, str) and item and len(item.encode("utf-8")) <= 255 and not any(ord(char) <= 0x1f or ord(char) == 0x7f for char in item) for item in courses)
+     and sum(len(item.encode("utf-8")) for item in courses) <= 2048
+     and len(set(courses)) == len(courses))
+    or (keys == {"allCourses", "maxNewEventsPerCycle"} and all_courses is True)
+):
+    pass
+else:
+    raise SystemExit("scheduler scope must be explicit and unambiguous")
+if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 100:
+    raise SystemExit("invalid scheduler event cap")
+if len(raw) > 16 * 1024:
+    raise SystemExit("scheduler configuration is too large")
+try:
+    old = os.lstat(target)
+except FileNotFoundError:
+    old = None
+if old is not None and (not stat.S_ISREG(old.st_mode) or stat.S_ISLNK(old.st_mode)):
+    raise SystemExit("scheduler config target is unsafe")
+directory = os.path.dirname(target)
+parent = os.lstat(directory)
+if (
+    not stat.S_ISDIR(parent.st_mode)
+    or stat.S_ISLNK(parent.st_mode)
+    or parent.st_uid != 0
+    or stat.S_IMODE(parent.st_mode) & 0o022
+):
+    raise SystemExit("scheduler config directory is unsafe")
+fd, temporary = tempfile.mkstemp(prefix=".scheduler.", dir=directory)
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chown(temporary, 0, grp.getgrnam(group).gr_gid)
+    os.chmod(temporary, 0o640)
+    os.replace(temporary, target)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+
 cat >/usr/local/sbin/${project_name}-refresh-config <<'CONFIG_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -108,7 +187,7 @@ User=${project_name}
 Group=${project_name}
 WorkingDirectory=/var/lib/${project_name}
 ExecStartPre=+/usr/local/sbin/${project_name}-refresh-config
-ExecStart=/opt/${project_name}/current/venv/bin/moodle-autotask-scheduler run --state /var/lib/${project_name}/state.sqlite3 --token-file /etc/${project_name}/moodle-token.json --telegram-config-file /etc/${project_name}/telegram.json --approval-state /var/lib/${project_name}/approval.sqlite3 --interval-seconds ${scheduler_interval} --request-timeout-seconds 60 --course-shortname ASIX-CAMPAIGN-01 --max-new-events-per-cycle 4
+ExecStart=/opt/${project_name}/current/venv/bin/moodle-autotask-scheduler run --state /var/lib/${project_name}/state.sqlite3 --token-file /etc/${project_name}/moodle-token.json --telegram-config-file /etc/${project_name}/telegram.json --approval-state /var/lib/${project_name}/approval.sqlite3 --interval-seconds ${scheduler_interval} --request-timeout-seconds 60 --scheduler-config-file /etc/${project_name}/scheduler.json
 Restart=on-failure
 RestartSec=30
 UMask=0077

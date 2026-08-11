@@ -77,6 +77,16 @@ terraform -chdir=infra/aws/controller plan -out controller.tfplan
 terraform -chdir=infra/aws/controller apply controller.tfplan
 ```
 
+The scheduler scope is mandatory infrastructure input. Set exactly one of
+`scheduler_course_shortnames` (a non-empty, exactly unique list) or
+`scheduler_all_courses = true`, plus `scheduler_max_new_events_per_cycle` from 1 through 100.
+There is intentionally no implicit all-course default. Terraform serializes that decision into
+root-owned `/etc/moodle-autotask/scheduler.json` (`root:moodle-autotask`, mode `0640`); the
+unprivileged scheduler reads only this file. Course shortnames may contain normal Moodle text,
+including Unicode or spaces. Names are matched exactly: no Unicode/case normalization occurs.
+They cannot be empty or contain ASCII controls. The scope allows at most 64 names, 255 UTF-8 bytes
+per name, and 2048 UTF-8 bytes total; the runtime canonically sorts names only after validation.
+
 Review every plan before applying it. Never commit a plan file: it can contain account metadata.
 This apply creates the lab roles, profile, subnet, and security group, but does not launch a Windows
 instance and therefore does not start Windows compute charges.
@@ -150,13 +160,22 @@ updates `/opt/moodle-autotask/current`. `Deploy` never enables either service:
 .\scripts\aws-deploy.ps1 `
   -Action Deploy `
   -AccountId '<AWS_ACCOUNT_ID>' `
-  -Profile 'moodle-autotask'
+  -Profile 'moodle-autotask' `
+  -CourseShortname '<EXACT_MOODLE_COURSE_SHORTNAME>' `
+  -MaxNewEventsPerCycle 4
 
 .\scripts\aws-deploy.ps1 `
   -Action Status `
   -AccountId '<AWS_ACCOUNT_ID>' `
   -Profile 'moodle-autotask'
 ```
+
+`Deploy` requires this explicit selection every time. To deliberately scan every Moodle course,
+use `-AllCourses` instead of `-CourseShortname`; the two options cannot be combined. `Status`,
+`Activate`, and `Deactivate` do not require scope arguments. Upgrade writes the configuration
+through a validated temporary file and atomic rename, rejecting unsafe links. On an upgrade it
+retains and restores a prior configuration on any later failure; a legacy controller without this
+file keeps the newly migrated configuration so its new unit is never left without scope.
 
 After both secret values exist, activation first refreshes and validates them, then enables and
 starts all four units together. Any start failure stops and disables all four. Deactivation is explicit:

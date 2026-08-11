@@ -1,3 +1,22 @@
+locals {
+  controller_user_data = templatefile("${path.module}/cloud-init.sh.tftpl", {
+    region              = var.region
+    secret_arn          = aws_secretsmanager_secret.moodle_token.arn
+    telegram_secret_arn = aws_secretsmanager_secret.telegram_config.arn
+    project_name        = var.project_name
+    scheduler_interval  = 86400
+    scheduler_config_base64 = base64encode(jsonencode(
+      var.scheduler_all_courses ? {
+        allCourses           = true
+        maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
+      } : {
+        courseShortnames     = var.scheduler_course_shortnames
+        maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
+      }
+    ))
+  })
+}
+
 data "aws_ssm_parameter" "ubuntu_ami" {
   name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
 }
@@ -13,16 +32,15 @@ resource "aws_instance" "controller" {
   disable_api_termination     = true
   user_data_replace_on_change = false
 
-  user_data = templatefile("${path.module}/cloud-init.sh.tftpl", {
-    region              = var.region
-    secret_arn          = aws_secretsmanager_secret.moodle_token.arn
-    telegram_secret_arn = aws_secretsmanager_secret.telegram_config.arn
-    project_name        = var.project_name
-    scheduler_interval  = 86400
-  })
+  user_data = local.controller_user_data
 
   lifecycle {
     ignore_changes = [user_data]
+
+    precondition {
+      condition     = length(base64encode(local.controller_user_data)) <= 21848
+      error_message = "Rendered controller user_data exceeds the EC2 16 KiB raw limit."
+    }
   }
 
   metadata_options {

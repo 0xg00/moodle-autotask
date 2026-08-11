@@ -56,6 +56,9 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "--telegram-config-file /etc/moodle-autotask/telegram.json" in scheduler_text
     assert "--approval-state /var/lib/moodle-autotask/approval.sqlite3" in scheduler_text
     assert "--request-timeout-seconds 60" in scheduler_text
+    assert "--scheduler-config-file /etc/moodle-autotask/scheduler.json" in scheduler_text
+    assert "ASIX-CAMPAIGN-01" not in scheduler_text
+    assert "--max-new-events-per-cycle" not in scheduler_text
     assert "moodle-autotask-telegram run" in telegram_text
     assert "rust-v0.147.0/codex-x86_64-unknown-linux-musl.tar.gz" in codex_installer_text
     assert "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36" in (
