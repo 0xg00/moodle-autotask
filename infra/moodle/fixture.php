@@ -1135,10 +1135,235 @@ function expand_fixture(): void {
     upgrade_fixture_v4($loaded['data'], $loaded['digest']);
 }
 
+const AUTOTASK_LIVE_E2E_PREFIX = 'AUTOTASK-LIVE-E2E-';
+const AUTOTASK_LIVE_E2E_ASSIGNMENT_PREFIX = 'autotask-live-e2e-';
+
+function live_e2e_run_id(string $runid): string {
+    if (preg_match('/^[a-z0-9](?:[a-z0-9-]{6,38}[a-z0-9])$/', $runid) !== 1) {
+        throw new InvalidArgumentException('live e2e run ID is invalid');
+    }
+    return $runid;
+}
+
+function live_e2e_spec(string $runid): array {
+    $runid = live_e2e_run_id($runid);
+    return [
+        'runid' => $runid,
+        'course_shortname' => AUTOTASK_LIVE_E2E_PREFIX . $runid,
+        'course_idnumber' => AUTOTASK_LIVE_E2E_PREFIX . $runid,
+        'course_fullname' => 'AutoTask live central E2E ' . $runid,
+        'course_summary' => 'Disposable fictitious AutoTask central E2E fixture. Run: ' . $runid . '.',
+        'assignment_idnumber' => AUTOTASK_LIVE_E2E_ASSIGNMENT_PREFIX . $runid,
+        'assignment_name' => 'AutoTask live central E2E report ' . $runid,
+        'assignment_intro' => '<p>Scenario: CENTRAL. Create the deterministic central report; do not use a lab, VM, import, or image.</p>',
+    ];
+}
+
+function live_e2e_module_footprint_valid(array $assignment, array $forum, int $assigncount, int $forumcount, int $allmodules, array $spec): bool {
+    return $assigncount === 1 && $forumcount === 1 && $allmodules === 2
+        && ($assignment['cmidnumber'] ?? null) === $spec['assignment_idnumber']
+        && ($assignment['name'] ?? null) === $spec['assignment_name']
+        && ($assignment['intro'] ?? null) === $spec['assignment_intro']
+        && ($assignment['introformat'] ?? null) === (int)FORMAT_HTML
+        && ($assignment['submissionattachments'] ?? null) === 1
+        && ($assignment['submissiondrafts'] ?? null) === 0
+        && ($assignment['requiresubmissionstatement'] ?? null) === 0
+        && ($forum['name'] ?? null) === get_string('namenews', 'forum')
+        && ($forum['type'] ?? null) === 'news' && ($forum['cmidnumber'] ?? null) === '';
+}
+
+function live_e2e_enrolment_valid(array $enrolled, array $roles, int $studentid): bool {
+    return count($enrolled) === 1 && isset($enrolled[$studentid])
+        && $enrolled[$studentid]->username === 'student1' && $roles === ['student'];
+}
+
+function live_e2e_fixture_row(string $runid, ?string &$reason = null): ?array {
+    global $DB;
+    $reason = null;
+    $spec = live_e2e_spec($runid);
+    $course = $DB->get_record('course', ['shortname' => $spec['course_shortname']]);
+    $idnumbercourse = $DB->get_record('course', ['idnumber' => $spec['course_idnumber']]);
+    if (!$course && !$idnumbercourse) {
+        if ($DB->record_exists('course_modules', ['idnumber' => $spec['assignment_idnumber']])) {
+            throw new RuntimeException('live e2e fixture identifier collision');
+        }
+        $reason = 'absent';
+        return null;
+    }
+    if (!$course || !$idnumbercourse || (int)$course->id !== (int)$idnumbercourse->id) {
+        throw new RuntimeException('live e2e course collision');
+    }
+    if ($course->fullname !== $spec['course_fullname'] || $course->summary !== $spec['course_summary']
+        || $course->idnumber !== $spec['course_idnumber']) {
+        throw new RuntimeException('live e2e course metadata is tampered');
+    }
+    $modules = $DB->get_records_sql(
+        "SELECT a.*, cm.id AS cmid, cm.idnumber AS cmidnumber FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id "
+        . "JOIN {modules} m ON m.id = cm.module WHERE cm.course = ? AND m.name = 'assign'",
+        [$course->id],
+    );
+    $forums = $DB->get_records_sql(
+        "SELECT f.*, cm.id AS cmid, cm.idnumber AS cmidnumber FROM {forum} f JOIN {course_modules} cm ON cm.instance = f.id "
+        . "JOIN {modules} m ON m.id = cm.module WHERE cm.course = ? AND m.name = 'forum'",
+        [$course->id],
+    );
+    $allmodules = $DB->count_records('course_modules', ['course' => $course->id]);
+    // Moodle create_course() creates this pinned core Announcements forum. It is
+    // part of the exact disposable footprint, not an additional E2E assignment.
+    $assignment = reset($modules);
+    $forum = reset($forums);
+    if (!$assignment || !$forum || !live_e2e_module_footprint_valid([
+        'cmidnumber' => $assignment->cmidnumber, 'name' => $assignment->name, 'intro' => $assignment->intro,
+        'introformat' => (int)$assignment->introformat, 'submissionattachments' => (int)$assignment->submissionattachments,
+        'submissiondrafts' => (int)$assignment->submissiondrafts, 'requiresubmissionstatement' => (int)$assignment->requiresubmissionstatement,
+    ], [
+        'name' => $forum->name, 'type' => $forum->type, 'cmidnumber' => (string)$forum->cmidnumber,
+    ], count($modules), count($forums), $allmodules, $spec)
+        || !fixture_v3_submission_file_enabled((int)$assignment->id)) {
+        throw new RuntimeException('live e2e course module set is tampered');
+    }
+    if (!$assignment || $assignment->cmidnumber !== $spec['assignment_idnumber']
+        || $assignment->name !== $spec['assignment_name'] || $assignment->intro !== $spec['assignment_intro']
+        || (int)$assignment->introformat !== (int)FORMAT_HTML || (int)$assignment->submissionattachments !== 1
+        || (int)$assignment->submissiondrafts !== 0 || (int)$assignment->requiresubmissionstatement !== 0) {
+        throw new RuntimeException('live e2e assignment is tampered');
+    }
+    $student = $DB->get_record('user', ['username' => 'student1']);
+    if (!$student) {
+        throw new RuntimeException('live e2e student is missing');
+    }
+    $context = context_course::instance($course->id);
+    $enrolled = get_enrolled_users($context, '', 0, 'u.id,u.username');
+    $roles = $DB->get_fieldset_sql(
+        'SELECT r.shortname FROM {role_assignments} ra JOIN {role} r ON r.id = ra.roleid WHERE ra.contextid = ? AND ra.userid = ?',
+        [$context->id, $student->id],
+    );
+    if (!live_e2e_enrolment_valid($enrolled, $roles, (int)$student->id)) {
+        throw new RuntimeException('live e2e enrolment is tampered');
+    }
+    return ['course' => $course, 'assignment' => $assignment, 'student' => $student, 'spec' => $spec];
+}
+
+function live_e2e_submission_evidence(array $row): ?array {
+    global $DB;
+    $submission = $DB->get_record('assign_submission', [
+        'assignment' => $row['assignment']->id, 'userid' => $row['student']->id,
+    ]);
+    if (!$submission) {
+        return null;
+    }
+    if (!in_array($submission->status, ['new', 'reopened', 'submitted'], true)) {
+        throw new RuntimeException('live e2e submission status is invalid');
+    }
+    $files = get_file_storage()->get_area_files(
+        context_module::instance($row['assignment']->cmid)->id,
+        'assignsubmission_file', 'submission_files', $submission->id, 'filename', false,
+    );
+    if ($submission->status !== 'submitted') {
+        if ($files) {
+            throw new RuntimeException('live e2e unsubmitted submission has files');
+        }
+        return ['status' => $submission->status];
+    }
+    if (count($files) !== 1) {
+        throw new RuntimeException('live e2e submitted file count is invalid');
+    }
+    $file = reset($files);
+    if (!$file || preg_match('/^autotask-[0-9a-f]{16}\.md$/', $file->get_filename()) !== 1) {
+        throw new RuntimeException('live e2e submitted filename is invalid');
+    }
+    $content = $file->get_content();
+    return [
+        'status' => 'submitted', 'submissionId' => (int)$submission->id,
+        'filename' => $file->get_filename(), 'sizeBytes' => strlen($content),
+        'sha256' => hash('sha256', $content),
+    ];
+}
+
+function live_e2e_evidence(string $runid): array {
+    $row = live_e2e_fixture_row($runid, $reason);
+    if ($row === null) {
+        return ['kind' => 'autotask-live-e2e-fixture-v1', 'runId' => live_e2e_run_id($runid), 'state' => $reason];
+    }
+    return [
+        'kind' => 'autotask-live-e2e-fixture-v1', 'runId' => $row['spec']['runid'], 'state' => 'ready',
+        'courseId' => (int)$row['course']->id, 'courseShortname' => $row['spec']['course_shortname'],
+        'assignmentId' => (int)$row['assignment']->id, 'assignmentCmid' => (int)$row['assignment']->cmid,
+        'assignmentIdnumber' => $row['spec']['assignment_idnumber'], 'submission' => live_e2e_submission_evidence($row),
+    ];
+}
+
+function prepare_live_e2e_fixture(string $runid): array {
+    global $DB;
+    $runid = live_e2e_run_id($runid);
+    if (fixture_state() !== 'complete-v4') {
+        throw new RuntimeException('live e2e requires the exact managed fixture v4 state');
+    }
+    $existing = live_e2e_fixture_row($runid, $reason);
+    if ($existing !== null) {
+        if (live_e2e_submission_evidence($existing) !== null) {
+            throw new RuntimeException('live e2e fixture is already used');
+        }
+        return live_e2e_evidence($runid);
+    }
+    $spec = live_e2e_spec($runid);
+    if ($DB->record_exists('course', ['shortname' => $spec['course_shortname']])
+        || $DB->record_exists('course', ['idnumber' => $spec['course_idnumber']])
+        || $DB->record_exists('course_modules', ['idnumber' => $spec['assignment_idnumber']])) {
+        throw new RuntimeException('live e2e fixture identifier collision');
+    }
+    $transaction = $DB->start_delegated_transaction();
+    try {
+        $student = $DB->get_record('user', ['username' => 'student1'], '*', MUST_EXIST);
+        $course = create_course((object)[
+            'fullname' => $spec['course_fullname'], 'shortname' => $spec['course_shortname'],
+            'idnumber' => $spec['course_idnumber'], 'category' => 1, 'summary' => $spec['course_summary'],
+        ]);
+        $manual = enrol_get_plugin('manual');
+        $role = $DB->get_record('role', ['shortname' => 'student'], '*', MUST_EXIST);
+        $instance = $DB->get_record('enrol', ['courseid' => $course->id, 'enrol' => 'manual'], '*', MUST_EXIST);
+        if (!$manual) {
+            throw new RuntimeException('manual enrolment plugin unavailable');
+        }
+        $manual->enrol_user($instance, $student->id, $role->id);
+        create_assignment($course, [
+            'idnumber' => $spec['assignment_idnumber'], 'name' => $spec['assignment_name'],
+            'intro' => $spec['assignment_intro'], 'dueoffset' => 172800, 'allowoffset' => 0,
+            'files' => [], 'submissionfile' => true,
+        ], time());
+        if (live_e2e_fixture_row($runid, $verification) === null || $verification !== null) {
+            throw new RuntimeException('live e2e fixture verification failed');
+        }
+        $transaction->allow_commit();
+    } catch (Throwable $error) {
+        $transaction->rollback($error);
+    }
+    return live_e2e_evidence($runid);
+}
+
+function cleanup_live_e2e_fixture(string $runid): array {
+    global $DB;
+    $runid = live_e2e_run_id($runid);
+    $row = live_e2e_fixture_row($runid, $reason);
+    if ($row === null) {
+        return live_e2e_evidence($runid);
+    }
+    $courseid = (int)$row['course']->id;
+    delete_course($row['course'], false);
+    if ($DB->record_exists('course', ['id' => $courseid])
+        || $DB->record_exists('course', ['shortname' => $row['spec']['course_shortname']])
+        || $DB->record_exists('course', ['idnumber' => $row['spec']['course_idnumber']])
+        || $DB->record_exists('course_modules', ['idnumber' => $row['spec']['assignment_idnumber']])) {
+        throw new RuntimeException('live e2e fixture cleanup did not remove the exact fixture');
+    }
+    return live_e2e_evidence($runid);
+}
+
 if (!defined('AUTOTASK_FIXTURE_LIBRARY')) {
     $action = $argv[1] ?? '';
-    $catalogpath = $argv[2] ?? '';
-    if (in_array($action, ['state', 'ensure', 'seed', 'advance', 'expand'], true)) {
+    $catalogpath = in_array($action, ['live-e2e-prepare', 'live-e2e-inspect', 'live-e2e-cleanup'], true)
+        ? ($argv[3] ?? '') : ($argv[2] ?? '');
+    if (in_array($action, ['state', 'ensure', 'seed', 'advance', 'expand', 'live-e2e-prepare', 'live-e2e-inspect', 'live-e2e-cleanup'], true)) {
         fixture_v3_load_catalog($catalogpath);
     }
     if ($action === 'state') {
@@ -1168,6 +1393,15 @@ if (!defined('AUTOTASK_FIXTURE_LIBRARY')) {
     } elseif ($action === 'expand') {
         expand_fixture();
         echo 'rich-fixture-expanded';
+    } elseif (in_array($action, ['live-e2e-prepare', 'live-e2e-inspect', 'live-e2e-cleanup'], true)) {
+        $runid = $argv[2] ?? '';
+        if ($catalogpath === '') {
+            throw new InvalidArgumentException('live e2e catalog path is required');
+        }
+        fixture_v3_load_catalog($catalogpath);
+        $evidence = $action === 'live-e2e-prepare' ? prepare_live_e2e_fixture($runid)
+            : ($action === 'live-e2e-inspect' ? live_e2e_evidence($runid) : cleanup_live_e2e_fixture($runid));
+        echo json_encode($evidence, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
     } else {
         throw new InvalidArgumentException('unsupported fixture action');
     }

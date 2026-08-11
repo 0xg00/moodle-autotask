@@ -37,6 +37,13 @@ _CONTROLLER_FILES = (
 _BASH_TRANSPORT = 'if [ -z "${BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi'
 
 
+def _chown(path: Path, user: int, group: int) -> None:
+    command = getattr(os, "chown", None)
+    if command is None:
+        pytest.skip("requires POSIX ownership semantics")
+    command(path, user, group)
+
+
 def _function_payload(name: str) -> str:
     source = _DEPLOY.read_text(encoding="utf-8")
     match = re.search(
@@ -239,6 +246,16 @@ class _RemoteHarness:
         self.bin.mkdir()
         self.state.mkdir()
         self._fake("systemctl", self._systemctl())
+        self._fake(
+            "getent",
+            "#!/usr/bin/env bash\nset -eu\n"
+            'case "$1:$2" in\n'
+            "  passwd:moodle-autotask) "
+            "printf 'moodle-autotask:x:1001:1001::/nonexistent:/usr/sbin/nologin\\n' ;;\n"
+            "  group:moodle-autotask) printf 'moodle-autotask:x:1001:\\n' ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
+        )
         self._fake("mktemp", self._once("/usr/bin/mktemp"))
         self._fake("cp", self._once("/bin/cp"))
         self._fake("mv", self._once("/bin/mv"))
@@ -314,6 +331,7 @@ case "$command" in
           "$command" >&2
         exit 5
       fi
+      if failed "$command-$unit"; then exit 92; fi
       if [ "$command" = start ] && [ "$unit" = scheduler ]; then
         test -d "$FAKE_ROOT/run/moodle-autotask-health" \
           && test ! -L "$FAKE_ROOT/run/moodle-autotask-health" \
@@ -344,6 +362,9 @@ esac
             "etc/systemd/system",
         ):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
+        state_directory = self.root / "var/lib/moodle-autotask"
+        state_directory.chmod(0o750)
+        _chown(state_directory, 1001, 1001)
         (self.root / "run/moodle-autotask-health").chmod(0o711)
         for service in _SERVICES:
             pulse = self.root / "run/moodle-autotask-health" / service
@@ -611,13 +632,18 @@ def test_activate_exact_payload_enables_all_and_creates_the_marker(
     assert set(_SERVICES).issubset(harness.snapshot()[0])
     assert set(_SERVICES).issubset(harness.snapshot()[1])
     assert {"timer"}.issubset(harness.snapshot()[0]) and {"timer"}.issubset(harness.snapshot()[1])
-    assert marker.read_bytes() == b"" and marker.stat().st_mode & 0o777 == 0o600
+    assert marker.read_bytes() == b""
+    assert os.stat(marker).st_uid == 0 and os.stat(marker).st_gid == 0
+    assert marker.stat().st_mode & 0o777 == 0o600 and marker.stat().st_nlink == 1
+    state_directory = harness.root / "var/lib/moodle-autotask"
+    assert (os.stat(state_directory).st_uid, os.stat(state_directory).st_gid) == (1001, 1001)
+    assert state_directory.stat().st_mode & 0o777 == 0o750
     assert not tuple(marker.parent.glob(".activation-marker.*"))
 
 
 @pytest.mark.parametrize(
     "failure",
-    ("enable", "start", "mktemp", "cp", "mv"),
+    ("enable", "enable-timer", "start", "mktemp", "cp", "mv"),
 )
 def test_activate_failures_restore_the_exact_prior_service_and_timer_state(
     tmp_path: Path, failure: str
@@ -635,6 +661,24 @@ def test_activate_failures_restore_the_exact_prior_service_and_timer_state(
     assert harness.snapshot() == prior
     assert marker.read_bytes() == b"" and marker.stat().st_mode & 0o777 == 0o600
     assert not tuple(marker.parent.glob(".activation-marker.*"))
+    assert not tuple(marker.parent.glob(".health-enabled.*"))
+    assert marker.parent.stat().st_mode & 0o777 == 0o750
+    assert (os.stat(marker.parent).st_uid, os.stat(marker.parent).st_gid) == (1001, 1001)
+
+
+def test_activate_marker_publish_failure_removes_the_guarded_candidate(
+    tmp_path: Path,
+) -> None:
+    harness = _RemoteHarness(tmp_path)
+    harness.set_states({"scheduler"}, {"scheduler"}, timer=(False, False))
+    marker = harness.root / "var/lib/moodle-autotask/health-enabled"
+    prior = harness.snapshot()
+    result = harness.run(_activate_payload(), failure="mv")
+    assert result.returncode != 0 and "activated-environment" not in result.stdout
+    assert harness.snapshot() == prior and not marker.exists()
+    assert not tuple(marker.parent.glob(".health-enabled.*"))
+    assert marker.parent.stat().st_mode & 0o777 == 0o750
+    assert (os.stat(marker.parent).st_uid, os.stat(marker.parent).st_gid) == (1001, 1001)
 
 
 @pytest.mark.parametrize("malformed", ("content", "symlink"))

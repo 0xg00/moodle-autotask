@@ -599,6 +599,20 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
         "systemctl enable"
     )
     assert "systemctl stop moodle-autotask-scheduler.service" in activation
+    assert "install -d -o root -g root -m 0700 /var/lib/moodle-autotask" not in activation
+    assert "getent passwd moodle-autotask" in activation
+    assert "getent group moodle-autotask" in activation
+    assert "= \"$state_uid:$state_gid:750\"" in activation
+    assert (
+        "activation_marker_candidate=$(mktemp /var/lib/moodle-autotask/.health-enabled"
+        in activation
+    )
+    assert (
+        "mv -f \"$activation_marker_candidate\" "
+        "/var/lib/moodle-autotask/health-enabled" in activation
+    )
+    assert "activation_marker_candidate=\"\"" in activation
+    assert "= 0:0:600:1" in activation
     assert "systemctl disable moodle-autotask-scheduler.service" in activation
     assert "systemctl is-active --quiet moodle-autotask-worker.service" in activation
     assert "--secret-string" not in script

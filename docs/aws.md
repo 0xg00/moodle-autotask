@@ -333,6 +333,77 @@ Telegram, and schedules mandatory teardown two hours after execution. Execution-
 at-least-once: a controller crash after Telegram accepts a document and before the lease update can
 send the same digest-bound report again.
 
+## Real central E2E acceptance harness
+
+`scripts/aws-central-e2e.ps1` is the one-task acceptance harness for the local fictitious Moodle
+and a deployed controller. It requires an explicit account, profile, Region, controller instance,
+unique run ID, local `.runtime/moodle-token.json`, and bounded timeout. It does not accept Moodle,
+Telegram, or Codex credentials as arguments. Run it only from a clean, committed checkout after
+`scripts/moodle.ps1 -Action Bootstrap` and `-Action ExpandFixture` have produced fixture v4:
+
+```powershell
+.\scripts\aws-central-e2e.ps1 `
+  -Action Run `
+  -AccountId '<AWS_ACCOUNT_ID>' `
+  -Region '<AWS_REGION>' `
+  -Profile '<AWS_PROFILE>' `
+  -ControllerInstanceId '<CONTROLLER_INSTANCE_ID>' `
+  -RunId '<LOWERCASE-UNIQUE-RUN-ID>' `
+  -MoodleTokenFile .runtime/moodle-token.json `
+  -TimeoutSeconds 3600
+```
+
+It creates `AUTOTASK-LIVE-E2E-<RUN_ID>`, temporarily replaces only the root-owned scheduler scope
+with that exact course and cap `1`, and restores the exact prior scheduler configuration,
+enabled/active state in `finally`. A normal run first requires all deployed controller services to be active,
+so it cannot silently activate a deactivated controller; guarded `Cleanup` restores its exact scope
+record before that health check so it can repair a stopped scheduler. The harness waits (and times out) for two
+separate human Telegram choices: first `Hacer tarea`, then `Entregar`. It never invokes a callback,
+approves work, or submits Moodle work itself.
+
+Canonical read-only controller evidence identifies exactly one event, task key, revision, central
+mode, three distinct planner/executor/reviewer job IDs, dependency/result digests, reviewer
+acceptance, report digest, manifest, and deterministic ZIP content/digest. It also queries EC2 for
+the run-bound provision key and requires zero tagged lab instances, import tasks, AMIs, and snapshots.
+Finally it asks the local Moodle fixture to verify the submitted file's SHA-256 against the approved
+manifest. A failure or timeout preserves both the local fixture and local forensic evidence; cleanup
+happens only after a successful run or through the explicit guarded action below. There is one
+root-owned active scope record at `/var/lib/moodle-autotask/e2e/active`; it contains exactly the
+backup and state files, including the run-bound desired and backup digests. Valid retired records
+remain as `.<RUN_ID>.retired` tombstones, so a run ID is never reusable. Publication uses a unique
+same-parent `.<RUN_ID>.pending.*` candidate and atomic rename. An active different run, any foreign
+pending candidate, or an unexpected/tampered record fails closed without deleting that evidence.
+After the original config and scheduler service are restored, the active record is atomically renamed
+to its retired tombstone. A response-loss or killed local process resumes or restores only that
+record; `Cleanup` restores it before deleting the Moodle course.
+
+The harness records the clean local Git commit and the deployed immutable release digest separately.
+Preflight compares a domain-separated local/deployed Moodle credential digest without emitting the
+token or digest; final acceptance proves both Telegram notifications were delivered and both decisions
+were made by the deployed `allowedUserId`, without recording that identity in evidence.
+The current deployment interface stores only the wheel digest under `/opt/moodle-autotask/current`,
+not a commit-to-wheel attestation, so it does **not** claim those values are cryptographically bound.
+Use the reviewed `aws-deploy.ps1` output for that deployment binding until the deployment contract
+persists a signed commit mapping.
+
+```powershell
+.\scripts\aws-central-e2e.ps1 `
+  -Action Cleanup `
+  -AccountId '<AWS_ACCOUNT_ID>' `
+  -Region '<AWS_REGION>' `
+  -Profile '<AWS_PROFILE>' `
+  -ControllerInstanceId '<CONTROLLER_INSTANCE_ID>' `
+  -RunId '<LOWERCASE-UNIQUE-RUN-ID>' `
+  -MoodleTokenFile .runtime/moodle-token.json
+```
+
+The evidence record is `.runtime/central-e2e/<RUN_ID>.evidence.json` unless `-EvidencePath` names
+another file under `.runtime`. Its bounded schema is `autotask-central-e2e-evidence-v1`:
+`kind`, `runId`, `controllerInstanceId`, `region`, `startedAt`, `completedAt`, `status`, and ordered
+`phases`; phases contain only canonical IDs/digests, scope state, zero-count EC2 assertions,
+submission receipt digest/size, and sanitized failure codes. It excludes tokens, authorization
+headers, prompts, Telegram identities, raw SSM output, Moodle names, and user PII.
+
 The current image-import boundary supports exactly one `.ova` in an approved revision. Before any
 import it re-reads that exact revision, downloads every attachment with the Moodle token kept out of
 AWS arguments, hashes the bytes, uploads them to `assignments/<task>/<revision>/<attachment>/<sha256>/`,

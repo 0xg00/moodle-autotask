@@ -179,6 +179,35 @@ deletion work. Before any Compose wrapper call it accepts only the exact generat
 existing containers, waits for PostgreSQL, and refreshes image evidence; it fails with a Bootstrap
 instruction if no local containers exist. Only `Reset -Force` destroys volumes.
 
+## Disposable central E2E fixture
+
+The real central acceptance harness never uses an institutional Moodle. It creates one narrowly
+scoped, disposable course only in this local fixture:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 `
+  -Action LiveE2EPrepare -RunId '<LOWERCASE-UNIQUE-RUN-ID>'
+```
+
+Run IDs are 8--40 lowercase letters, digits, or internal hyphens. The exact course identifier is
+`AUTOTASK-LIVE-E2E-<RUN_ID>` and its only assignment has idnumber
+`autotask-live-e2e-<RUN_ID>`. Prepare requires an exact managed fixture v4, creates only that
+course, enrols only the existing fictitious `student1`, and rejects any collision, extra module,
+extra enrolment, changed metadata, or assignment tamper. Re-running prepare is safe only while no
+submission exists. It does not modify fixture v4 configuration, users, or managed courses.
+
+The two read/cleanup operations use the same checks:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action LiveE2EInspect -RunId '<LOWERCASE-UNIQUE-RUN-ID>'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action LiveE2ECleanup -RunId '<LOWERCASE-UNIQUE-RUN-ID>'
+```
+
+Inspect emits compact JSON with the exact course/assignment identities and, after the separate
+human submission approval, the submitted `autotask-<REVISION_PREFIX>.md` byte count and SHA-256. Cleanup first
+re-verifies the exact run-bound course and deletes only it. It leaves the fixture intact on a failed
+or timed-out acceptance run; use explicit guarded cleanup after diagnosis.
+
 ## Optional private or Tailscale bind
 
 The default is still loopback-only: `127.0.0.1:8000`. To opt in for a private Windows address or

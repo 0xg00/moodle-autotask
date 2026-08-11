@@ -1,10 +1,13 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet('Bootstrap', 'Up', 'Down', 'Status', 'Smoke', 'AdvanceFixture', 'ExpandFixture', 'Reset')]
+    [ValidateSet('Bootstrap', 'Up', 'Down', 'Status', 'Smoke', 'AdvanceFixture', 'ExpandFixture', 'LiveE2EPrepare', 'LiveE2EInspect', 'LiveE2ECleanup', 'Reset')]
     [string]$Action = 'Status',
     [Parameter()]
-    [switch]$Force
+    [switch]$Force,
+    [Parameter()]
+    [ValidatePattern('^$|^[a-z0-9](?:[a-z0-9-]{6,38}[a-z0-9])$')]
+    [string]$RunId = ''
 )
 
 Set-StrictMode -Version Latest
@@ -1237,7 +1240,11 @@ function Invoke-MoodleDocker {
 }
 
 function Invoke-RichFixtureTool {
-    param([Parameter(Mandatory = $true)][ValidateSet('state', 'ensure', 'seed', 'advance', 'expand')][string]$FixtureAction)
+    # Existing rich fixture contract: ValidateSet('state', 'ensure', 'seed', 'advance', 'expand')
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('state', 'ensure', 'seed', 'advance', 'expand', 'live-e2e-prepare', 'live-e2e-inspect', 'live-e2e-cleanup')][string]$FixtureAction,
+        [Parameter()][ValidatePattern('^$|^[a-z0-9](?:[a-z0-9-]{6,38}[a-z0-9])$')][string]$FixtureRunId = ''
+    )
     Assert-ContainedNonReparsePath -Path $FixtureToolPath
     Assert-ContainedNonReparsePath -Path $FixtureCatalogV3Path
     if (-not (Test-Path -LiteralPath $FixtureToolPath -PathType Leaf)) {
@@ -1269,7 +1276,14 @@ function Invoke-RichFixtureTool {
         if ($actualCatalogHash -ne $expectedCatalogHash) {
             Fail 'Rich Moodle fixture catalog hash changed while copying it into the container.'
         }
-        $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction, $catalogContainerPath)
+        if ($FixtureAction -like 'live-e2e-*') {
+            if ([string]::IsNullOrWhiteSpace($FixtureRunId)) {
+                Fail 'Live E2E fixture actions require a validated RunId.'
+            }
+            $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction, $FixtureRunId, $catalogContainerPath)
+        } else {
+            $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction, $catalogContainerPath)
+        }
         if ($FixtureAction -eq 'state' -and @($result | Select-Object -First 1).Trim() -notin @('absent', 'partial', 'complete-v1', 'complete-v2', 'complete-v3', 'complete-v3-submission-config-legacy', 'complete-v3-v4-config-orphan-repairable', 'complete-v4')) {
             Fail 'Rich Moodle fixture state output is invalid.'
         }
@@ -1281,6 +1295,24 @@ function Invoke-RichFixtureTool {
             Write-Warning 'Could not remove temporary rich fixture inputs from the Moodle container.'
         }
     }
+}
+
+function Invoke-LiveE2EFixture {
+    param([Parameter(Mandatory = $true)][ValidateSet('prepare', 'inspect', 'cleanup')][string]$Operation)
+    if ([string]::IsNullOrWhiteSpace($RunId)) {
+        Fail 'Live E2E fixture actions require -RunId.'
+    }
+    $result = ((Invoke-RichFixtureTool -FixtureAction ("live-e2e-" + $Operation) -FixtureRunId $RunId) -join "`n").Trim()
+    try {
+        $evidence = $result | ConvertFrom-Json
+    } catch {
+        Fail 'Live E2E fixture returned invalid JSON evidence.'
+    }
+    if ($null -eq $evidence -or $evidence.kind -ne 'autotask-live-e2e-fixture-v1' -or
+        $evidence.runId -ne $RunId -or $evidence.state -notin @('absent', 'ready')) {
+        Fail 'Live E2E fixture evidence is invalid.'
+    }
+    return $evidence
 }
 
 function Invoke-MoodleDockerWaitForDb {
@@ -1891,6 +1923,27 @@ switch ($Action) {
             Fail 'Rich fixture did not expand to revision 4.'
         }
         Invoke-Smoke
+    }
+    'LiveE2EPrepare' {
+        Assert-NoMoodleDockerLocalOverride
+        $script:Versions = Read-MoodleVersions -Path $VersionsPath
+        Assert-NormalMoodleDockerExecutionTrust
+        Assert-DockerDaemon
+        Invoke-LiveE2EFixture -Operation 'prepare' | ConvertTo-Json -Compress
+    }
+    'LiveE2EInspect' {
+        Assert-NoMoodleDockerLocalOverride
+        $script:Versions = Read-MoodleVersions -Path $VersionsPath
+        Assert-NormalMoodleDockerExecutionTrust
+        Assert-DockerDaemon
+        Invoke-LiveE2EFixture -Operation 'inspect' | ConvertTo-Json -Compress
+    }
+    'LiveE2ECleanup' {
+        Assert-NoMoodleDockerLocalOverride
+        $script:Versions = Read-MoodleVersions -Path $VersionsPath
+        Assert-NormalMoodleDockerExecutionTrust
+        Assert-DockerDaemon
+        Invoke-LiveE2EFixture -Operation 'cleanup' | ConvertTo-Json -Compress
     }
     'Reset' {
         Reset-LocalEnvironment
