@@ -77,6 +77,7 @@ resource "aws_cloudwatch_metric_alarm" "controller_status_check" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
 
   dimensions = {
     InstanceId = aws_instance.controller.id

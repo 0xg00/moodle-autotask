@@ -115,7 +115,7 @@ IAM requires that `ProvisionKey` is present; Python additionally requires it to 
 does not trust an expiry tag. The five-minute schedule is eventual,
 not an exact termination deadline. This independent Lambda has a dedicated role and cannot be
 modified by the controller role; its CloudWatch log group retains bounded JSON operational records
-for 30 days and its error metric has an alarm without an implicit notification destination. It does
+for 30 days and its alarms publish through the managed SNS notification path below. It does
 not reserve Lambda concurrency or serialize executions. Both the EventBridge target and Lambda
 asynchronous invoke configuration have a 300-second maximum event age. The EventBridge target has
 zero pre-invocation delivery retries, and Lambda's zero retry-attempt setting suppresses retries
@@ -124,6 +124,28 @@ The next five-minute schedule is the normal function-error retry path, but not t
 retry. AWS may still deliver a duplicate event, so each invocation independently applies the
 deterministic 20-instance cap and relies on idempotent EC2 termination rather than a global
 per-period cap.
+
+### Operator alerts and retained failures
+
+`operator_alert_email` is a required controller Terraform input. It accepts a bounded UTF-8
+address with exactly one `@`, no whitespace or control characters; this is intentionally not full RFC email
+validation. Terraform creates an SNS email subscription, but AWS leaves it in `PendingConfirmation`
+until the operator confirms the email. No alert delivery should be assumed before that confirmation.
+The managed topic receives the controller status-check alarm and all reaper alarms: Lambda errors,
+throttles, async drops, destination-delivery failures; EventBridge failed invocations and failures
+to send to its DLQ; visible SQS failure records; and absence of EventBridge invocations over a
+15-minute schedule window.
+
+The reaper has one standard SQS queue encrypted with SQS-managed server-side encryption and a
+14-day retention limit. EventBridge sends pre-invocation delivery failures there through a
+rule-scoped queue policy; Lambda sends asynchronous function failures there through its narrow
+execution-role permission and on-failure destination. This queue is for diagnosis, not automatic
+replay. When an alarm fires, inspect the alarm state, the reaper JSON log group, and one queue
+message without deleting it. Resolve the permission, destination, or runtime cause first. The
+scheduled event has no task payload, so after the cause is fixed it is safe to wait for the next
+five-minute run (or invoke the reaper once with an empty `{}` event under normal operator IAM).
+Do not blindly replay opaque queue records. Delete only an individually inspected record after
+confirming the root cause is resolved and the subsequent reaper run is healthy.
 
 `AwsEc2LabProvider` uses the fixed launch values installed with the service and the AWS CLI already
 on the controller. Deployment reads the exact AMI authorized by the inline provisioner policy, so a

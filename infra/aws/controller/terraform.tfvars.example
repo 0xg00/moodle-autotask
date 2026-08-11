@@ -4,6 +4,8 @@ controller_instance_type = "t3.small"
 root_volume_size_gib     = 30
 lab_hard_ttl_seconds     = 14400
 lab_reaper_max_terminations_per_run = 20
+# Replace with a monitored operator mailbox, then confirm the SNS subscription email.
+operator_alert_email = "<OPERATOR_EMAIL>"
 
 # Set exactly one scheduler scope before planning. This intentionally invalid default is rejected.
 scheduler_course_shortnames       = []

@@ -11,6 +11,26 @@ ROOT = Path(__file__).resolve().parents[1]
 AWS_ROOT = ROOT / "infra" / "aws"
 
 
+def _terraform_block(source: str, kind: str, resource_type: str, name: str) -> str:
+    marker = (
+        f'{kind} "{resource_type}" {{'
+        if kind in {"variable", "output"}
+        else f'{kind} "{resource_type}" "{name}" {{'
+    )
+    remainder = source.split(marker, 1)[1]
+    ends = [
+        position
+        for position in (
+            remainder.find("\nresource "),
+            remainder.find("\ndata "),
+            remainder.find("\nvariable "),
+            remainder.find("\noutput "),
+        )
+        if position >= 0
+    ]
+    return remainder[: min(ends)] if ends else remainder
+
+
 def test_controller_has_no_ingress_and_requires_imdsv2() -> None:
     network = (AWS_ROOT / "controller" / "network.tf").read_text(encoding="utf-8")
     compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")
@@ -116,6 +136,114 @@ def test_independent_lab_reaper_has_bounded_tag_scoped_hard_ttl() -> None:
     assert "lab_reaper_max_terminations_per_run" in variables and "<= 20" in variables
     assert "lab_reaper" not in controller_iam
     assert "lab_reaper" not in labs
+
+
+def test_operator_alerts_and_reaper_failure_capture_are_scoped_and_actionable() -> None:
+    reaper = (AWS_ROOT / "controller" / "lab_reaper.tf").read_text(encoding="utf-8")
+    compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")
+    variables = (AWS_ROOT / "controller" / "variables.tf").read_text(encoding="utf-8")
+    outputs = (AWS_ROOT / "controller" / "outputs.tf").read_text(encoding="utf-8")
+    example = (AWS_ROOT / "controller" / "terraform.tfvars.example").read_text(encoding="utf-8")
+
+    email = _terraform_block(variables, "variable", "operator_alert_email", "")
+    assert "type        = string" in email and "default" not in email
+    assert "length(base64encode(var.operator_alert_email))" in email
+    assert 'regexall("@", var.operator_alert_email)' in email
+    assert 'regex("[\\\\s\\\\p{C}]", var.operator_alert_email)' in email
+    assert 'operator_alert_email = "<OPERATOR_EMAIL>"' in example
+    assert "operator_alert_topic_arn" in outputs and "lab_reaper_failure_queue_url" in outputs
+
+    topic = _terraform_block(reaper, "resource", "aws_sns_topic", "operator_alerts")
+    subscription = _terraform_block(
+        reaper, "resource", "aws_sns_topic_subscription", "operator_alert_email"
+    )
+    topic_policy = _terraform_block(reaper, "data", "aws_iam_policy_document", "operator_alerts")
+    topic_policy_attachment = _terraform_block(
+        reaper, "resource", "aws_sns_topic_policy", "operator_alerts"
+    )
+    assert 'name = "${local.name_prefix}-operator-alerts"' in topic
+    assert (
+        'protocol  = "email"' in subscription
+        and "endpoint  = var.operator_alert_email" in subscription
+    )
+    assert 'identifiers = ["cloudwatch.amazonaws.com"]' in topic_policy
+    assert "aws:SourceAccount" in topic_policy and "aws:SourceArn" in topic_policy
+    assert "policy = data.aws_iam_policy_document.operator_alerts.json" in topic_policy_attachment
+
+    queue = _terraform_block(reaper, "resource", "aws_sqs_queue", "lab_reaper_failures")
+    queue_policy = _terraform_block(
+        reaper, "data", "aws_iam_policy_document", "lab_reaper_failures"
+    )
+    queue_policy_attachment = _terraform_block(
+        reaper, "resource", "aws_sqs_queue_policy", "lab_reaper_failures"
+    )
+    reaper_policy = _terraform_block(reaper, "data", "aws_iam_policy_document", "lab_reaper")
+    assert "fifo_queue                = false" in queue
+    assert "sqs_managed_sse_enabled   = true" in queue
+    assert "message_retention_seconds = 1209600" in queue
+    assert 'identifiers = ["events.amazonaws.com"]' in queue_policy
+    assert "AllowEventBridgeTargetDlq" in queue_policy and "aws:SourceArn" in queue_policy
+    assert "DenyInsecureTransport" in queue_policy and "aws:SecureTransport" in queue_policy
+    assert (
+        "policy    = data.aws_iam_policy_document.lab_reaper_failures.json"
+        in queue_policy_attachment
+    )
+    assert "SendOwnFailureRecords" in reaper_policy
+    assert 'actions   = ["sqs:SendMessage"]' in reaper_policy
+    assert "resources = [aws_sqs_queue.lab_reaper_failures.arn]" in reaper_policy
+
+    invoke_config = _terraform_block(
+        reaper, "resource", "aws_lambda_function_event_invoke_config", "lab_reaper"
+    )
+    target = _terraform_block(reaper, "resource", "aws_cloudwatch_event_target", "lab_reaper")
+    assert "destination = aws_sqs_queue.lab_reaper_failures.arn" in invoke_config
+    assert (
+        "dead_letter_config" in target and "arn = aws_sqs_queue.lab_reaper_failures.arn" in target
+    )
+    assert "aws_sqs_queue_policy.lab_reaper_failures" in target
+
+    expected_alarms = {
+        "lab_reaper_errors": ("AWS/Lambda", "Errors", "FunctionName"),
+        "lab_reaper_throttles": ("AWS/Lambda", "Throttles", "FunctionName"),
+        "lab_reaper_async_events_dropped": ("AWS/Lambda", "AsyncEventsDropped", "FunctionName"),
+        "lab_reaper_destination_delivery_failures": (
+            "AWS/Lambda",
+            "DestinationDeliveryFailures",
+            "FunctionName",
+        ),
+        "lab_reaper_eventbridge_failed_invocations": (
+            "AWS/Events",
+            "FailedInvocations",
+            "RuleName",
+        ),
+        "lab_reaper_eventbridge_dlq_delivery_failures": (
+            "AWS/Events",
+            "InvocationsFailedToBeSentToDlq",
+            "RuleName",
+        ),
+        "lab_reaper_failure_queue_messages": (
+            "AWS/SQS",
+            "ApproximateNumberOfMessagesVisible",
+            "QueueName",
+        ),
+        "lab_reaper_missing_invocations": ("AWS/Events", "Invocations", "RuleName"),
+    }
+    for name, (namespace, metric, dimension) in expected_alarms.items():
+        alarm = _terraform_block(reaper, "resource", "aws_cloudwatch_metric_alarm", name)
+        assert f'namespace           = "{namespace}"' in alarm
+        assert f'metric_name         = "{metric}"' in alarm
+        assert f"{dimension} =" in alarm
+        assert "alarm_actions       = [aws_sns_topic.operator_alerts.arn]" in alarm
+
+    missing = _terraform_block(
+        reaper, "resource", "aws_cloudwatch_metric_alarm", "lab_reaper_missing_invocations"
+    )
+    assert 'comparison_operator = "LessThanThreshold"' in missing
+    assert 'treat_missing_data  = "breaching"' in missing and "period              = 900" in missing
+    controller_alarm = _terraform_block(
+        compute, "resource", "aws_cloudwatch_metric_alarm", "controller_status_check"
+    )
+    assert "alarm_actions       = [aws_sns_topic.operator_alerts.arn]" in controller_alarm
 
 
 def test_deploy_scope_renderer_preserves_exact_unicode_and_rejects_limits() -> None:

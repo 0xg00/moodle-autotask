@@ -84,6 +84,13 @@ concurrency or serialize executions. EventBridge has zero pre-invocation deliver
 throttling or system errors can still retry within the same age bound. The next five-minute event is
 the normal function-error retry path, not the only possible retry. Duplicate delivery remains safe
 because each invocation has its own deterministic cap and EC2 termination is idempotent.
+Terraform independently retains asynchronous failure evidence in one encrypted, bounded standard
+SQS queue: EventBridge can send target-delivery failures through a rule-scoped queue policy and
+Lambda can send failed asynchronous invocation records through its execution role. CloudWatch alarms
+for the controller, Lambda, EventBridge, queue visibility, and missing scheduled invocation publish
+to an operator-confirmed SNS email subscription. These records are diagnostic evidence, not work
+items: recovery fixes the cause and uses the next idempotent empty scheduled event rather than
+replaying opaque records.
 
 AWS infrastructure is a separate adapter boundary. The Terraform baseline creates a Linux
 controller whose instance role can read the exact Moodle secret, use bounded artifact prefixes, and

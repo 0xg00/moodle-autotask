@@ -8,6 +8,16 @@ output "controller_public_ip" {
   value       = aws_instance.controller.public_ip
 }
 
+output "operator_alert_topic_arn" {
+  description = "SNS topic receiving controller and lab-reaper operator alarms after email confirmation."
+  value       = aws_sns_topic.operator_alerts.arn
+}
+
+output "lab_reaper_failure_queue_url" {
+  description = "Encrypted SQS queue retaining EventBridge and Lambda asynchronous failure records for inspection."
+  value       = aws_sqs_queue.lab_reaper_failures.url
+}
+
 output "artifact_bucket_name" {
   description = "Private encrypted project artifact bucket."
   value       = aws_s3_bucket.artifacts.id

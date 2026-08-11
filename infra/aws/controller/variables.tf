@@ -107,6 +107,22 @@ variable "lab_reaper_max_terminations_per_run" {
   }
 }
 
+variable "operator_alert_email" {
+  description = "Operator email address for SNS alarm confirmation; Terraform never confirms the subscription."
+  type        = string
+
+  validation {
+    condition = (
+      length(var.operator_alert_email) > 0 &&
+      (length(base64encode(var.operator_alert_email)) / 4 * 3 -
+      (endswith(base64encode(var.operator_alert_email), "==") ? 2 : endswith(base64encode(var.operator_alert_email), "=") ? 1 : 0)) <= 254 &&
+      !can(regex("[\\s\\p{C}]", var.operator_alert_email)) &&
+      length(regexall("@", var.operator_alert_email)) == 1
+    )
+    error_message = "operator_alert_email must be a non-empty UTF-8 address of at most 254 bytes, without whitespace or control characters, containing exactly one @."
+  }
+}
+
 variable "additional_tags" {
   description = "Additional non-sensitive resource tags."
   type        = map(string)

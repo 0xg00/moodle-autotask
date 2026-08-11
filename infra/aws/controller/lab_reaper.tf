@@ -28,6 +28,109 @@ resource "aws_cloudwatch_log_group" "lab_reaper" {
   retention_in_days = 30
 }
 
+resource "aws_sns_topic" "operator_alerts" {
+  name = "${local.name_prefix}-operator-alerts"
+}
+
+data "aws_iam_policy_document" "operator_alerts" {
+  statement {
+    sid       = "AllowAccountAdministration"
+    effect    = "Allow"
+    actions   = ["sns:*"]
+    resources = [aws_sns_topic.operator_alerts.arn]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+  }
+
+  statement {
+    sid       = "AllowCloudWatchAlarms"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.operator_alerts.arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${data.aws_partition.current.partition}:cloudwatch:${var.region}:${data.aws_caller_identity.current.account_id}:alarm:*"]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "operator_alerts" {
+  arn    = aws_sns_topic.operator_alerts.arn
+  policy = data.aws_iam_policy_document.operator_alerts.json
+}
+
+resource "aws_sns_topic_subscription" "operator_alert_email" {
+  topic_arn = aws_sns_topic.operator_alerts.arn
+  protocol  = "email"
+  endpoint  = var.operator_alert_email
+}
+
+resource "aws_sqs_queue" "lab_reaper_failures" {
+  name                      = "${local.name_prefix}-lab-reaper-failures"
+  fifo_queue                = false
+  sqs_managed_sse_enabled   = true
+  message_retention_seconds = 1209600
+}
+
+data "aws_iam_policy_document" "lab_reaper_failures" {
+  statement {
+    sid       = "AllowEventBridgeTargetDlq"
+    effect    = "Allow"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.lab_reaper_failures.arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = [aws_cloudwatch_event_rule.lab_reaper.arn]
+    }
+  }
+
+  statement {
+    sid       = "DenyInsecureTransport"
+    effect    = "Deny"
+    actions   = ["sqs:*"]
+    resources = [aws_sqs_queue.lab_reaper_failures.arn]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_sqs_queue_policy" "lab_reaper_failures" {
+  queue_url = aws_sqs_queue.lab_reaper_failures.id
+  policy    = data.aws_iam_policy_document.lab_reaper_failures.json
+}
+
 data "aws_iam_policy_document" "lab_reaper" {
   statement {
     sid       = "WriteOwnLogs"
@@ -41,6 +144,13 @@ data "aws_iam_policy_document" "lab_reaper" {
     effect    = "Allow"
     actions   = ["ec2:DescribeInstances"]
     resources = ["*"]
+  }
+
+  statement {
+    sid       = "SendOwnFailureRecords"
+    effect    = "Allow"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.lab_reaper_failures.arn]
   }
 
   statement {
@@ -118,6 +228,14 @@ resource "aws_lambda_function_event_invoke_config" "lab_reaper" {
   function_name                = aws_lambda_function.lab_reaper.function_name
   maximum_event_age_in_seconds = 300
   maximum_retry_attempts       = 0
+
+  destination_config {
+    on_failure {
+      destination = aws_sqs_queue.lab_reaper_failures.arn
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.lab_reaper]
 }
 
 resource "aws_cloudwatch_event_rule" "lab_reaper" {
@@ -135,9 +253,14 @@ resource "aws_cloudwatch_event_target" "lab_reaper" {
     maximum_retry_attempts       = 0
   }
 
+  dead_letter_config {
+    arn = aws_sqs_queue.lab_reaper_failures.arn
+  }
+
   depends_on = [
     aws_lambda_permission.eventbridge_lab_reaper,
     aws_lambda_function_event_invoke_config.lab_reaper,
+    aws_sqs_queue_policy.lab_reaper_failures,
   ]
 }
 
@@ -161,8 +284,142 @@ resource "aws_cloudwatch_metric_alarm" "lab_reaper_errors" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
 
   dimensions = {
     FunctionName = aws_lambda_function.lab_reaper.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lab_reaper_throttles" {
+  alarm_name          = "${local.name_prefix}-lab-reaper-throttles"
+  alarm_description   = "The lab reaper is being throttled."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Throttles"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
+
+  dimensions = {
+    FunctionName = aws_lambda_function.lab_reaper.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lab_reaper_async_events_dropped" {
+  alarm_name          = "${local.name_prefix}-lab-reaper-async-events-dropped"
+  alarm_description   = "Lambda dropped a lab-reaper asynchronous invocation."
+  namespace           = "AWS/Lambda"
+  metric_name         = "AsyncEventsDropped"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
+
+  dimensions = {
+    FunctionName = aws_lambda_function.lab_reaper.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lab_reaper_destination_delivery_failures" {
+  alarm_name          = "${local.name_prefix}-lab-reaper-destination-delivery-failures"
+  alarm_description   = "Lambda could not send a lab-reaper failure record to SQS."
+  namespace           = "AWS/Lambda"
+  metric_name         = "DestinationDeliveryFailures"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
+
+  dimensions = {
+    FunctionName = aws_lambda_function.lab_reaper.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lab_reaper_eventbridge_failed_invocations" {
+  alarm_name          = "${local.name_prefix}-lab-reaper-eventbridge-failed-invocations"
+  alarm_description   = "EventBridge could not invoke the lab reaper."
+  namespace           = "AWS/Events"
+  metric_name         = "FailedInvocations"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
+
+  dimensions = {
+    RuleName = aws_cloudwatch_event_rule.lab_reaper.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lab_reaper_eventbridge_dlq_delivery_failures" {
+  alarm_name          = "${local.name_prefix}-lab-reaper-eventbridge-dlq-delivery-failures"
+  alarm_description   = "EventBridge could not send a failed lab-reaper invocation to SQS."
+  namespace           = "AWS/Events"
+  metric_name         = "InvocationsFailedToBeSentToDlq"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
+
+  dimensions = {
+    RuleName = aws_cloudwatch_event_rule.lab_reaper.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lab_reaper_failure_queue_messages" {
+  alarm_name          = "${local.name_prefix}-lab-reaper-failure-queue-messages"
+  alarm_description   = "The lab-reaper failure queue has records requiring operator inspection."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
+
+  dimensions = {
+    QueueName = aws_sqs_queue.lab_reaper_failures.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lab_reaper_missing_invocations" {
+  alarm_name          = "${local.name_prefix}-lab-reaper-missing-invocations"
+  alarm_description   = "EventBridge has not invoked the lab reaper during the expected schedule window."
+  namespace           = "AWS/Events"
+  metric_name         = "Invocations"
+  statistic           = "Sum"
+  period              = 900
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.operator_alerts.arn]
+
+  dimensions = {
+    RuleName = aws_cloudwatch_event_rule.lab_reaper.name
   }
 }
