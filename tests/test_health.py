@@ -9,6 +9,11 @@ import pytest
 
 from moddle_autotask.health import pulse
 
+pytestmark = pytest.mark.skipif(
+    os.name == "nt" or getattr(os, "geteuid", lambda: -1)() != 0,
+    reason="requires a root POSIX ownership test invocation",
+)
+
 
 def _chown(path: Path, user: int, group: int) -> None:
     command = getattr(os, "chown", None)

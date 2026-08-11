@@ -12,7 +12,10 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="remote guards are POSIX shell")
+pytestmark = pytest.mark.skipif(
+    os.name == "nt" or getattr(os, "geteuid", lambda: -1)() != 0,
+    reason="requires a root POSIX ownership test invocation",
+)
 
 _ROOT = Path(__file__).parents[1]
 _DEPLOY = _ROOT / "scripts" / "aws-deploy.ps1"

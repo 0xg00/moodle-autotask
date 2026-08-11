@@ -23,6 +23,19 @@ jobs:
       - run: python -m mypy src tests
       - run: python -m pytest -q
 
+  root-ownership:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e ".[dev]"
+      - run: >-
+          sudo env PYTHONDONTWRITEBYTECODE=1 "$(command -v python)" -m pytest -q
+          -p no:cacheprovider --basetemp "$RUNNER_TEMP/pytest-root-ownership"
+          tests/test_health.py tests/test_health_publishers.py tests/test_aws_deploy_guards.py
+
   terraform:
     runs-on: ubuntu-latest
     steps:

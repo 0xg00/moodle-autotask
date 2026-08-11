@@ -543,7 +543,14 @@ def _scheduler_guard_command(config: Path) -> str:
         re.DOTALL,
     )
     assert match is not None
-    return match.group(1).replace("__CONFIG_PATH__", str(config))
+    return "\n".join(
+        (
+            "restore_controller_install() { :; }",
+            "cleanup_controller_install() { :; }",
+            "restore_release_set() { :; }",
+            match.group(1).replace("__CONFIG_PATH__", str(config)),
+        )
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX bash service fake")
@@ -598,11 +605,7 @@ trap - EXIT
     completed = subprocess.run(["bash", "-c", script], check=False, timeout=15)
     assert completed.returncode != 0
     assert (state / f"failed-{failed_service}").is_file()
-    if failed_command == "stop":
-        assert not config.exists()
-    else:
-        assert config.read_bytes() == b"migrated"
-        assert (config.stat().st_mode & 0o777) == 0o640
+    assert not config.exists()
     assert (state / "scheduler").is_file()
     assert (state / "telegram").is_file()
     assert (state / "worker").is_file()

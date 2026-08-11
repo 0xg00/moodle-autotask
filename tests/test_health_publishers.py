@@ -15,7 +15,10 @@ import pytest
 
 from moddle_autotask.adapters.aws.controller_service import _health_publisher_script
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="publisher scripts require Linux")
+pytestmark = pytest.mark.skipif(
+    os.name == "nt" or getattr(os, "geteuid", lambda: -1)() != 0,
+    reason="requires a root POSIX ownership test invocation",
+)
 
 _ROOT = Path(__file__).parents[1]
 _SERVICES = ("scheduler", "telegram", "worker", "agent")
