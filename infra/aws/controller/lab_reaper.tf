@@ -88,16 +88,15 @@ resource "aws_iam_role_policy" "lab_reaper" {
 }
 
 resource "aws_lambda_function" "lab_reaper" {
-  function_name                  = "${local.name_prefix}-lab-reaper"
-  description                    = "Terminates only over-age tagged lab instances independent of the controller"
-  filename                       = data.archive_file.lab_reaper.output_path
-  source_code_hash               = data.archive_file.lab_reaper.output_base64sha256
-  role                           = aws_iam_role.lab_reaper.arn
-  handler                        = "lab_reaper.lambda_handler"
-  runtime                        = "python3.13"
-  timeout                        = 30
-  memory_size                    = 128
-  reserved_concurrent_executions = 1
+  function_name    = "${local.name_prefix}-lab-reaper"
+  description      = "Terminates only over-age tagged lab instances independent of the controller"
+  filename         = data.archive_file.lab_reaper.output_path
+  source_code_hash = data.archive_file.lab_reaper.output_base64sha256
+  role             = aws_iam_role.lab_reaper.arn
+  handler          = "lab_reaper.lambda_handler"
+  runtime          = "python3.13"
+  timeout          = 30
+  memory_size      = 128
 
   environment {
     variables = {
@@ -115,6 +114,12 @@ resource "aws_lambda_function" "lab_reaper" {
   depends_on = [aws_cloudwatch_log_group.lab_reaper]
 }
 
+resource "aws_lambda_function_event_invoke_config" "lab_reaper" {
+  function_name                = aws_lambda_function.lab_reaper.function_name
+  maximum_event_age_in_seconds = 300
+  maximum_retry_attempts       = 0
+}
+
 resource "aws_cloudwatch_event_rule" "lab_reaper" {
   name                = "${local.name_prefix}-lab-reaper"
   description         = "Run the independent lab hard-TTL reaper every five minutes"
@@ -124,6 +129,16 @@ resource "aws_cloudwatch_event_rule" "lab_reaper" {
 resource "aws_cloudwatch_event_target" "lab_reaper" {
   rule = aws_cloudwatch_event_rule.lab_reaper.name
   arn  = aws_lambda_function.lab_reaper.arn
+
+  retry_policy {
+    maximum_event_age_in_seconds = 300
+    maximum_retry_attempts       = 0
+  }
+
+  depends_on = [
+    aws_lambda_permission.eventbridge_lab_reaper,
+    aws_lambda_function_event_invoke_config.lab_reaper,
+  ]
 }
 
 resource "aws_lambda_permission" "eventbridge_lab_reaper" {

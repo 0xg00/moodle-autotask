@@ -90,9 +90,21 @@ def test_independent_lab_reaper_has_bounded_tag_scoped_hard_ttl() -> None:
     assert 'source  = "hashicorp/archive"' in versions and 'version = "= 2.7.1"' in versions
     assert 'schedule_expression = "rate(5 minutes)"' in reaper
     assert 'output_file_mode = "0664"' in reaper
-    assert "reserved_concurrent_executions = 1" in reaper
-    assert "timeout                        = 30" in reaper
+    assert "reserved_concurrent_executions" not in reaper
+    assert "timeout          = 30" in reaper
     assert 'logging_config {' in reaper and 'log_format = "JSON"' in reaper
+    assert "aws_lambda_function_event_invoke_config" in reaper
+    invoke_resource = 'resource "aws_lambda_function_event_invoke_config" "lab_reaper"'
+    rule_resource = 'resource "aws_cloudwatch_event_rule" "lab_reaper"'
+    invoke_config = reaper.split(invoke_resource, 1)[1].split(rule_resource, 1)[0]
+    target = reaper.split('resource "aws_cloudwatch_event_target" "lab_reaper"', 1)[1].split(
+        'resource "aws_lambda_permission" "eventbridge_lab_reaper"', 1
+    )[0]
+    for block in (invoke_config, target):
+        assert "maximum_event_age_in_seconds = 300" in block
+        assert "maximum_retry_attempts       = 0" in block
+    assert "aws_lambda_permission.eventbridge_lab_reaper" in target
+    assert "aws_lambda_function_event_invoke_config.lab_reaper" in target
     assert "aws_cloudwatch_event_target" in reaper and "aws_lambda_permission" in reaper
     assert "aws_cloudwatch_metric_alarm" in reaper and "retention_in_days = 30" in reaper
     assert "ec2:DescribeInstances" in reaper and "ec2:TerminateInstances" in reaper

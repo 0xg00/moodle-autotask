@@ -115,7 +115,15 @@ IAM requires that `ProvisionKey` is present; Python additionally requires it to 
 does not trust an expiry tag. The five-minute schedule is eventual,
 not an exact termination deadline. This independent Lambda has a dedicated role and cannot be
 modified by the controller role; its CloudWatch log group retains bounded JSON operational records
-for 30 days and its error metric has an alarm without an implicit notification destination.
+for 30 days and its error metric has an alarm without an implicit notification destination. It does
+not reserve Lambda concurrency or serialize executions. Both the EventBridge target and Lambda
+asynchronous invoke configuration have a 300-second maximum event age. The EventBridge target has
+zero pre-invocation delivery retries, and Lambda's zero retry-attempt setting suppresses retries
+after a function error; Lambda can still retry throttling or system errors until that age expires.
+The next five-minute schedule is the normal function-error retry path, but not the only possible
+retry. AWS may still deliver a duplicate event, so each invocation independently applies the
+deterministic 20-instance cap and relies on idempotent EC2 termination rather than a global
+per-period cap.
 
 `AwsEc2LabProvider` uses the fixed launch values installed with the service and the AWS CLI already
 on the controller. Deployment reads the exact AMI authorized by the inline provisioner policy, so a

@@ -78,7 +78,12 @@ independent hard cost guard: every five minutes it paginates EC2, defensively re
 ownership tags and server-side launch time, and terminates only eligible labs at least the
 configured four-hour TTL old. Its dedicated role has no controller or IAM authority and limits
 each run to 20 deterministic terminations; delayed EventBridge delivery can make the bound
-eventual but cannot expand its scope beyond exact tagged labs.
+eventual but cannot expand its scope beyond exact tagged labs. The reaper does not reserve Lambda
+concurrency or serialize executions. EventBridge has zero pre-invocation delivery retries and a
+300-second age bound; Lambda's zero retry-attempt setting suppresses function-error retries, while
+throttling or system errors can still retry within the same age bound. The next five-minute event is
+the normal function-error retry path, not the only possible retry. Duplicate delivery remains safe
+because each invocation has its own deterministic cap and EC2 termination is idempotent.
 
 AWS infrastructure is a separate adapter boundary. The Terraform baseline creates a Linux
 controller whose instance role can read the exact Moodle secret, use bounded artifact prefixes, and
