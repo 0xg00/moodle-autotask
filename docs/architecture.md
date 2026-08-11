@@ -64,11 +64,14 @@ AMI and snapshots, and passes that exact AMI to the lab provider. Cleanup termin
 deregisters the imported AMI, and deletes its snapshots before completing the work item.
 
 The connector never uses password login, scraping, or browser automation. Its only mutation is the
-explicit submission boundary: after a distinct Telegram `Entregar` decision it verifies the current
+explicit submission boundary: after a distinct Telegram decision it verifies the current
 task/revision/assignment identity, uploads one Markdown report to Moodle `upload.php`, persists the
-draft item ID before `mod_assign_save_submission`, then verifies the final result through
-`mod_assign_get_submission_status`. A crash after a saved draft is resolved by verification, never a
-blind second save. Telegram uses long polling over outbound HTTPS;
+draft item ID before `mod_assign_save_submission`, verifies the exact draft, durably records
+`finalizing`, then calls official `mod_assign_submit_for_grading` and verifies the exact submitted
+file through `mod_assign_get_submission_status`. For a required statement, its formatted bytes,
+format, deterministic plain presentation, and digest are revision-bound and Telegram exposes the
+explicit `Acepto y entregar` decision. A crash after a saved draft is resolved by verification,
+never a blind second save. Telegram uses long polling over outbound HTTPS;
 the controller exposes no webhook or inbound port. Bot credentials are read only from a protected
 file and never accepted as a command-line value or placed in callback data.
 

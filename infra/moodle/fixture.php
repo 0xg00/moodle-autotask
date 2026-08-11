@@ -14,6 +14,8 @@ const AUTOTASK_FIXTURE_CONFIG = 'moddle_autotask_rich_fixture_version';
 const AUTOTASK_FIXTURE_ANCHOR_CONFIG = 'moddle_autotask_rich_fixture_anchor';
 const AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG = 'moddle_autotask_rich_fixture_catalog_v3_sha256';
 const AUTOTASK_FIXTURE_V3_COURSE = 'ASIX-CAMPAIGN-01';
+const AUTOTASK_FIXTURE_V4_STATEMENT_CONFIG = 'moddle_autotask_rich_fixture_v4_submission_statement_sha256';
+const AUTOTASK_FIXTURE_V4_STATEMENT = '<p>Declaro que aquesta entrega és meva — 你好.</p><p>Versió <strong>HTML</strong> distintiva.</p>';
 
 function fixture_courses(): array {
     return [
@@ -149,7 +151,8 @@ function fixture_footprint_exists(): bool {
     }
     return $DB->record_exists_select('course_categories', 'idnumber IN (?, ?, ?)', ['AUTOTASK-CF', 'AUTOTASK-INFO', 'AUTOTASK-ASIX'])
         || $DB->record_exists_select('course_modules', $DB->sql_like('idnumber', '?'), ['autotask-rich-%'])
-        || fixture_v3_footprint_exists();
+        || fixture_v3_footprint_exists()
+        || fixture_v4_footprint_exists();
 }
 
 function fixture_v3_footprint_exists(): bool {
@@ -160,6 +163,58 @@ function fixture_v3_footprint_exists(): bool {
         || $DB->record_exists_select('course_modules', 'idnumber IN (?, ?, ?, ?)', [
             'central-report-success', 'windows-ssm-success', 'windows-command-failure', 'ova-import-negative',
         ]);
+}
+
+function fixture_v4_assignments(): array {
+    return [
+        [
+            'idnumber' => 'autotask-draft-only',
+            'title' => 'AutoTask draft-only submission fixture',
+            'intro' => '<p>Deterministic Moodle draft-only submission fixture.</p>',
+            'dueoffset' => 172800, 'allowoffset' => 0, 'files' => [],
+            'submissiondrafts' => 1, 'requiresubmissionstatement' => 0,
+        ],
+        [
+            'idnumber' => 'autotask-draft-statement',
+            'title' => 'AutoTask draft statement fixture',
+            'intro' => '<p>Deterministic statement fixture: català �� 中文.</p>',
+            'dueoffset' => 172800, 'allowoffset' => 0, 'files' => [],
+            'submissiondrafts' => 1, 'requiresubmissionstatement' => 1,
+        ],
+        [
+            'idnumber' => 'autotask-statement-only-blocked',
+            'title' => 'AutoTask statement-only blocked fixture',
+            'intro' => '<p>Must be rejected: no Moodle draft phase.</p>',
+            'dueoffset' => 172800, 'allowoffset' => 0, 'files' => [],
+            'submissiondrafts' => 0, 'requiresubmissionstatement' => 1,
+        ],
+    ];
+}
+
+function fixture_v4_footprint_exists(): bool {
+    global $DB;
+    $idnumbers = array_column(fixture_v4_assignments(), 'idnumber');
+    return get_config('core', AUTOTASK_FIXTURE_V4_STATEMENT_CONFIG) !== false
+        || (string)get_config('assign', 'submissionstatement') === AUTOTASK_FIXTURE_V4_STATEMENT
+        || $DB->record_exists_select(
+            'course_modules',
+            'idnumber IN (' . implode(',', array_fill(0, count($idnumbers), '?')) . ')',
+            $idnumbers,
+        );
+}
+
+function fixture_v4_config_orphan_repairable(): bool {
+    global $DB;
+    $idnumbers = array_column(fixture_v4_assignments(), 'idnumber');
+    $stored = get_config('core', AUTOTASK_FIXTURE_V4_STATEMENT_CONFIG);
+    return is_string($stored)
+        && hash_equals(hash('sha256', AUTOTASK_FIXTURE_V4_STATEMENT), $stored)
+        && (string)get_config('assign', 'submissionstatement') === AUTOTASK_FIXTURE_V4_STATEMENT
+        && !$DB->record_exists_select(
+            'course_modules',
+            'idnumber IN (' . implode(',', array_fill(0, count($idnumbers), '?')) . ')',
+            $idnumbers,
+        );
 }
 
 function fixture_timestamp(int $anchor, int $offset): int {
@@ -240,7 +295,9 @@ function verify_fixture(bool $advanced, int $anchor): bool {
             $expectedallow = fixture_timestamp($anchor, $spec['allowoffset']);
             if ($row->name !== $spec['name'] || $row->intro !== $expectedintro
                     || (int)$row->duedate !== $expecteddue
-                    || (int)$row->allowsubmissionsfromdate !== $expectedallow) {
+                    || (int)$row->allowsubmissionsfromdate !== $expectedallow
+                    || (int)$row->submissiondrafts !== (int)($spec['submissiondrafts'] ?? 0)
+                    || (int)$row->requiresubmissionstatement !== (int)($spec['requiresubmissionstatement'] ?? 0)) {
                 return false;
             }
             $context = context_module::instance($row->cmid);
@@ -272,16 +329,27 @@ function fixture_state(): string {
     }
     if ($version === '3') {
         $catalog = fixture_v3_catalog();
+        if (fixture_v4_footprint_exists()) {
+            return $catalog !== null
+                && verify_fixture_v3($catalog['data'], $catalog['digest'], true)
+                && fixture_v4_config_orphan_repairable()
+                ? 'complete-v3-v4-config-orphan-repairable' : 'partial';
+        }
         if ($catalog !== null && verify_fixture_v3($catalog['data'], $catalog['digest'], true)) {
             return 'complete-v3';
         }
         return $catalog !== null && verify_fixture_v3($catalog['data'], $catalog['digest'], true, $ignored, false)
             ? 'complete-v3-submission-config-legacy' : 'partial';
     }
+    if ($version === '4') {
+        $catalog = fixture_v3_catalog();
+        return $catalog !== null && verify_fixture_v4($catalog['data'], $catalog['digest'])
+            ? 'complete-v4' : 'partial';
+    }
     if ($version !== '1' && $version !== '2') {
         return 'partial';
     }
-    if (fixture_v3_footprint_exists()) {
+    if (fixture_v3_footprint_exists() || fixture_v4_footprint_exists()) {
         return 'partial';
     }
     $advanced = $version === '2';
@@ -299,13 +367,13 @@ function create_assignment(object $course, array $spec, int $now): void {
         'modulename' => 'assign', 'module' => $module->id, 'course' => $course->id,
         'section' => 0, 'visible' => 1, 'showdescription' => 0, 'name' => $spec['name'],
         'cmidnumber' => $spec['idnumber'], 'intro' => $spec['intro'], 'introformat' => FORMAT_HTML,
-        'alwaysshowdescription' => 1, 'submissionattachments' => !empty($spec['submissionfile']) ? 1 : 0, 'submissiondrafts' => 0,
+        'alwaysshowdescription' => 1, 'submissionattachments' => !empty($spec['submissionfile']) ? 1 : 0, 'submissiondrafts' => (int)($spec['submissiondrafts'] ?? 0),
         'assignsubmission_file_enabled' => !empty($spec['submissionfile']) ? 1 : 0,
         'assignsubmission_file_maxfiles' => !empty($spec['submissionfile']) ? 1 : 0,
         'assignsubmission_file_maxsizebytes' => !empty($spec['submissionfile']) ? 2097152 : 0,
         'assignsubmission_file_filetypes' => !empty($spec['submissionfile']) ? '.md' : '',
         'assignsubmission_onlinetext_enabled' => 0,
-        'requiresubmissionstatement' => 0, 'sendnotifications' => 0, 'sendlatenotifications' => 0,
+        'requiresubmissionstatement' => (int)($spec['requiresubmissionstatement'] ?? 0), 'sendnotifications' => 0, 'sendlatenotifications' => 0,
         'sendstudentnotifications' => 0,
         'duedate' => fixture_timestamp($now, $spec['dueoffset']),
         'allowsubmissionsfromdate' => fixture_timestamp($now, $spec['allowoffset']),
@@ -704,7 +772,7 @@ function fixture_v3_verification_failure(?string &$reason, string $code): bool {
     return false;
 }
 
-function verify_fixture_v3(array $catalog, string $digest, bool $requirestored, ?string &$reason = null, bool $checksubmission = true): bool {
+function verify_fixture_v3(array $catalog, string $digest, bool $requirestored, ?string &$reason = null, bool $checksubmission = true, bool $checkassignmentset = true): bool {
     global $DB;
     $reason = null;
     $phase = 'legacy-v2';
@@ -805,10 +873,54 @@ function verify_fixture_v3(array $catalog, string $digest, bool $requirestored, 
             $seen[$spec['idnumber']] = true;
         }
         $phase = 'campaign-assignment-set';
-        return fixture_v3_has_exact_assignments((int)$campaign->id, array_keys($seen))
+        return (!$checkassignmentset || fixture_v3_has_exact_assignments((int)$campaign->id, array_keys($seen)))
             || fixture_v3_verification_failure($reason, 'campaign-assignment-set');
     } catch (Throwable) {
         return fixture_v3_verification_failure($reason, 'verification-exception-' . $phase);
+    }
+}
+
+function verify_fixture_v4(array $catalog, string $digest, ?string &$reason = null, bool $checkglobal = true): bool {
+    global $DB;
+    $reason = null;
+    try {
+        if (!verify_fixture_v3($catalog, $digest, true, $reason, true, false)) {
+            return false;
+        }
+        $statementdigest = hash('sha256', AUTOTASK_FIXTURE_V4_STATEMENT);
+        $storedstatement = get_config('core', AUTOTASK_FIXTURE_V4_STATEMENT_CONFIG);
+        if ($checkglobal && (!is_string($storedstatement) || !hash_equals($statementdigest, $storedstatement)
+            || (string)get_config('assign', 'submissionstatement') !== AUTOTASK_FIXTURE_V4_STATEMENT)) {
+            return fixture_v3_verification_failure($reason, 'v4-submission-statement');
+        }
+        $campaign = $DB->get_record('course', ['shortname' => AUTOTASK_FIXTURE_V3_COURSE], '*', MUST_EXIST);
+        $anchor = fixture_anchor(true);
+        if ($anchor === null) {
+            return fixture_v3_verification_failure($reason, 'v4-anchor');
+        }
+        $expected = array_column($catalog['assignments'], 'idnumber');
+        foreach (fixture_v4_assignments() as $index => $spec) {
+            $row = $DB->get_record_sql(
+                "SELECT a.*, cm.id AS cmid FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE a.course = ? AND cm.idnumber = ? AND m.name = ?",
+                [$campaign->id, $spec['idnumber'], 'assign'],
+            );
+            if (!$row || $row->name !== $spec['title'] || $row->intro !== $spec['intro']
+                || (int)$row->introformat !== (int)FORMAT_HTML
+                || (int)$row->duedate !== fixture_timestamp($anchor, $spec['dueoffset'])
+                || (int)$row->allowsubmissionsfromdate !== fixture_timestamp($anchor, $spec['allowoffset'])
+                || (int)$row->submissionattachments !== 1
+                || (int)$row->submissiondrafts !== $spec['submissiondrafts']
+                || (int)$row->requiresubmissionstatement !== $spec['requiresubmissionstatement']
+                || !fixture_v3_submission_file_enabled((int)$row->id)
+                || !fixture_v3_verify_files(context_module::instance($row->cmid)->id, $spec['files'])) {
+                return fixture_v3_verification_failure($reason, 'v4-assignment-' . ($index + 1));
+            }
+            $expected[] = $spec['idnumber'];
+        }
+        return fixture_v3_has_exact_assignments((int)$campaign->id, $expected)
+            || fixture_v3_verification_failure($reason, 'v4-assignment-set');
+    } catch (Throwable) {
+        return fixture_v3_verification_failure($reason, 'v4-verification-exception');
     }
 }
 
@@ -830,6 +942,15 @@ function fixture_v3_create_assignment(object $course, array $spec, int $anchor):
         'idnumber' => $module->idnumber, 'name' => $module->name, 'intro' => $module->intro,
         'dueoffset' => $module->dueoffset, 'allowoffset' => $module->allowoffset, 'files' => $module->files,
         'submissionfile' => true,
+    ], $anchor);
+}
+
+function fixture_v4_create_assignment(object $course, array $spec, int $anchor): void {
+    create_assignment($course, [
+        'idnumber' => $spec['idnumber'], 'name' => $spec['title'], 'intro' => $spec['intro'],
+        'dueoffset' => $spec['dueoffset'], 'allowoffset' => $spec['allowoffset'], 'files' => $spec['files'],
+        'submissionfile' => true, 'submissiondrafts' => $spec['submissiondrafts'],
+        'requiresubmissionstatement' => $spec['requiresubmissionstatement'],
     ], $anchor);
 }
 
@@ -869,6 +990,50 @@ function fixture_v3_enable_submission_file(int $assignmentid): void {
     }
 }
 
+function upgrade_fixture_v4(array $catalog, string $digest): void {
+    global $DB;
+    $state = fixture_state();
+    if ($state === 'complete-v4') {
+        return;
+    }
+    if (!in_array($state, ['complete-v3', 'complete-v3-v4-config-orphan-repairable'], true)
+        || !verify_fixture_v3($catalog, $digest, true)) {
+        throw new RuntimeException('rich fixture v3 verification failed before v4 migration');
+    }
+    foreach (fixture_v4_assignments() as $spec) {
+        if ($DB->record_exists('course_modules', ['idnumber' => $spec['idnumber']])) {
+            throw new RuntimeException('v4 fixture assignment collision');
+        }
+    }
+    $transaction = $DB->start_delegated_transaction();
+    try {
+        $campaign = $DB->get_record('course', ['shortname' => AUTOTASK_FIXTURE_V3_COURSE], '*', MUST_EXIST);
+        $anchor = fixture_anchor(true);
+        if ($anchor === null) {
+            throw new RuntimeException('rich fixture v4 anchor is invalid');
+        }
+        foreach (fixture_v4_assignments() as $spec) {
+            fixture_v4_create_assignment($campaign, $spec, $anchor);
+        }
+        $reason = null;
+        if (!verify_fixture_v4($catalog, $digest, $reason, false)) {
+            throw new RuntimeException('rich fixture verification failed during v4 migration: ' . ($reason ?? 'verification-exception'));
+        }
+        $transaction->allow_commit();
+    } catch (Throwable $error) {
+        $transaction->rollback($error);
+    }
+    // Moodle config-plugin writes do not participate in delegated DML
+    // transactions.  They are written only after the module transaction has
+    // committed and its exact footprint has been verified.
+    set_config('submissionstatement', AUTOTASK_FIXTURE_V4_STATEMENT, 'assign');
+    set_config(AUTOTASK_FIXTURE_V4_STATEMENT_CONFIG, hash('sha256', AUTOTASK_FIXTURE_V4_STATEMENT));
+    set_config(AUTOTASK_FIXTURE_CONFIG, '4');
+    if (fixture_state() !== 'complete-v4') {
+        throw new RuntimeException('rich fixture verification failed after v4 migration');
+    }
+}
+
 function expand_fixture(): void {
     global $DB;
     $loaded = fixture_v3_catalog();
@@ -876,7 +1041,7 @@ function expand_fixture(): void {
         throw new RuntimeException('v3 catalog was not loaded');
     }
     $state = fixture_state();
-    if ($state === 'complete-v3') {
+    if ($state === 'complete-v4') {
         return;
     }
     if ($state === 'complete-v3-submission-config-legacy') {
@@ -890,10 +1055,10 @@ function expand_fixture(): void {
                 throw new RuntimeException('v3 submission configuration verification failed');
             }
             $transaction->allow_commit();
-            return;
         } catch (Throwable $error) {
             $transaction->rollback($error);
         }
+        $state = fixture_state();
     }
     if ($state === 'partial') {
         throw new RuntimeException('rich fixture is partial');
@@ -905,6 +1070,10 @@ function expand_fixture(): void {
     if ($state === 'complete-v1') {
         advance_fixture();
         $state = fixture_state();
+    }
+    if ($state === 'complete-v3' || $state === 'complete-v3-v4-config-orphan-repairable') {
+        upgrade_fixture_v4($loaded['data'], $loaded['digest']);
+        return;
     }
     if ($state !== 'complete-v2') {
         throw new RuntimeException('rich fixture cannot migrate to revision 3');
@@ -963,6 +1132,7 @@ function expand_fixture(): void {
     } catch (Throwable $error) {
         $transaction->rollback($error);
     }
+    upgrade_fixture_v4($loaded['data'], $loaded['digest']);
 }
 
 if (!defined('AUTOTASK_FIXTURE_LIBRARY')) {

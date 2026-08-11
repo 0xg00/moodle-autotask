@@ -8,6 +8,7 @@ from typing import Protocol, cast, runtime_checkable
 from moddle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
     ApprovalStateError,
+    SubmissionClaim,
     SubmissionManifest,
     WorkClaim,
 )
@@ -61,6 +62,10 @@ class SubmissionService(Protocol):
     def upload(self, manifest: SubmissionManifest) -> int: ...
 
     def save(self, manifest: SubmissionManifest, draft_item_id: int) -> None: ...
+
+    def verify_draft(self, manifest: SubmissionManifest) -> object | None: ...
+
+    def finalize(self, manifest: SubmissionManifest) -> None: ...
 
     def verify(self, manifest: SubmissionManifest) -> object | None: ...
 
@@ -281,9 +286,7 @@ def _deliver_pending_notification(
         try:
             notifier.notify(notification.event, progress)
             if notification.succeeded and notification.event.assignment_id is not None:
-                _offer_submission_approval(
-                    state, notifier, submission_service, notification, now
-                )
+                _offer_submission_approval(state, notifier, submission_service, notification, now)
         except RuntimeError:
             return
         state.mark_execution_notification_delivered(notification, now=now)
@@ -309,7 +312,7 @@ def _offer_submission_approval(
     event = getattr(notification, "event", None)
     if not isinstance(event, NotificationEvent) or not isinstance(notifier, SubmissionNotifier):
         return
-    if event.submission_drafts or event.requires_submission_statement:
+    if not event.submission_drafts and event.requires_submission_statement:
         notifier.notify_submission_blocked(
             event, "la actividad exige la declaración de entrega del alumno"
         )
@@ -351,6 +354,15 @@ def _process_submission(
         return None
     try:
         if claim.phase == "saving":
+            if claim.manifest.event.submission_drafts:
+                draft = service.verify_draft(claim.manifest)
+                if draft is None:
+                    state.fail_submission(claim, "submission_draft_unverified", now=now)
+                    return WorkerCycle("submission_draft_unverified")
+                finalizing = state.record_submission_finalizing(claim, now=now)
+                if finalizing is None:
+                    return WorkerCycle("submission_ownership_lost")
+                return _finalize_submission(state, service, finalizing, now)
             receipt = service.verify(claim.manifest)
             if receipt is None:
                 state.fail_submission(claim, "submission_ambiguous", now=now)
@@ -358,8 +370,11 @@ def _process_submission(
             reference = getattr(receipt, "reference", None)
             if not isinstance(reference, str) or not reference:
                 raise RuntimeError("submission receipt is invalid")
-            state.complete_submission(claim, reference, now=now)
+            if not state.complete_submission(claim, reference, now=now):
+                return WorkerCycle("submission_ownership_lost")
             return WorkerCycle("submission_confirmed")
+        if claim.phase == "finalizing":
+            return _finalize_submission(state, service, claim, now)
         draft_item_id = service.upload(claim.manifest)
         persisted = state.record_submission_draft(claim, draft_item_id, now=now)
         if persisted is None:
@@ -367,14 +382,33 @@ def _process_submission(
         try:
             service.save(persisted.manifest, draft_item_id)
         except RuntimeError:
+            if persisted.manifest.event.submission_drafts:
+                draft = service.verify_draft(persisted.manifest)
+                if draft is not None:
+                    finalizing = state.record_submission_finalizing(persisted, now=now)
+                    if finalizing is None:
+                        return WorkerCycle("submission_ownership_lost")
+                    return _finalize_submission(state, service, finalizing, now)
+                state.fail_submission(persisted, "submission_ambiguous", now=now)
+                return WorkerCycle("submission_ambiguous")
             receipt = service.verify(persisted.manifest)
             if receipt is not None:
                 reference = getattr(receipt, "reference", None)
                 if isinstance(reference, str) and reference:
-                    state.complete_submission(persisted, reference, now=now)
+                    if not state.complete_submission(persisted, reference, now=now):
+                        return WorkerCycle("submission_ownership_lost")
                     return WorkerCycle("submission_confirmed")
             state.fail_submission(persisted, "submission_ambiguous", now=now)
             return WorkerCycle("submission_ambiguous")
+        if persisted.manifest.event.submission_drafts:
+            draft = service.verify_draft(persisted.manifest)
+            if draft is None:
+                state.fail_submission(persisted, "submission_draft_unverified", now=now)
+                return WorkerCycle("submission_draft_unverified")
+            finalizing = state.record_submission_finalizing(persisted, now=now)
+            if finalizing is None:
+                return WorkerCycle("submission_ownership_lost")
+            return _finalize_submission(state, service, finalizing, now)
         receipt = service.verify(persisted.manifest)
         if receipt is None:
             state.fail_submission(persisted, "submission_unverified", now=now)
@@ -382,7 +416,8 @@ def _process_submission(
         reference = getattr(receipt, "reference", None)
         if not isinstance(reference, str) or not reference:
             raise RuntimeError("submission receipt is invalid")
-        state.complete_submission(persisted, reference, now=now)
+        if not state.complete_submission(persisted, reference, now=now):
+            return WorkerCycle("submission_ownership_lost")
         return WorkerCycle("submission_confirmed")
     except (ApprovalStateError, RuntimeError, ValueError):
         # Never retry an uncertain Moodle save automatically; durable state and
@@ -390,6 +425,56 @@ def _process_submission(
         if state.fail_submission(claim, "submission_failed", now=now):
             return WorkerCycle("submission_failed")
         return WorkerCycle("submission_ownership_lost")
+
+
+def _finalize_submission(
+    state: ApprovalState,
+    service: SubmissionService,
+    claim: SubmissionClaim,
+    now: int | None,
+) -> WorkerCycle:
+    # A previous worker may have completed Moodle's transition before crashing.
+    # Reconcile first so recovery never submits twice.
+    receipt = service.verify(claim.manifest)
+    if receipt is not None:
+        reference = getattr(receipt, "reference", None)
+        if not isinstance(reference, str) or not reference:
+            raise RuntimeError("submission receipt is invalid")
+        if not state.complete_submission(claim, reference, now=now):
+            return WorkerCycle("submission_ownership_lost")
+        return WorkerCycle("submission_confirmed")
+    draft = service.verify_draft(claim.manifest)
+    if draft is None:
+        state.fail_submission(claim, "submission_draft_unverified", now=now)
+        return WorkerCycle("submission_draft_unverified")
+    try:
+        service.finalize(claim.manifest)
+    except RuntimeError as error:
+        # The final Moodle response can be lost after its side effect.
+        # Reconcile only a digest-bound submitted receipt; an exact draft
+        # is still ambiguous and must not be finalized again automatically.
+        receipt = service.verify(claim.manifest)
+        if receipt is not None:
+            reference = getattr(receipt, "reference", None)
+            if not isinstance(reference, str) or not reference:
+                raise RuntimeError("submission receipt is invalid") from error
+            if not state.complete_submission(claim, reference, now=now):
+                return WorkerCycle("submission_ownership_lost")
+            return WorkerCycle("submission_confirmed")
+        if service.verify_draft(claim.manifest) is not None:
+            state.fail_submission(claim, "submission_ambiguous", now=now)
+            return WorkerCycle("submission_ambiguous")
+        raise
+    receipt = service.verify(claim.manifest)
+    if receipt is None:
+        state.fail_submission(claim, "submission_unverified", now=now)
+        return WorkerCycle("submission_unverified")
+    reference = getattr(receipt, "reference", None)
+    if not isinstance(reference, str) or not reference:
+        raise RuntimeError("submission receipt is invalid")
+    if not state.complete_submission(claim, reference, now=now):
+        return WorkerCycle("submission_ownership_lost")
+    return WorkerCycle("submission_confirmed")
 
 
 def _requires_image_import(event: NotificationEvent) -> bool:

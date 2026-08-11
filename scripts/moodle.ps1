@@ -1269,7 +1269,11 @@ function Invoke-RichFixtureTool {
         if ($actualCatalogHash -ne $expectedCatalogHash) {
             Fail 'Rich Moodle fixture catalog hash changed while copying it into the container.'
         }
-        return Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction, $catalogContainerPath)
+        $result = Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', $containerPath, $FixtureAction, $catalogContainerPath)
+        if ($FixtureAction -eq 'state' -and @($result | Select-Object -First 1).Trim() -notin @('absent', 'partial', 'complete-v1', 'complete-v2', 'complete-v3', 'complete-v3-submission-config-legacy', 'complete-v3-v4-config-orphan-repairable', 'complete-v4')) {
+            Fail 'Rich Moodle fixture state output is invalid.'
+        }
+        return $result
     } finally {
         try {
             Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', '-r', "foreach (['$containerPath', '$catalogContainerPath'] as `$path) { if (is_file(`$path)) { unlink(`$path); } }") | Out-Null
@@ -1481,7 +1485,7 @@ function Seed-Fixture {
         Fail 'Could not verify complete Moodle fixture state. Run Reset -Force.'
     }
     $richState = ((Invoke-RichFixtureTool -FixtureAction 'ensure') -join "`n").Trim()
-    if ($richState -notin @('complete-v1', 'complete-v2', 'complete-v3')) {
+    if ($richState -notin @('complete-v1', 'complete-v2', 'complete-v3', 'complete-v4')) {
         Fail 'Could not verify the rich local Moodle fixture. Run Reset -Force.'
     }
     Invoke-MoodleDocker -Arguments @('exec', '-T', 'webserver', 'php', "$($Layout.CoreCliRoot)/admin/cli/reset_password.php", '--username=student1', "--password=$($Secrets.studentPassword)") | Out-Null
@@ -1694,27 +1698,58 @@ function Invoke-Smoke {
     $campaignAssignments = @($campaignCourse.assignments)
     $managedCourseShortnames += 'ASIX-CAMPAIGN-01'
     $managedAssignments = Get-ManagedAssignments -Courses @($assignmentsPayload.courses) -CourseShortnames $managedCourseShortnames
-    $expectedCampaignTitles = @(
+    $richFixtureState = ((Invoke-RichFixtureTool -FixtureAction 'state') -join "`n").Trim()
+    $expectedV3CampaignTitles = @(
         'Campaign Report', ('Pr' + [char]0x00e1 + 'ctica Windows Server validation'),
         ('Pr' + [char]0x00e1 + 'ctica Windows Server command failure'), 'OVA import validation'
     )
+    $expectedV4PolicyTitles = @(
+        'AutoTask draft-only submission fixture', 'AutoTask draft statement fixture',
+        'AutoTask statement-only blocked fixture'
+    )
+    $expectedCampaignTitles = if ($richFixtureState -eq 'complete-v4') {
+        $expectedV3CampaignTitles + $expectedV4PolicyTitles
+    } elseif ($richFixtureState -eq 'complete-v3') {
+        $expectedV3CampaignTitles
+    } else {
+        Fail 'Campaign assignments exist but the rich fixture state is not complete-v3 or complete-v4.'
+    }
     $resolvedCampaignAssignments = @(
         Resolve-CampaignAssignmentsByTitle -CampaignCourse $campaignCourse -Assignments $campaignAssignments -ExpectedTitles $expectedCampaignTitles -BaseUrl $baseUrl -Token $tokenData.token
     )
     $actualCampaignTitles = @($resolvedCampaignAssignments | ForEach-Object { [string]$_.Title } | Sort-Object)
-    Assert-ManagedAssignmentCount -Assignments $managedAssignments -ExpectedCount 16 -FailureMessage 'Smoke test did not receive the exact 16 managed assignments after fixture v3 expansion.'
-    if ($campaignAssignments.Count -ne 4 -or
-        $resolvedCampaignAssignments.Count -ne 4 -or
+    $expectedManagedAssignmentCount = if ($richFixtureState -eq 'complete-v4') { 19 } else { 16 }
+    Assert-ManagedAssignmentCount -Assignments $managedAssignments -ExpectedCount $expectedManagedAssignmentCount -FailureMessage 'Smoke test did not receive the exact managed assignments after rich fixture expansion.'
+    if ($campaignAssignments.Count -ne $expectedCampaignTitles.Count -or
+        $resolvedCampaignAssignments.Count -ne $expectedCampaignTitles.Count -or
         (@($actualCampaignTitles | Where-Object { $_ -cnotin $expectedCampaignTitles }).Count -ne 0) -or
         (@($expectedCampaignTitles | Where-Object { $_ -cnotin $actualCampaignTitles }).Count -ne 0)) {
-        Fail 'Smoke test did not receive the exact 16 assignments after fixture v3 expansion.'
+        Fail 'Smoke test did not receive the exact campaign assignments after rich fixture expansion.'
     }
     $negative = @($resolvedCampaignAssignments | Where-Object { $_.Title -ceq 'OVA import validation' }) | Select-Object -First 1
     $negativeFiles = if ($null -eq $negative) { @() } else { @($negative.Assignment.introattachments | ForEach-Object { [string]$_.filename }) }
     if ($null -eq $negative -or $negativeFiles -notcontains 'negative.ova') {
         Fail 'Smoke test did not receive the v3 metadata-only OVA attachment.'
     }
-    Write-Output "Moodle REST smoke passed for 16 assignments across the base and expanded ASIX fixtures at $baseUrl."
+    if ($richFixtureState -eq 'complete-v4') {
+        $expectedStatement = '<p>Declaro que aquesta entrega ' + [char]0x00e9 + 's meva ' + [char]0x2014 + ' ' + [char]0x4f60 + [char]0x597d + '.</p><p>Versi' + [char]0x00f3 + ' <strong>HTML</strong> distintiva.</p>'
+        $policies = @{
+            'AutoTask draft-only submission fixture' = @(1, 0)
+            'AutoTask draft statement fixture' = @(1, 1)
+            'AutoTask statement-only blocked fixture' = @(0, 1)
+        }
+        foreach ($title in $policies.Keys) {
+            $policy = @($resolvedCampaignAssignments | Where-Object { $_.Title -ceq $title }) | Select-Object -First 1
+            if ($null -eq $policy -or [int]$policy.Assignment.submissiondrafts -ne $policies[$title][0] -or
+                [int]$policy.Assignment.requiresubmissionstatement -ne $policies[$title][1]) {
+                Fail 'Smoke test did not receive the exact v4 submission policy assignments.'
+            }
+            if ($policies[$title][1] -eq 1 -and [string]$policy.Assignment.submissionstatement -cne $expectedStatement) {
+                Fail 'Smoke test did not receive the exact v4 global submission statement.'
+            }
+        }
+    }
+    Write-Output "Moodle REST smoke passed for $expectedManagedAssignmentCount assignments across the base and expanded ASIX fixtures at $baseUrl."
 }
 
 function Assert-ResetTarget {
@@ -1853,7 +1888,7 @@ switch ($Action) {
         Assert-DockerDaemon
         $result = ((Invoke-RichFixtureTool -FixtureAction 'expand') -join "`n").Trim()
         if ($result -ne 'rich-fixture-expanded') {
-            Fail 'Rich fixture did not expand to revision 3.'
+            Fail 'Rich fixture did not expand to revision 4.'
         }
         Invoke-Smoke
     }

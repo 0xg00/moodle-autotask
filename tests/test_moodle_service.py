@@ -259,6 +259,7 @@ def test_scan_acknowledgement_lifecycle_reports_updated(tmp_path: Path) -> None:
                                 "timemodified": self.modified,
                                 "submissiondrafts": 0,
                                 "requiresubmissionstatement": 0,
+                                "configs": [],
                             }
                         ],
                     }

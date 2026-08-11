@@ -51,17 +51,16 @@ class SchedulerOptions:
             or not self.retry_base_seconds <= self.retry_max_seconds <= 86400
         ):
             raise ValueError("retry maximum seconds are invalid")
-        if not isinstance(self.course_shortnames, tuple) or len(
-            self.course_shortnames
-        ) > MAX_SCHEDULER_COURSES:
+        if (
+            not isinstance(self.course_shortnames, tuple)
+            or len(self.course_shortnames) > MAX_SCHEDULER_COURSES
+        ):
             raise ValueError("course shortnames are invalid")
         if any(
-                not isinstance(item, str)
-                or not item
-                or any(
-                    ord(character) <= 0x1F or ord(character) == 0x7F for character in item
-                )
-                for item in self.course_shortnames
+            not isinstance(item, str)
+            or not item
+            or any(ord(character) <= 0x1F or ord(character) == 0x7F for character in item)
+            for item in self.course_shortnames
         ):
             raise ValueError("course shortnames are invalid")
         try:
@@ -153,6 +152,14 @@ def draft_from_assignment(assignment: MoodleAssignmentSnapshot) -> NotificationD
         assignment_id=assignment.assignment_id,
         submission_drafts=assignment.submission_drafts,
         requires_submission_statement=assignment.requires_submission_statement,
+        submission_statement=assignment.submission_statement,
+        submission_statement_format=assignment.submission_statement_format,
+        team_submission=assignment.team_submission,
+        no_submissions=assignment.no_submissions,
+        file_submission_enabled=assignment.file_submission_enabled,
+        file_submission_max_files=assignment.file_submission_max_files,
+        file_submission_max_bytes=assignment.file_submission_max_bytes,
+        file_submission_filetypes=assignment.file_submission_filetypes,
     )
 
 

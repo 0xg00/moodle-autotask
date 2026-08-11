@@ -577,12 +577,17 @@ def test_fixture_v3_catalog_is_declarative_and_has_exact_campaign_matrix() -> No
     ]
 
 
-def test_fixture_v3_migration_paths_are_one_way_idempotent_and_fail_closed() -> None:
+def test_fixture_v4_migration_paths_are_one_way_idempotent_and_fail_closed() -> None:
     fixture = read(FIXTURE)
     expand = fixture.split("function expand_fixture(): void", maxsplit=1)[1].split(
         "$action = $argv[1]", maxsplit=1
     )[0]
-    assert "if ($state === 'complete-v3') {\n        return;" in expand
+    assert "if ($state === 'complete-v4') {\n        return;" in expand
+    assert (
+        "if ($state === 'complete-v3' || "
+        "$state === 'complete-v3-v4-config-orphan-repairable')" in expand
+    )
+    assert "complete-v3-v4-config-orphan-repairable" in expand
     assert "if ($state === 'partial')" in expand
     assert "throw new RuntimeException('rich fixture is partial')" in expand
     assert "if ($state === 'absent')" in expand
@@ -593,7 +598,17 @@ def test_fixture_v3_migration_paths_are_one_way_idempotent_and_fail_closed() -> 
     assert "v3 fixture identity collision" in expand
     assert "v3 fixture course collision" in expand
     assert "set_config(AUTOTASK_FIXTURE_CONFIG, '3')" in expand
-    assert "fixture_state() !== 'complete-v3'" in expand
+    assert "upgrade_fixture_v4($loaded['data'], $loaded['digest'])" in expand
+    assert "set_config(AUTOTASK_FIXTURE_CONFIG, '4')" in fixture
+    assert "verify_fixture_v4($catalog, $digest, $reason, false)" in fixture
+    assert "function fixture_v4_config_orphan_repairable(): bool" in fixture
+    upgrade = fixture.split("function upgrade_fixture_v4", maxsplit=1)[1].split(
+        "function expand_fixture", maxsplit=1
+    )[0]
+    assert upgrade.index("$transaction->allow_commit();") < upgrade.index(
+        "set_config('submissionstatement', AUTOTASK_FIXTURE_V4_STATEMENT, 'assign')"
+    )
+    assert "fixture_state() !== 'complete-v4'" in upgrade
 
 
 def test_fixture_v3_rejects_tamper_and_partial_metadata_before_completion() -> None:
@@ -635,6 +650,71 @@ def test_fixture_v3_catalog_harness_validates_canonical_digest_and_timestamp_con
     zero, positive, digest = result.stdout.strip().split(":")
     assert (zero, positive) == ("0", "102")
     assert re.fullmatch(r"[0-9a-f]{64}", digest)
+
+
+@pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
+def test_fixture_v4_policy_contract_is_isolated_and_complete() -> None:
+    php = shutil.which("php")
+    assert php is not None
+    harness = (
+        "define('AUTOTASK_FIXTURE_LIBRARY', true); require $argv[1]; "
+        "$items = fixture_v4_assignments(); "
+        "if (count($items) !== 3 || array_column($items, 'idnumber') !== "
+        "['autotask-draft-only', 'autotask-draft-statement', "
+        "'autotask-statement-only-blocked']) { exit(1); } "
+        "if ($items[0]['submissiondrafts'] !== 1 || $items[0]['requiresubmissionstatement'] !== 0 "
+        "|| $items[1]['submissiondrafts'] !== 1 || $items[1]['requiresubmissionstatement'] !== 1 "
+        "|| $items[2]['submissiondrafts'] !== 0 "
+        "|| $items[2]['requiresubmissionstatement'] !== 1) { exit(2); } "
+        "if (hash('sha256', AUTOTASK_FIXTURE_V4_STATEMENT) !== "
+        "'dacfbef94a08440e925414cdc3fa74306e40b2b872c42f89bd7b598ded461088') { exit(3); } "
+        "echo 'fixture-v4-policy-ok';"
+    )
+    result = subprocess.run(
+        [php, "-r", harness, str(FIXTURE)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fixture-v4-policy-ok"
+
+
+@pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
+def test_fixture_v4_orphan_config_harness_is_exact_and_repairable() -> None:
+    php = shutil.which("php")
+    assert php is not None
+    harness = (
+        "$configs = []; "
+        "function get_config($plugin, $name) { global $configs; "
+        "return $configs[$plugin . ':' . $name] ?? false; } "
+        "class FixtureV4Db { public bool $assignment = false; "
+        "public function record_exists_select($table, $where, $params) { "
+        "if ($table !== 'course_modules' || count($params) !== 3) { exit(9); } "
+        "return $this->assignment; } } "
+        "define('AUTOTASK_FIXTURE_LIBRARY', true); require $argv[1]; "
+        "$DB = new FixtureV4Db(); "
+        "$configs['core:' . AUTOTASK_FIXTURE_V4_STATEMENT_CONFIG] = "
+        "hash('sha256', AUTOTASK_FIXTURE_V4_STATEMENT); "
+        "$configs['assign:submissionstatement'] = AUTOTASK_FIXTURE_V4_STATEMENT; "
+        "if (!fixture_v4_config_orphan_repairable()) { exit(1); } "
+        "$DB->assignment = true; if (fixture_v4_config_orphan_repairable()) { exit(2); } "
+        "$DB->assignment = false; unset($configs['core:' . AUTOTASK_FIXTURE_V4_STATEMENT_CONFIG]); "
+        "if (!fixture_v4_footprint_exists() || fixture_v4_config_orphan_repairable()) { exit(3); } "
+        "$configs['assign:submissionstatement'] = 'tampered'; "
+        "if (fixture_v4_footprint_exists() || fixture_v4_config_orphan_repairable()) { exit(4); } "
+        "echo 'fixture-v4-orphan-ok';"
+    )
+    result = subprocess.run(
+        [php, "-r", harness, str(FIXTURE)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fixture-v4-orphan-ok"
 
 
 @pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
@@ -745,7 +825,7 @@ def test_fixture_v3_transaction_and_v2_partial_contracts_are_explicit() -> None:
     expand = fixture.split("function expand_fixture(): void", maxsplit=1)[1].split(
         "if (!defined('AUTOTASK_FIXTURE_LIBRARY')", maxsplit=1
     )[0]
-    assert "if (fixture_v3_footprint_exists())" in state
+    assert "if (fixture_v3_footprint_exists() || fixture_v4_footprint_exists())" in state
     assert "return 'partial'" in state
     assert "$transaction = $DB->start_delegated_transaction()" in expand
     assert "$transaction->allow_commit()" in expand
@@ -770,12 +850,12 @@ def test_fixture_v3_transaction_and_v2_partial_contracts_are_explicit() -> None:
     assert "$state === 'complete-v2' || $state === 'complete-v3'" in ensure
 
 
-def test_bootstrap_seed_accepts_an_exact_complete_v3_fixture() -> None:
+def test_bootstrap_seed_accepts_an_exact_complete_v4_fixture() -> None:
     script = read(SCRIPT)
     seed = script.split("function Seed-Fixture", maxsplit=1)[1].split(
         "function Ensure-FixtureAttachment", maxsplit=1
     )[0]
-    assert "@('complete-v1', 'complete-v2', 'complete-v3')" in seed
+    assert "@('complete-v1', 'complete-v2', 'complete-v3', 'complete-v4')" in seed
 
 
 def test_rich_fixture_verifies_category_course_and_deadline_contracts() -> None:
@@ -828,6 +908,7 @@ def test_fixture_tool_is_copied_hash_verified_executed_and_removed() -> None:
         "'php', $containerPath, $FixtureAction, $catalogContainerPath"
     )
     assert "unlink(`$path)" in tool
+    assert "'complete-v3-v4-config-orphan-repairable'" in tool
     assert "/tmp/moodle-autotask-catalog-v3.json" in script
     assert "Invoke-RichFixtureTool -FixtureAction 'ensure'" in script
 
@@ -849,9 +930,12 @@ def test_smoke_requires_exact_rich_course_assignment_and_ova_metadata_matrix() -
         in smoke
     )
     assert (
-        "Assert-ManagedAssignmentCount -Assignments $managedAssignments -ExpectedCount 16"
+        "$expectedManagedAssignmentCount = if ($richFixtureState -eq 'complete-v4') "
+        "{ 19 } else { 16 }"
         in smoke
     )
+    assert "'AutoTask draft statement fixture'" in smoke
+    assert "exact v4 global submission statement" in smoke
     assert "ASIX-CAMPAIGN-01" in smoke
     assert "OVA import validation" in smoke
     assert "idnumber" not in smoke
@@ -981,12 +1065,13 @@ def test_campaign_smoke_production_expected_titles_match_catalog_accent(
     tmp_path: Path,
 ) -> None:
     script = read(SCRIPT)
-    start = script.index("    $expectedCampaignTitles = @(")
+    start = script.index("    $expectedV3CampaignTitles = @(")
     end = script.index("    $resolvedCampaignAssignments", start)
     production_definition = script[start:end]
     driver = tmp_path / "campaign-production-titles.ps1"
     driver.write_text(
         "Set-StrictMode -Version Latest\n"
+        + "$richFixtureState = 'complete-v3'\n"
         + production_definition
         + "$expected = @(\n"
         + "  'Campaign Report',\n"
@@ -994,9 +1079,9 @@ def test_campaign_smoke_production_expected_titles_match_catalog_accent(
         + "  ('Pr' + [char]0x00e1 + 'ctica Windows Server command failure'),\n"
         + "  'OVA import validation'\n"
         + ")\n"
-        + "if ($expectedCampaignTitles.Count -ne $expected.Count -or\n"
-        + "    (@($expectedCampaignTitles | Where-Object { $_ -cnotin $expected }).Count -ne 0) -or\n"  # noqa: E501
-        + "    (@($expected | Where-Object { $_ -cnotin $expectedCampaignTitles }).Count -ne 0)) {\n"  # noqa: E501
+        + "if ($expectedV3CampaignTitles.Count -ne $expected.Count -or\n"
+        + "    (@($expectedV3CampaignTitles | Where-Object { $_ -cnotin $expected }).Count -ne 0) -or\n"  # noqa: E501
+        + "    (@($expected | Where-Object { $_ -cnotin $expectedV3CampaignTitles }).Count -ne 0)) {\n"  # noqa: E501
         + "  throw 'production campaign titles do not match catalog'\n"
         + "}\n"
         + "Write-Output 'campaign-production-titles-ok'\n",
@@ -1013,6 +1098,52 @@ def test_campaign_smoke_production_expected_titles_match_catalog_accent(
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("campaign-production-titles-ok")
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell") is None and shutil.which("pwsh") is None,
+    reason="PowerShell is required",
+)
+def test_campaign_smoke_complete_v4_adds_only_the_three_policy_assignments(
+    tmp_path: Path,
+) -> None:
+    script = read(SCRIPT)
+    start = script.index("    $expectedV3CampaignTitles = @(")
+    end = script.index("    $resolvedCampaignAssignments", start)
+    production_definition = script[start:end]
+    driver = tmp_path / "campaign-v4-production-titles.ps1"
+    driver.write_text(
+        "Set-StrictMode -Version Latest\n"
+        + "$richFixtureState = 'complete-v4'\n"
+        + production_definition
+        + "$expected = @(\n"
+        + "  'Campaign Report',\n"
+        + "  ('Pr' + [char]0x00e1 + 'ctica Windows Server validation'),\n"
+        + "  ('Pr' + [char]0x00e1 + 'ctica Windows Server command failure'),\n"
+        + "  'OVA import validation',\n"
+        + "  'AutoTask draft-only submission fixture',\n"
+        + "  'AutoTask draft statement fixture',\n"
+        + "  'AutoTask statement-only blocked fixture'\n"
+        + ")\n"
+        + "if ($expectedCampaignTitles.Count -ne $expected.Count -or\n"
+        + "    (@($expectedCampaignTitles | Where-Object { $_ -cnotin $expected }).Count -ne 0) -or\n"  # noqa: E501
+        + "    (@($expected | Where-Object { $_ -cnotin $expectedCampaignTitles }).Count -ne 0)) {\n"  # noqa: E501
+        + "  throw 'complete-v4 campaign titles are not exact'\n"
+        + "}\n"
+        + "Write-Output 'campaign-v4-production-titles-ok'\n",
+        encoding="utf-8",
+    )
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    assert powershell is not None
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("campaign-v4-production-titles-ok")
 
 
 def test_moodle_script_is_ascii_and_windows_powershell_composes_ova_assignment(

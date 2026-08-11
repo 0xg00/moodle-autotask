@@ -338,3 +338,7 @@ VDI, and multiple appliance attachments remain fail-closed because their disk or
 licensing cannot be inferred safely from filenames. The bundled local `asix-router-lab.ova` is only
 a 76-byte routing fixture and is intentionally not a bootable image, so it must never be used for a
 live AWS import test.
+# Moodle draft finalization
+
+The worker journal has a durable `finalizing` state between exact draft verification and the
+official Moodle finalization call. Restart recovery never repeats a save blindly.

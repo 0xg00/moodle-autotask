@@ -51,11 +51,30 @@ class TelegramExecutionNotifier:
     def notify_submission_ready(
         self, manifest: SubmissionManifest, buttons: SubmissionButtons
     ) -> None:
+        statement = manifest.submission_statement_plain
+        if statement is not None:
+            content = statement.encode("utf-8")
+            if not content:
+                raise RuntimeError("Moodle submission statement is empty")
+            if len(content) <= 2 * 1024 * 1024:
+                self.client.send_document(
+                    self.config.chat_id,
+                    "moodle-submission-statement.txt",
+                    content,
+                    "Declaración de entrega completa",
+                )
+            else:
+                raise RuntimeError("Moodle submission statement is too large")
         self.client.send_message(
             self.config.chat_id,
             f"Revisar entrega: {manifest.event.assignment_title}\n"
             f"Archivo: {manifest.filename}\n"
-            f"SHA-256: {manifest.report_digest}",
+            f"SHA-256: {manifest.report_digest}"
+            + (
+                f"\nDeclaración SHA-256: {manifest.submission_statement_digest}"
+                if statement is not None
+                else ""
+            ),
             buttons,
         )
 

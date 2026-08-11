@@ -70,6 +70,17 @@ def test_submission_approval_is_bound_to_manifest_and_persists_draft_before_save
     assert restarted.complete_submission(recovered, "moodle-submission:9", now=68)
     pending = restarted.pending_submission_notification()
     assert pending is not None and pending.status == "submitted"
+    with restarted._connect() as connection:
+        receipt = json.loads(
+            connection.execute("SELECT receipt_payload FROM submissions").fetchone()[0]
+        )
+    assert receipt == {
+        "approvedAt": 4,
+        "approvedBy": 42,
+        "manifestDigest": manifest.manifest_digest,
+        "reference": "moodle-submission:9",
+        "submittedAt": 68,
+    }
 
 
 def test_submission_manifest_binds_submission_policies(tmp_path: Path) -> None:
@@ -85,16 +96,92 @@ def test_submission_manifest_binds_submission_policies(tmp_path: Path) -> None:
     assert statement.as_dict()["requireSubmissionStatement"] is True
 
 
-@pytest.mark.parametrize("policy", ("submission_drafts", "requires_submission_statement"))
-def test_submission_policy_cannot_create_a_second_approval(tmp_path: Path, policy: str) -> None:
+def test_statement_manifest_binds_formatted_unicode_bytes_and_plain_presentation(
+    tmp_path: Path,
+) -> None:
+    event = replace(
+        _event(tmp_path, lab=False),
+        submission_drafts=True,
+        requires_submission_statement=True,
+        submission_statement="<p>Jo sóc �� — 你好 <strong>autora</strong>.</p>",
+        submission_statement_format=1,
+    )
+    manifest = _submission_manifest(event, "report")
+    assert manifest.submission_statement_plain == "Jo sóc �� — 你好 autora."
+    assert manifest.submission_statement_digest is not None
+    changed = _submission_manifest(replace(event, submission_statement="<p>canvi</p>"), "report")
+    assert changed.manifest_digest != manifest.manifest_digest
+
+
+def test_draft_submission_records_finalizing_before_moodle_submit(tmp_path: Path) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = replace(_event(tmp_path, "c", lab=False), submission_drafts=True)
+    state.prepare(event, now=1)
+    _manifest, buttons = state.prepare_submission(event, "ok", "report", now=2)
+    state.resolve_submission(buttons.submit, 42, 42, now=3)
+    claim = state.claim_submission("worker", 60, now=4)
+    assert claim is not None
+    saving = state.record_submission_draft(claim, 19, now=5)
+    assert saving is not None
+    finalizing = state.record_submission_finalizing(saving, now=6)
+    assert finalizing is not None and finalizing.phase == "finalizing"
+
+
+def test_submission_receipt_binds_exact_approver_time_and_statement_manifest(
+    tmp_path: Path,
+) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = replace(
+        _event(tmp_path, "d", lab=False),
+        submission_drafts=True,
+        requires_submission_statement=True,
+        submission_statement="<p>Declaro que esta entrega es mía.</p>",
+        submission_statement_format=1,
+    )
+    state.prepare(event, now=1)
+    manifest, buttons = state.prepare_submission(event, "ok", "report", now=2)
+    state.resolve_submission(buttons.submit, 77, 77, now=3)
+    claim = state.claim_submission("worker", 60, now=4)
+    assert claim is not None and state.complete_submission(claim, "moodle-submission:7", now=5)
+
+    with state._connect() as connection:
+        receipt = json.loads(
+            connection.execute("SELECT receipt_payload FROM submissions").fetchone()[0]
+        )
+    assert receipt == {
+        "approvedAt": 3,
+        "approvedBy": 77,
+        "manifestDigest": manifest.manifest_digest,
+        "reference": "moodle-submission:7",
+        "submittedAt": 5,
+    }
+    assert manifest.as_dict()["submissionStatementDigest"] is not None
+
+
+@pytest.mark.parametrize("phase", ("saving", "finalizing"))
+def test_expired_submission_leases_reclaim_only_durable_phase(tmp_path: Path, phase: str) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = replace(_event(tmp_path, "e", lab=False), submission_drafts=True)
+    state.prepare(event, now=1)
+    _manifest, buttons = state.prepare_submission(event, "ok", "report", now=2)
+    state.resolve_submission(buttons.submit, 42, 42, now=3)
+    claim = state.claim_submission("first", 6, now=4)
+    assert claim is not None
+    saving = state.record_submission_draft(claim, 19, now=4)
+    assert saving is not None
+    if phase == "finalizing":
+        assert state.record_submission_finalizing(saving, now=4) is not None
+
+    recovered = state.claim_submission("second", 60, now=10)
+
+    assert recovered is not None and recovered.phase == phase and recovered.draft_item_id == 19
+
+
+def test_statement_without_drafts_cannot_create_a_second_approval(tmp_path: Path) -> None:
     state = ApprovalState(tmp_path / "approval.sqlite3")
     event = _event(tmp_path, lab=False)
     state.prepare(event, now=1)
-    blocked = (
-        replace(event, submission_drafts=True)
-        if policy == "submission_drafts"
-        else replace(event, requires_submission_statement=True)
-    )
+    blocked = replace(event, requires_submission_statement=True)
     with pytest.raises(ApprovalStateError, match="policy is not supported"):
         state.prepare_submission(blocked, "ok", "# report", now=2)
 

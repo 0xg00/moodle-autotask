@@ -100,9 +100,10 @@ requires inspection or `Reset -Force`. To simulate a teacher updating the OVA ta
 `AdvanceFixture` once. It keeps the stable task identity, changes its revision fields, and adds
 `revision-2.txt`; a second advance is rejected.
 
-`ExpandFixture` applies the declarative `infra/moodle/catalog-v3.json` catalog. It accepts only an
-exact v1, v2, or absent fixture: absent is seeded and advanced first, v1 is advanced to v2, and v2
-is expanded to v3. An exact v3 is a no-op. The PHP tool validates the complete JSON schema,
+`ExpandFixture` applies the declarative `infra/moodle/catalog-v3.json` catalog, then performs the
+one-way v3-to-v4 policy migration. It accepts only an exact v1, v2, v3, or absent fixture: absent
+is seeded and advanced first, v1 is advanced to v2, v2 is expanded to v3, and v3 is expanded to
+v4. An exact v4 is a no-op. The PHP tool validates the complete JSON schema,
 identities, cardinalities, types, duplicate keys, and a canonical SHA-256 digest before it creates
 anything. A small JSON lexer rejects duplicate keys at every object depth after decoding escapes,
 so `"x"` and `"\\u0078"` cannot silently overwrite one another. Canonical JSON recursively sorts
@@ -111,6 +112,12 @@ only after complete verification. Existing campaign users, course,
 assignments, partial migrations, or a changed catalog digest fail closed and are never overwritten.
 The wrapper copies both the PHP tool and catalog to fixed temporary container paths, verifies each
 SHA-256 value there, and removes both paths in `finally` cleanup.
+
+`complete-v3-v4-config-orphan-repairable` is the sole bounded recovery state. It is recognized
+only when the v3 fixture is otherwise exact, all three v4 assignments are absent, and the exact v4
+statement plus its fixture marker are the only v4 footprint. `ExpandFixture` may then create and
+verify the three assignments before writing version `4`; every other incomplete or tampered v4
+footprint remains `partial` and fails closed.
 
 V3 creates `ASIX-CAMPAIGN-01`, four fictitious `@example.test` teachers with `editingteacher`, and
 11 new fictitious `@example.test` students with `student`; together with the existing `student1`,
@@ -214,8 +221,8 @@ must be running; the script neither changes Docker Desktop settings nor starts i
 The Moodle CLI seeds use supported core/course/manual-enrolment APIs to create `student1`, the
 base `ASIX-LAB` course, the public-structure-inspired ASIX category tree, 11 module courses, and 12
 managed assignments in total. Before expansion, Smoke requires those exact 12 managed assignments.
-After `ExpandFixture`, Smoke requires the exact 16 managed assignments, four campaign assignments, and both
-simulated OVA metadata attachments. It resolves campaign assignment `cmid` values against the one
+After `ExpandFixture`, Smoke requires the exact 19 managed assignments, seven campaign assignments, the three
+v4 submission-policy assignments, the global submission statement, and both simulated OVA metadata attachments. It resolves campaign assignment `cmid` values against the one
 official `core_course_get_contents` response for the campaign course and fails closed on a missing,
 duplicate, or case-mismatched assignment title. Moodle's student REST response intentionally does
 not expose course-module `idnumber`; the fixture PHP verifier checks those exact IDs in Moodle's
@@ -293,10 +300,13 @@ draft ID before the final save, and confirms it through `mod_assign_get_submissi
 reporting success. Legacy notifications without an assignment ID remain executable but cannot be
 submitted until safely re-enumerated as a new exact revision.
 
-The development fixture sets `submissiondrafts=0` and `requiresubmissionstatement=0`. If Moodle reports either policy as `1`, the
-worker does not show `Entregar`: Moodle 5.2.1's official `mod_assign_submit_for_grading` requires
-the student's `acceptsubmissionstatement`, which this service must not assert on the student's
-behalf. The execution report remains available and Telegram states that delivery was not offered.
+The v4 campaign fixture adds one draft-only assignment, one draft assignment requiring the site-wide
+submission statement, and one statement-only assignment. The worker may save only an empty assignment
+as a draft; it rejects any pre-existing draft or submitted content. Moodle 5.2.1's official
+`mod_assign_submit_for_grading` requires the student's `acceptsubmissionstatement`, which is sent only
+after the explicit `Acepto y entregar` confirmation. A statement-only assignment remains intentionally
+blocked because saving it would submit before that consent step. The execution report remains available
+when delivery is not offered.
 This policy is part of the assignment revision and submission manifest. Site info must explicitly
 advertise `uploadfiles=true` or Moodle's numeric `uploadfiles=1` before an approval or upload is
 offered; absent, null, false, and strings fail closed.
@@ -307,3 +317,8 @@ local commit can repeat a message with the same buttons. Download selection uses
 unsafe filenames, and size mismatches; the mobile token is appended only after URL validation.
 The default attachment cap is 16 GiB (hard maximum 64 GiB), so plan local disk capacity before
 selecting OVA images; callers may lower the limit but it is always enforced while streaming.
+## Draft-submission safety
+
+Local draft fixtures may use `submissiondrafts=1`. A required statement is shown in full as a
+Telegram document and requires `Acepto y entregar`; a statement without drafts is intentionally
+blocked because Moodle would submit during save before consent finalization.

@@ -1,5 +1,4 @@
 """Explicit, verified Moodle assignment-file submission boundary."""
-# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -76,11 +75,13 @@ class MoodleSubmissionClient:
         self.client = client or MoodleClient(config)
         self.service = service or MoodleService(config, self.client)
         self._verified = False
+        self._finalization_verified = False
 
     def upload(self, manifest: SubmissionManifest) -> int:
         self._verify_service()
         self._reject_unsupported_policy(manifest)
         self._assert_current_manifest(manifest)
+        self._assert_file_policy(manifest)
         try:
             return self.client.upload_draft_file(
                 manifest.filename, manifest.report_markdown.encode("utf-8")
@@ -114,14 +115,48 @@ class MoodleSubmissionClient:
         if result != []:
             raise MoodleSubmissionError("Moodle save submission response is invalid")
 
+    def finalize(self, manifest: SubmissionManifest) -> None:
+        """Submit a verified Moodle draft using the documented consent parameter."""
+        self._verify_service(finalization=True)
+        self._assert_current_manifest(manifest)
+        if not manifest.event.submission_drafts:
+            return
+        try:
+            result = self.client.call(
+                "mod_assign_submit_for_grading",
+                {
+                    "assignmentid": manifest.event.assignment_id or 0,
+                    "acceptsubmissionstatement": 1
+                    if manifest.event.requires_submission_statement
+                    else 0,
+                },
+            )
+        except MoodleClientError as error:
+            raise MoodleSubmissionError("could not finalize Moodle submission") from error
+        if result == []:
+            return
+        # Moodle may have completed the transition while returning a warning.
+        # Reconcile only by the exact, file-digest-bound submitted status.
+        if self.verify(manifest) is None:
+            raise MoodleSubmissionError("Moodle finalization response is invalid")
+
     def can_offer_submission(self, event: NotificationEvent) -> None:
         if not isinstance(event, NotificationEvent):
             raise MoodleSubmissionError("Moodle submission event is invalid")
         self._reject_unsupported_policy(event)
-        self._verify_service()
+        self._verify_service(finalization=event.submission_drafts)
         self._assert_current_event(event)
+        self._preflight(event)
 
     def verify(self, manifest: SubmissionManifest) -> MoodleSubmissionReceipt | None:
+        return self._verify_status(manifest, "submitted")
+
+    def verify_draft(self, manifest: SubmissionManifest) -> MoodleSubmissionReceipt | None:
+        return self._verify_status(manifest, "draft")
+
+    def _verify_status(
+        self, manifest: SubmissionManifest, expected_status: str
+    ) -> MoodleSubmissionReceipt | None:
         self._verify_service()
         try:
             raw = self.client.call(
@@ -129,7 +164,7 @@ class MoodleSubmissionClient:
             )
         except MoodleClientError as error:
             raise MoodleSubmissionError("could not verify Moodle submission") from error
-        result = _submission_receipt(raw, manifest)
+        result = _submission_receipt(raw, manifest, expected_status)
         if result is None:
             return None
         receipt, file_url = result
@@ -143,12 +178,15 @@ class MoodleSubmissionClient:
             raise MoodleSubmissionError("Moodle submission file digest differs")
         return receipt
 
-    def _verify_service(self) -> None:
-        if self._verified:
+    def _verify_service(self, *, finalization: bool = False) -> None:
+        if self._verified and (not finalization or self._finalization_verified):
             return
         try:
             self.service.verified_site_url(
-                frozenset({"mod_assign_save_submission", "mod_assign_get_submission_status"}),
+                frozenset(
+                    {"mod_assign_save_submission", "mod_assign_get_submission_status"}
+                    | ({"mod_assign_submit_for_grading"} if finalization else set())
+                ),
                 require_uploadfiles=True,
             )
         except (MoodleRequiredFunctionCapabilityError, MoodleUploadCapabilityError) as error:
@@ -158,9 +196,30 @@ class MoodleSubmissionClient:
         except MoodleServiceError as error:
             raise MoodleSubmissionError("could not verify Moodle submission service") from error
         self._verified = True
+        self._finalization_verified = self._finalization_verified or finalization
 
     def _assert_current_manifest(self, manifest: SubmissionManifest) -> None:
         self._assert_current_event(manifest.event)
+
+    def _assert_file_policy(self, manifest: SubmissionManifest) -> None:
+        matches = [
+            item
+            for item in self.service.assignments()
+            if getattr(item, "assignment_id", None) == manifest.event.assignment_id
+        ]
+        if len(matches) != 1:
+            raise PermanentSubmissionOfferError("approved Moodle assignment no longer exists")
+        assignment = matches[0]
+        size = len(manifest.report_markdown.encode("utf-8"))
+        if size > getattr(assignment, "file_submission_max_bytes", 2 * 1024 * 1024):
+            raise PermanentSubmissionOfferError("Moodle assignment file size limit is too small")
+        filetypes = getattr(assignment, "file_submission_filetypes", ".md")
+        if (
+            isinstance(filetypes, str)
+            and filetypes.strip()
+            and ".md" not in {item.strip().lower() for item in filetypes.replace(",", " ").split()}
+        ):
+            raise PermanentSubmissionOfferError("Moodle assignment does not accept Markdown files")
 
     def _assert_current_event(self, event: object) -> None:
         try:
@@ -181,26 +240,91 @@ class MoodleSubmissionClient:
         ):
             raise PermanentSubmissionOfferError("approved Moodle assignment revision changed")
 
+    def _preflight(self, event: NotificationEvent) -> None:
+        matches = [
+            item
+            for item in self.service.assignments()
+            if getattr(item, "assignment_id", None) == event.assignment_id
+        ]
+        if len(matches) != 1:
+            raise PermanentSubmissionOfferError("approved Moodle assignment no longer exists")
+        assignment = matches[0]
+        if any(
+            bool(getattr(assignment, name, False)) for name in ("team_submission", "no_submissions")
+        ):
+            raise PermanentSubmissionOfferError(
+                "Moodle assignment submission mode is not supported"
+            )
+        if not bool(getattr(assignment, "file_submission_enabled", True)):
+            raise PermanentSubmissionOfferError("Moodle file submission plugin is disabled")
+        if getattr(assignment, "file_submission_max_files", 1) != 1:
+            raise PermanentSubmissionOfferError("Moodle assignment does not permit one exact file")
+        if getattr(assignment, "file_submission_max_bytes", 2 * 1024 * 1024) < 1:
+            raise PermanentSubmissionOfferError("Moodle assignment file size is invalid")
+        if event.requires_submission_statement and not event.submission_statement:
+            raise PermanentSubmissionOfferError("Moodle submission statement is missing")
+        try:
+            raw = self.client.call(
+                "mod_assign_get_submission_status", {"assignid": event.assignment_id or 0}
+            )
+        except MoodleClientError as error:
+            raise MoodleSubmissionError("could not preflight Moodle submission") from error
+        if not isinstance(raw, Mapping):
+            raise MoodleSubmissionError("Moodle submission preflight is invalid")
+        last_attempt = raw.get("lastattempt")
+        if not isinstance(last_attempt, Mapping):
+            raise MoodleSubmissionError("Moodle submission preflight is invalid")
+        summary = raw.get("gradingsummary")
+        if summary is not None and not isinstance(summary, Mapping):
+            raise MoodleSubmissionError("Moodle submission preflight is invalid")
+        for name, required in (
+            ("submissionsenabled", True),
+            ("locked", False),
+            ("canedit", True),
+            ("caneditowner", True),
+        ):
+            value = last_attempt.get(name)
+            if not isinstance(value, bool):
+                raise MoodleSubmissionError("Moodle submission preflight is invalid")
+            if value is not required:
+                raise PermanentSubmissionOfferError("Moodle submission is not currently editable")
+        # ``cansubmit`` is deliberately not a prerequisite: Moodle reports it
+        # false for normal direct-save assignments that do not use a separate
+        # submit-for-grading transition.  Any material submission object,
+        # however, is an existing attempt and must never be overwritten.
+        for name in ("submission", "teamsubmission"):
+            existing = last_attempt.get(name)
+            if existing is not None and not isinstance(existing, Mapping):
+                raise MoodleSubmissionError("Moodle submission preflight is invalid")
+            if isinstance(existing, Mapping):
+                raise PermanentSubmissionOfferError("Moodle assignment already has a submission")
+
     @staticmethod
     def _reject_unsupported_policy(manifest: SubmissionManifest | NotificationEvent) -> None:
         event = manifest.event if isinstance(manifest, SubmissionManifest) else manifest
-        if event.submission_drafts or event.requires_submission_statement:
+        if not event.submission_drafts and event.requires_submission_statement:
             raise UnsupportedSubmissionPolicyError(
                 "Moodle assignment requires a student submission statement"
             )
 
 
 def _submission_receipt(
-    raw: object, manifest: SubmissionManifest
+    raw: object, manifest: SubmissionManifest, expected_status: str = "submitted"
 ) -> tuple[MoodleSubmissionReceipt, str] | None:
-    if not isinstance(raw, Mapping) or set(raw) - {
-        "lastattempt",
-        "feedback",
-        "previousattempts",
-        "assignmentdata",
-        "gradingsummary",
-        "warnings",
-    } or "assignmentdata" not in raw or "warnings" not in raw:
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw)
+        - {
+            "lastattempt",
+            "feedback",
+            "previousattempts",
+            "assignmentdata",
+            "gradingsummary",
+            "warnings",
+        }
+        or "assignmentdata" not in raw
+        or "warnings" not in raw
+    ):
         raise MoodleSubmissionError("Moodle submission status is invalid")
     if (
         not (
@@ -228,7 +352,7 @@ def _submission_receipt(
         not isinstance(submission_id, int)
         or isinstance(submission_id, bool)
         or submission_id <= 0
-        or status != "submitted"
+        or status != expected_status
         or not isinstance(plugins, list)
     ):
         return None

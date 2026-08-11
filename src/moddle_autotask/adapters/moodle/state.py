@@ -73,6 +73,14 @@ class NotificationDraft:
     assignment_id: int | None = None
     submission_drafts: bool = False
     requires_submission_statement: bool = False
+    submission_statement: str = ""
+    submission_statement_format: int = 0
+    team_submission: bool = False
+    no_submissions: bool = False
+    file_submission_enabled: bool = True
+    file_submission_max_files: int = 1
+    file_submission_max_bytes: int = 2 * 1024 * 1024
+    file_submission_filetypes: str = ".md"
 
     def __post_init__(self) -> None:
         _validate_identity(self.task_key, self.revision_digest)
@@ -104,6 +112,39 @@ class NotificationDraft:
             raise ValueError("notification submission draft policy is invalid")
         if not isinstance(self.requires_submission_statement, bool):
             raise ValueError("notification submission statement policy is invalid")
+        if (
+            not isinstance(self.submission_statement, str)
+            or len(self.submission_statement.encode("utf-8")) > 2 * 1024 * 1024
+        ):
+            raise ValueError("notification submission statement is invalid")
+        if (
+            not isinstance(self.submission_statement_format, int)
+            or isinstance(self.submission_statement_format, bool)
+            or self.submission_statement_format < 0
+        ):
+            raise ValueError("notification submission statement format is invalid")
+        if not all(
+            isinstance(value, bool)
+            for value in (self.team_submission, self.no_submissions, self.file_submission_enabled)
+        ):
+            raise ValueError("notification submission policy is invalid")
+        if (
+            not isinstance(self.file_submission_max_files, int)
+            or isinstance(self.file_submission_max_files, bool)
+            or not 0 <= self.file_submission_max_files <= 1000
+        ):
+            raise ValueError("notification submission file count is invalid")
+        if (
+            not isinstance(self.file_submission_max_bytes, int)
+            or isinstance(self.file_submission_max_bytes, bool)
+            or self.file_submission_max_bytes < 0
+        ):
+            raise ValueError("notification submission file size is invalid")
+        if (
+            not isinstance(self.file_submission_filetypes, str)
+            or len(self.file_submission_filetypes) > 4096
+        ):
+            raise ValueError("notification submission file types are invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +166,14 @@ class NotificationEvent:
     assignment_id: int | None = None
     submission_drafts: bool = False
     requires_submission_statement: bool = False
+    submission_statement: str = ""
+    submission_statement_format: int = 0
+    team_submission: bool = False
+    no_submissions: bool = False
+    file_submission_enabled: bool = True
+    file_submission_max_files: int = 1
+    file_submission_max_bytes: int = 2 * 1024 * 1024
+    file_submission_filetypes: str = ".md"
 
     def __post_init__(self) -> None:
         if not _EVENT_ID.fullmatch(self.event_id):
@@ -149,6 +198,14 @@ class NotificationEvent:
             self.assignment_id,
             self.submission_drafts,
             self.requires_submission_statement,
+            self.submission_statement,
+            self.submission_statement_format,
+            self.team_submission,
+            self.no_submissions,
+            self.file_submission_enabled,
+            self.file_submission_max_files,
+            self.file_submission_max_bytes,
+            self.file_submission_filetypes,
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -170,6 +227,14 @@ class NotificationEvent:
             "assignment_id": self.assignment_id,
             "submission_drafts": self.submission_drafts,
             "requires_submission_statement": self.requires_submission_statement,
+            "submission_statement": self.submission_statement,
+            "submission_statement_format": self.submission_statement_format,
+            "team_submission": self.team_submission,
+            "no_submissions": self.no_submissions,
+            "file_submission_enabled": self.file_submission_enabled,
+            "file_submission_max_files": self.file_submission_max_files,
+            "file_submission_max_bytes": self.file_submission_max_bytes,
+            "file_submission_filetypes": self.file_submission_filetypes,
         }
 
 
@@ -219,8 +284,7 @@ _OUTBOX_TABLE_SQL = (
     "CHECK ((delivery_state = 'delivered') = (delivered_at IS NOT NULL)))"
 )
 _OUTBOX_CLAIMABLE_INDEX_SQL = (
-    "CREATE INDEX outbox_claimable_idx ON outbox("
-    "delivery_state, available_at, lease_expires_at)"
+    "CREATE INDEX outbox_claimable_idx ON outbox(delivery_state, available_at, lease_expires_at)"
 )
 _OUTBOX_TASK_INDEX_SQL = "CREATE INDEX outbox_task_idx ON outbox(task_key)"
 
@@ -543,9 +607,7 @@ def _schema_objects(
     )
 
 
-def _index_signatures(
-    connection: sqlite3.Connection, table: str
-) -> frozenset[_IndexSignature]:
+def _index_signatures(connection: sqlite3.Connection, table: str) -> frozenset[_IndexSignature]:
     return frozenset(
         (
             row[1],
@@ -674,6 +736,14 @@ def _event_from_draft(draft: NotificationDraft, status: str) -> NotificationEven
         draft.assignment_id,
         draft.submission_drafts,
         draft.requires_submission_statement,
+        draft.submission_statement,
+        draft.submission_statement_format,
+        draft.team_submission,
+        draft.no_submissions,
+        draft.file_submission_enabled,
+        draft.file_submission_max_files,
+        draft.file_submission_max_bytes,
+        draft.file_submission_filetypes,
     )
 
 
@@ -710,14 +780,27 @@ def _event_from_json(payload: str) -> NotificationEvent:
             "time_modified",
             "attachments",
         }
+        policy_keys = {
+            "assignment_id",
+            "submission_drafts",
+            "requires_submission_statement",
+            "submission_statement",
+            "submission_statement_format",
+            "team_submission",
+            "no_submissions",
+            "file_submission_enabled",
+            "file_submission_max_files",
+            "file_submission_max_bytes",
+            "file_submission_filetypes",
+        }
         permitted_keys = {
             frozenset(required),
             frozenset(required | {"assignment_id"}),
             frozenset(required | {"assignment_id", "submission_drafts"}),
             frozenset(
-                required
-                | {"assignment_id", "submission_drafts", "requires_submission_statement"}
+                required | {"assignment_id", "submission_drafts", "requires_submission_statement"}
             ),
+            frozenset(required | policy_keys),
         }
         if not isinstance(raw, dict) or set(raw) not in permitted_keys:
             raise ValueError
@@ -746,6 +829,14 @@ def _event_from_json(payload: str) -> NotificationEvent:
             raw.get("assignment_id"),
             raw.get("submission_drafts", False),
             raw.get("requires_submission_statement", False),
+            raw.get("submission_statement", ""),
+            raw.get("submission_statement_format", 0),
+            raw.get("team_submission", False),
+            raw.get("no_submissions", False),
+            raw.get("file_submission_enabled", True),
+            raw.get("file_submission_max_files", 1),
+            raw.get("file_submission_max_bytes", 2 * 1024 * 1024),
+            raw.get("file_submission_filetypes", ".md"),
         )
         if (
             not _EVENT_ID.fullmatch(event.event_id)

@@ -75,6 +75,14 @@ class MoodleAssignmentSnapshot:
     attachments: tuple[MoodleAttachment, ...]
     submission_drafts: bool = False
     requires_submission_statement: bool = False
+    submission_statement: str = ""
+    submission_statement_format: int = 0
+    team_submission: bool = False
+    no_submissions: bool = False
+    file_submission_enabled: bool = True
+    file_submission_max_files: int = 1
+    file_submission_max_bytes: int = 2 * 1024 * 1024
+    file_submission_filetypes: str = ".md"
 
 
 def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentSnapshot, ...]:
@@ -129,6 +137,71 @@ def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentS
                 or requires_submission_statement not in {0, 1}
             ):
                 raise MoodlePayloadError("assignment submission statement policy is invalid")
+            statement = assignment.get("submissionstatement", "")
+            statement_format = assignment.get("submissionstatementformat", 0)
+            if (
+                not isinstance(statement, str)
+                or not isinstance(statement_format, int)
+                or isinstance(statement_format, bool)
+                or statement_format < 0
+            ):
+                raise MoodlePayloadError("assignment submission statement is invalid")
+            team_submission = assignment.get("teamsubmission", 0)
+            no_submissions = assignment.get("nosubmissions", 0)
+            if team_submission not in (0, 1, False, True) or no_submissions not in (
+                0,
+                1,
+                False,
+                True,
+            ):
+                raise MoodlePayloadError("assignment submission policy is invalid")
+            configs = assignment.get("configs")
+            if not isinstance(configs, list):
+                raise MoodlePayloadError("assignment submission configuration is invalid")
+            settings: dict[str, str] = {}
+            for config in configs:
+                if not isinstance(config, dict) or set(config) != {
+                    "plugin",
+                    "subtype",
+                    "name",
+                    "value",
+                }:
+                    raise MoodlePayloadError("assignment submission configuration is invalid")
+                if not all(isinstance(config[field], str) for field in config):
+                    raise MoodlePayloadError("assignment submission configuration is invalid")
+                if config["plugin"] == "file" and config["subtype"] == "assignsubmission":
+                    name, value = config["name"], config["value"]
+                    if name in settings:
+                        raise MoodlePayloadError("assignment submission configuration is invalid")
+                    settings[name] = value
+            if not settings:
+                file_enabled, file_max_files, file_max_bytes, filetypes = 0, 0, 0, ""
+            else:
+                required_file_settings = {
+                    "enabled",
+                    "maxfilesubmissions",
+                    "maxsubmissionsizebytes",
+                    "filetypeslist",
+                }
+                if set(settings) != required_file_settings or any(
+                    not value.isascii() or not value.isdecimal()
+                    for value in (
+                        settings["enabled"],
+                        settings["maxfilesubmissions"],
+                        settings["maxsubmissionsizebytes"],
+                    )
+                ):
+                    raise MoodlePayloadError("assignment file submission configuration is invalid")
+                file_enabled = int(settings["enabled"])
+                file_max_files = int(settings["maxfilesubmissions"])
+                file_max_bytes = int(settings["maxsubmissionsizebytes"])
+                filetypes = settings["filetypeslist"]
+                if (
+                    file_enabled not in (0, 1)
+                    or not 0 <= file_max_files <= 1000
+                    or file_max_bytes < 0
+                ):
+                    raise MoodlePayloadError("assignment file submission configuration is invalid")
             attachments: list[MoodleAttachment] = []
             for area in ("introfiles", "introattachments", "activityattachments"):
                 files = assignment.get(area, [])
@@ -153,6 +226,14 @@ def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentS
                 "intro": intro,
                 "submission_drafts": bool(submission_drafts),
                 "requires_submission_statement": bool(requires_submission_statement),
+                "submission_statement": statement,
+                "submission_statement_format": statement_format,
+                "team_submission": bool(team_submission),
+                "no_submissions": bool(no_submissions),
+                "file_submission_enabled": bool(file_enabled),
+                "file_submission_max_files": file_max_files,
+                "file_submission_max_bytes": file_max_bytes,
+                "file_submission_filetypes": filetypes,
                 **fields,
                 "attachments": [
                     {
@@ -182,6 +263,14 @@ def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentS
                     attachments=tuple(attachments),
                     submission_drafts=bool(submission_drafts),
                     requires_submission_statement=bool(requires_submission_statement),
+                    submission_statement=statement,
+                    submission_statement_format=statement_format,
+                    team_submission=bool(team_submission),
+                    no_submissions=bool(no_submissions),
+                    file_submission_enabled=bool(file_enabled),
+                    file_submission_max_files=file_max_files,
+                    file_submission_max_bytes=file_max_bytes,
+                    file_submission_filetypes=filetypes,
                     **fields,
                 )
             )

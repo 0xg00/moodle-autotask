@@ -12,7 +12,7 @@ from moddle_autotask.adapters.aws.image_imports import (
     ImageImportResult,
 )
 from moddle_autotask.adapters.aws.worker import process_one
-from moddle_autotask.adapters.moodle.approval_state import ApprovalState
+from moddle_autotask.adapters.moodle.approval_state import ApprovalState, SubmissionManifest
 from moddle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
@@ -149,11 +149,130 @@ class _SubmissionService:
     def upload(self, manifest: object) -> int:
         raise AssertionError("draft policy must not upload")
 
-    def save(self, manifest: object, draft_item_id: int) -> None:
+    def save(self, manifest: SubmissionManifest, draft_item_id: int) -> None:
         raise AssertionError("draft policy must not save")
 
     def verify(self, manifest: object) -> object | None:
         raise AssertionError("draft policy must not verify")
+
+    def verify_draft(self, manifest: object) -> object | None:
+        raise AssertionError("draft policy must not verify")
+
+    def finalize(self, manifest: object) -> None:
+        raise AssertionError("draft policy must not finalize")
+
+
+@dataclass(frozen=True)
+class _Receipt:
+    reference: str = "moodle-submission:91"
+
+
+@dataclass
+class _LifecycleSubmissionService:
+    """Stateful Moodle double: remote status only changes at the real boundaries."""
+
+    remote_status: str = "new"
+    fail_at: str | None = None
+    expire_lease_state: ApprovalState | None = None
+    upload_calls: int = 0
+    save_calls: int = 0
+    verify_draft_calls: int = 0
+    finalize_calls: int = 0
+    verify_calls: int = 0
+
+    def can_offer_submission(self, event: NotificationEvent) -> None:
+        del event
+
+    def upload(self, manifest: object) -> int:
+        del manifest
+        self.upload_calls += 1
+        if self.fail_at == "upload":
+            raise RuntimeError("upload crashed")
+        return 17
+
+    def save(self, manifest: SubmissionManifest, draft_item_id: int) -> None:
+        assert draft_item_id == 17
+        self.save_calls += 1
+        if self.fail_at == "save_after_submit":
+            self.remote_status = "submitted"
+            raise RuntimeError("save response lost")
+        if self.fail_at == "save_after_draft":
+            self.remote_status = "draft"
+            raise RuntimeError("save response lost")
+        if self.fail_at == "save":
+            raise RuntimeError("save crashed")
+        if self.fail_at == "save_no_remote":
+            return
+        self.remote_status = "draft" if manifest.event.submission_drafts else "submitted"
+
+    def verify_draft(self, manifest: object) -> object | None:
+        del manifest
+        self.verify_draft_calls += 1
+        if self.fail_at == "verify_draft":
+            raise RuntimeError("draft verification crashed")
+        return _Receipt() if self.remote_status == "draft" else None
+
+    def finalize(self, manifest: object) -> None:
+        del manifest
+        self.finalize_calls += 1
+        if self.fail_at == "finalize_after_submit":
+            self.remote_status = "submitted"
+            raise RuntimeError("finalize response lost")
+        if self.fail_at == "finalize":
+            raise RuntimeError("finalize crashed")
+        assert self.remote_status == "draft"
+        self.remote_status = "submitted"
+
+    def verify(self, manifest: object) -> object | None:
+        del manifest
+        self.verify_calls += 1
+        if self.fail_at == "verify":
+            raise RuntimeError("submitted verification crashed")
+        if self.expire_lease_state is not None:
+            with self.expire_lease_state._connect() as connection:
+                connection.execute("UPDATE submissions SET lease_expires_at = 10")
+        return _Receipt() if self.remote_status == "submitted" else None
+
+
+def _submission_approved(
+    tmp_path: Path, *, drafts: bool = False, statement: bool = False
+) -> tuple[ApprovalState, NotificationEvent]:
+    event = MoodleState(tmp_path / "submission-moodle.sqlite3").enqueue(
+        NotificationDraft(
+            "moodle-task-v1:" + "e" * 64,
+            "moodle-assignment-v1:" + "f" * 64,
+            "Course",
+            "M01",
+            "Report",
+            0,
+            100,
+            0,
+            0,
+            1,
+            (),
+            43,
+            drafts,
+            statement,
+            "<p>I accept the submission statement.</p>" if statement else "",
+            1 if statement else 0,
+        ),
+        now=1,
+    )
+    assert event is not None
+    state = ApprovalState(tmp_path / "submission-approval.sqlite3")
+    state.prepare(event, now=1)
+    _manifest, buttons = state.prepare_submission(event, "done", "# Report", now=2)
+    assert state.resolve_submission(buttons.submit, 42, 42, now=3)[1] == "approved"
+    return state, event
+
+
+def _submission_row(state: ApprovalState) -> tuple[str, int | None, str | None]:
+    with state._connect() as connection:
+        row = connection.execute(
+            "SELECT status, draft_item_id, error_code FROM submissions"
+        ).fetchone()
+    assert row is not None
+    return str(row[0]), row[1], row[2]
 
 
 @dataclass
@@ -271,38 +390,41 @@ def test_central_work_waits_for_agent_then_completes_exact_revision(tmp_path: Pa
     assert len(notifier.calls) == 1
 
 
-@pytest.mark.parametrize("policy", ("submission_drafts", "requires_submission_statement"))
-def test_submission_policy_never_offers_second_approval(tmp_path: Path, policy: str) -> None:
-    state, _, _ = (
-        _approved(tmp_path, lab=False, assignment_id=43, submission_drafts=True)
-        if policy == "submission_drafts"
-        else _approved(tmp_path, lab=False, assignment_id=43, requires_submission_statement=True)
+def test_statement_without_drafts_never_offers_second_approval(tmp_path: Path) -> None:
+    state, _, _ = _approved(
+        tmp_path, lab=False, assignment_id=43, requires_submission_statement=True
     )
     provider = _Provider()
     notifier = _SubmissionNotifier()
     service = _SubmissionService()
     broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
 
-    assert process_one(
-        state,
-        provider,
-        owner="worker",
-        artifact_preparer=_Preparer(),
-        execution_broker=broker,
-        execution_notifier=notifier,
-        submission_service=service,
-        now=10,
-    ).result == "central_ready"
-    assert process_one(
-        state,
-        provider,
-        owner="worker",
-        artifact_preparer=_Preparer(),
-        execution_broker=broker,
-        execution_notifier=notifier,
-        submission_service=service,
-        now=11,
-    ).result == "execution_complete"
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            submission_service=service,
+            now=10,
+        ).result
+        == "central_ready"
+    )
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            submission_service=service,
+            now=11,
+        ).result
+        == "execution_complete"
+    )
 
     assert notifier.ready == []
     assert service.offered == []
@@ -316,22 +438,47 @@ def test_submission_preflight_transient_retries_execution_notification(tmp_path:
     service = _SubmissionService(preflight_error=MoodleSubmissionError("Moodle timeout"))
     broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
 
-    assert process_one(
-        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
-        execution_notifier=notifier, submission_service=service, now=10,
-    ).result == "central_ready"
-    assert process_one(
-        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
-        execution_notifier=notifier, submission_service=service, now=11,
-    ).result == "execution_complete"
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            submission_service=service,
+            now=10,
+        ).result
+        == "central_ready"
+    )
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            submission_service=service,
+            now=11,
+        ).result
+        == "execution_complete"
+    )
     assert state.pending_execution_notification() is not None
     assert notifier.ready == [] and notifier.blocked == []
 
     service.preflight_error = None
-    assert process_one(
-        state, provider, owner="worker", execution_notifier=notifier,
-        submission_service=service, now=12,
-    ).result == "idle"
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            execution_notifier=notifier,
+            submission_service=service,
+            now=12,
+        ).result
+        == "idle"
+    )
     assert state.pending_execution_notification() is None
     assert len(service.offered) == 1 and len(notifier.ready) == 1
 
@@ -345,21 +492,46 @@ def test_submission_preflight_permanent_rejection_blocks_and_delivers(tmp_path: 
     )
     broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
 
-    assert process_one(
-        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
-        execution_notifier=notifier, submission_service=service, now=10,
-    ).result == "central_ready"
-    assert process_one(
-        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
-        execution_notifier=notifier, submission_service=service, now=11,
-    ).result == "execution_complete"
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            submission_service=service,
+            now=10,
+        ).result
+        == "central_ready"
+    )
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            submission_service=service,
+            now=11,
+        ).result
+        == "execution_complete"
+    )
     assert state.pending_execution_notification() is None
     assert notifier.ready == [] and len(notifier.blocked) == 1
     assert "Moodle no habilita" in notifier.blocked[0][1]
-    assert process_one(
-        state, provider, owner="worker", execution_notifier=notifier,
-        submission_service=service, now=12,
-    ).result == "idle"
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            execution_notifier=notifier,
+            submission_service=service,
+            now=12,
+        ).result
+        == "idle"
+    )
     assert len(notifier.blocked) == 1
 
 
@@ -671,3 +843,218 @@ def test_completed_ova_import_launches_exact_imported_image(tmp_path: Path) -> N
     assert provider.provisions[0][0].image_reference == "ami-0123456789abcdef0"
     item = state.work_status(task_key, revision)
     assert item is not None and item.status == "lab_pending"
+
+
+def test_direct_submission_is_uploaded_saved_verified_and_receipted_once(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path)
+    service = _LifecycleSubmissionService(remote_status="submitted")
+
+    cycle = process_one(state, _Provider(), owner="worker", submission_service=service, now=10)
+
+    assert cycle.result == "submission_confirmed"
+    assert _submission_row(state) == ("submitted", 17, None)
+    assert (service.upload_calls, service.save_calls, service.verify_calls) == (1, 1, 1)
+
+
+def test_draft_submission_requires_verified_draft_then_finalizes_once(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True, statement=True)
+    service = _LifecycleSubmissionService()
+
+    assert (
+        process_one(state, _Provider(), owner="worker", submission_service=service, now=10).result
+        == "submission_confirmed"
+    )
+    assert _submission_row(state) == ("submitted", 17, None)
+    assert (
+        service.upload_calls,
+        service.save_calls,
+        service.verify_draft_calls,
+        service.finalize_calls,
+        service.verify_calls,
+    ) == (1, 1, 2, 1, 2)
+
+
+def test_stale_saving_claim_recovers_by_verifying_draft_without_reuploading(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    claim = state.claim_submission("first", 6, now=10)
+    assert claim is not None and state.record_submission_draft(claim, 17, now=10)
+    service = _LifecycleSubmissionService(remote_status="draft")
+
+    cycle = process_one(state, _Provider(), owner="second", submission_service=service, now=16)
+
+    assert cycle.result == "submission_confirmed"
+    assert _submission_row(state) == ("submitted", 17, None)
+    assert (service.upload_calls, service.save_calls, service.verify_draft_calls) == (0, 0, 2)
+
+
+def test_stale_finalizing_claim_reconciles_without_reupload_or_resave(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    claim = state.claim_submission("first", 6, now=10)
+    assert claim is not None
+    saving = state.record_submission_draft(claim, 17, now=10)
+    assert saving is not None and state.record_submission_finalizing(saving, now=10)
+    service = _LifecycleSubmissionService(remote_status="draft")
+
+    cycle = process_one(state, _Provider(), owner="second", submission_service=service, now=16)
+
+    assert cycle.result == "submission_confirmed"
+    assert _submission_row(state) == ("submitted", 17, None)
+    assert (
+        service.upload_calls,
+        service.save_calls,
+        service.finalize_calls,
+        service.verify_calls,
+    ) == (0, 0, 1, 2)
+
+
+def test_upload_crash_never_creates_a_durable_draft(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path)
+    service = _LifecycleSubmissionService(fail_at="upload")
+
+    assert (
+        process_one(state, _Provider(), owner="worker", submission_service=service, now=10).result
+        == "submission_failed"
+    )
+    assert _submission_row(state) == ("failed", None, "submission_failed")
+    assert service.upload_calls == 1 and service.save_calls == 0
+
+
+def test_save_response_loss_reconciles_exact_submitted_receipt(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path)
+    service = _LifecycleSubmissionService(fail_at="save_after_submit")
+
+    assert (
+        process_one(state, _Provider(), owner="worker", submission_service=service, now=10).result
+        == "submission_confirmed"
+    )
+    assert _submission_row(state) == ("submitted", 17, None)
+    assert (service.upload_calls, service.save_calls, service.verify_calls) == (1, 1, 1)
+
+
+def test_draft_save_response_loss_recovers_without_duplicate_upload_or_save(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    service = _LifecycleSubmissionService(fail_at="save_after_draft")
+
+    assert (
+        process_one(state, _Provider(), owner="worker", submission_service=service, now=10).result
+        == "submission_confirmed"
+    )
+    assert _submission_row(state) == ("submitted", 17, None)
+    assert (
+        service.upload_calls,
+        service.save_calls,
+        service.verify_draft_calls,
+        service.verify_calls,
+    ) == (1, 1, 2, 2)
+    assert (service.upload_calls, service.save_calls, service.finalize_calls) == (1, 1, 1)
+
+
+def test_unverified_direct_submission_fails_closed_after_save(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path)
+    service = _LifecycleSubmissionService(fail_at="save_no_remote")
+
+    assert (
+        process_one(state, _Provider(), owner="worker", submission_service=service, now=10).result
+        == "submission_unverified"
+    )
+    assert _submission_row(state) == ("failed", 17, "submission_unverified")
+
+
+def test_unverified_draft_fails_closed_before_finalization(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    service = _LifecycleSubmissionService(fail_at="save_no_remote")
+
+    assert (
+        process_one(state, _Provider(), owner="worker", submission_service=service, now=10).result
+        == "submission_draft_unverified"
+    )
+    assert _submission_row(state) == ("failed", 17, "submission_draft_unverified")
+    assert service.finalize_calls == 0
+
+
+def test_finalization_response_loss_reconciles_submitted_remote_state(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    claim = state.claim_submission("first", 6, now=10)
+    assert claim is not None
+    saving = state.record_submission_draft(claim, 17, now=10)
+    assert saving is not None and state.record_submission_finalizing(saving, now=10)
+    service = _LifecycleSubmissionService(remote_status="draft", fail_at="finalize_after_submit")
+
+    cycle = process_one(state, _Provider(), owner="recover", submission_service=service, now=16)
+
+    assert cycle.result == "submission_confirmed"
+    assert _submission_row(state) == ("submitted", 17, None)
+    assert service.finalize_calls == 1 and service.verify_calls == 2
+
+
+def test_finalization_error_with_exact_draft_fails_closed_without_second_finalize(
+    tmp_path: Path,
+) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    claim = state.claim_submission("first", 6, now=10)
+    assert claim is not None
+    saving = state.record_submission_draft(claim, 17, now=10)
+    assert saving is not None and state.record_submission_finalizing(saving, now=10)
+    service = _LifecycleSubmissionService(remote_status="draft", fail_at="finalize")
+
+    assert (
+        process_one(state, _Provider(), owner="recover", submission_service=service, now=16).result
+        == "submission_ambiguous"
+    )
+    assert _submission_row(state) == ("failed", 17, "submission_ambiguous")
+    assert service.finalize_calls == 1 and service.verify_draft_calls == 2
+
+
+def test_recovered_finalizing_changed_draft_fails_closed_without_finalizing(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    claim = state.claim_submission("first", 6, now=10)
+    assert claim is not None
+    saving = state.record_submission_draft(claim, 17, now=10)
+    assert saving is not None and state.record_submission_finalizing(saving, now=10)
+    service = _LifecycleSubmissionService(remote_status="changed_draft")
+
+    cycle = process_one(state, _Provider(), owner="recover", submission_service=service, now=16)
+
+    assert cycle.result == "submission_draft_unverified"
+    assert _submission_row(state) == ("failed", 17, "submission_draft_unverified")
+    assert service.finalize_calls == 0
+
+
+def test_submitted_verification_crash_fails_closed(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path)
+    service = _LifecycleSubmissionService(fail_at="verify")
+
+    assert (
+        process_one(state, _Provider(), owner="worker", submission_service=service, now=10).result
+        == "submission_failed"
+    )
+    assert _submission_row(state) == ("failed", 17, "submission_failed")
+
+
+def test_completion_ownership_loss_never_reports_a_submitted_receipt(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path)
+    service = _LifecycleSubmissionService(expire_lease_state=state)
+
+    cycle = process_one(state, _Provider(), owner="worker", submission_service=service, now=10)
+
+    assert cycle.result == "submission_ownership_lost"
+    assert _submission_row(state) == ("saving", 17, None)
+
+
+def test_expired_submission_lease_causes_no_duplicate_remote_mutation(tmp_path: Path) -> None:
+    state, _event = _submission_approved(tmp_path, drafts=True)
+    claim = state.claim_submission("first", 6, now=10)
+    assert claim is not None
+    saving = state.record_submission_draft(claim, 17, now=10)
+    assert saving is not None and state.record_submission_finalizing(saving, now=10)
+    service = _LifecycleSubmissionService(remote_status="submitted")
+
+    assert (
+        process_one(state, _Provider(), owner="recover", submission_service=service, now=16).result
+        == "submission_confirmed"
+    )
+    assert (
+        process_one(state, _Provider(), owner="recover", submission_service=service, now=17).result
+        == "idle"
+    )
+    assert (service.upload_calls, service.save_calls, service.finalize_calls) == (0, 0, 0)

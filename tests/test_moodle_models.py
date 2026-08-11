@@ -24,6 +24,7 @@ def test_assignment_keys_and_revision_are_stable() -> None:
                         "timemodified": 1,
                         "submissiondrafts": 0,
                         "requiresubmissionstatement": 0,
+                        "configs": _file_submission_configs(),
                         "introattachments": [
                             {
                                 "filename": "brief.txt",
@@ -91,6 +92,7 @@ def _valid() -> dict[str, object]:
                         "timemodified": 1,
                         "submissiondrafts": 0,
                         "requiresubmissionstatement": 0,
+                        "configs": _file_submission_configs(),
                         "introattachments": [
                             {
                                 "filename": "x.txt",
@@ -108,10 +110,123 @@ def _valid() -> dict[str, object]:
     }
 
 
+def _file_submission_configs() -> list[dict[str, str]]:
+    return [
+        {"plugin": "file", "subtype": "assignsubmission", "name": "enabled", "value": "1"},
+        {
+            "plugin": "file",
+            "subtype": "assignsubmission",
+            "name": "maxfilesubmissions",
+            "value": "1",
+        },
+        {
+            "plugin": "file",
+            "subtype": "assignsubmission",
+            "name": "maxsubmissionsizebytes",
+            "value": "2097152",
+        },
+        {
+            "plugin": "file",
+            "subtype": "assignsubmission",
+            "name": "filetypeslist",
+            "value": ".md",
+        },
+    ]
+
+
 def test_warnings_rejected() -> None:
     payload = _valid()
     payload["warnings"] = ["warning"]
     with pytest.raises(MoodlePayloadError):
+        parse_assignments(payload, "https://example.test")
+
+
+def test_assignment_without_file_submission_configs_is_safely_unsupported() -> None:
+    payload = _valid()
+    assignment = payload["courses"][0]["assignments"][0]  # type: ignore[index]
+    assert isinstance(assignment, dict)
+    assignment["configs"] = []
+
+    snapshot = parse_assignments(payload, "https://example.test")[0]
+
+    assert not snapshot.file_submission_enabled
+    assert (snapshot.file_submission_max_files, snapshot.file_submission_max_bytes) == (0, 0)
+    assert snapshot.file_submission_filetypes == ""
+
+
+def test_feedback_only_configs_do_not_enable_file_submission() -> None:
+    payload = _valid()
+    assignment = payload["courses"][0]["assignments"][0]  # type: ignore[index]
+    assert isinstance(assignment, dict)
+    assignment["configs"] = [
+        {
+            "plugin": "comments",
+            "subtype": "assignfeedback",
+            "name": "enabled",
+            "value": "1",
+        }
+    ]
+
+    snapshot = parse_assignments(payload, "https://example.test")[0]
+
+    assert not snapshot.file_submission_enabled
+    assert (snapshot.file_submission_max_files, snapshot.file_submission_max_bytes) == (0, 0)
+    assert snapshot.file_submission_filetypes == ""
+
+
+@pytest.mark.parametrize("enabled", ("0", "1"))
+def test_complete_file_submission_quartet_parses_enabled_and_disabled(enabled: str) -> None:
+    payload = _valid()
+    assignment = payload["courses"][0]["assignments"][0]  # type: ignore[index]
+    assert isinstance(assignment, dict)
+    configs = assignment["configs"]
+    assert isinstance(configs, list) and isinstance(configs[0], dict)
+    configs[0]["value"] = enabled
+
+    snapshot = parse_assignments(payload, "https://example.test")[0]
+
+    assert snapshot.file_submission_enabled is (enabled == "1")
+    assert snapshot.file_submission_max_files == 1
+    assert snapshot.file_submission_max_bytes == 2_097_152
+    assert snapshot.file_submission_filetypes == ".md"
+
+
+@pytest.mark.parametrize(
+    "mutation", ("missing-list", "partial", "duplicate", "malformed", "lookalike")
+)
+def test_file_submission_configs_match_moodle_521_and_fail_closed(mutation: str) -> None:
+    payload = _valid()
+    assignment = payload["courses"][0]["assignments"][0]  # type: ignore[index]
+    assert isinstance(assignment, dict)
+    configs = assignment["configs"]
+    assert isinstance(configs, list) and isinstance(configs[0], dict)
+    if mutation == "missing-list":
+        assignment.pop("configs")
+    elif mutation == "partial":
+        configs.pop()
+    elif mutation == "duplicate":
+        configs.append(deepcopy(configs[0]))
+    elif mutation == "malformed":
+        configs[0] = {"plugin": "file", "subtype": "assignsubmission", "name": "enabled"}
+    else:
+        configs[0]["name"] = "enabled-typo"
+    with pytest.raises(MoodlePayloadError, match="submission configuration"):
+        parse_assignments(payload, "https://example.test")
+
+
+@pytest.mark.parametrize(
+    ("index", "value"),
+    ((0, "true"), (1, "1.0"), (2, "-1")),
+)
+def test_file_submission_config_values_fail_closed(index: int, value: str) -> None:
+    payload = _valid()
+    assignment = payload["courses"][0]["assignments"][0]  # type: ignore[index]
+    assert isinstance(assignment, dict)
+    configs = assignment["configs"]
+    assert isinstance(configs, list) and isinstance(configs[index], dict)
+    configs[index]["value"] = value
+
+    with pytest.raises(MoodlePayloadError, match="file submission configuration"):
         parse_assignments(payload, "https://example.test")
 
 
@@ -173,6 +288,7 @@ def test_duplicate_attachment_identity_rejected() -> None:
                         "timemodified": 1,
                         "submissiondrafts": 0,
                         "requiresubmissionstatement": 0,
+                        "configs": _file_submission_configs(),
                         "introattachments": [attachment, attachment],
                     }
                 ],
@@ -206,6 +322,7 @@ def test_userinfo_attachment_url_rejected() -> None:
                         "timemodified": 1,
                         "submissiondrafts": 0,
                         "requiresubmissionstatement": 0,
+                        "configs": _file_submission_configs(),
                         "introattachments": [attachment],
                     }
                 ],

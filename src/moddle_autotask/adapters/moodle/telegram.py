@@ -142,7 +142,12 @@ class TelegramClient:
                 {
                     "inline_keyboard": [
                         [
-                            {"text": "Entregar", "callback_data": f"ma:{buttons.submit}"},
+                            {
+                                "text": "Acepto y entregar"
+                                if buttons.requires_statement
+                                else "Entregar",
+                                "callback_data": f"ma:{buttons.submit}",
+                            },
                             {"text": "No entregar", "callback_data": f"ma:{buttons.decline}"},
                         ],
                         [{"text": "Ver detalles", "callback_data": f"ma:{buttons.details}"}],

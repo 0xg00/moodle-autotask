@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,11 @@ class _StatusClient:
                 "warnofungroupedusers": "",
             },
             "lastattempt": {
+                "submissionsenabled": True,
+                "locked": False,
+                "canedit": True,
+                "caneditowner": True,
+                "cansubmit": False,
                 "submission": {
                     "id": 9,
                     "status": "submitted",
@@ -84,7 +90,7 @@ class _StatusClient:
                         }
                     ],
                 }
-            }
+            },
         }
 
     def pluginfile_digest(self, file_url: str, expected_size: int) -> str:
@@ -160,9 +166,7 @@ def test_offer_turns_definitive_missing_or_disabled_upload_capability_permanent(
     manifest = _manifest(tmp_path)
 
     class SiteInfoClient:
-        def call(
-            self, function: str, parameters: Mapping[str, str | int] | None = None
-        ) -> object:
+        def call(self, function: str, parameters: Mapping[str, str | int] | None = None) -> object:
             del parameters
             assert function == "core_webservice_get_site_info"
             result: dict[str, object] = {
@@ -292,6 +296,143 @@ def test_save_accepts_pinned_empty_warning_list(tmp_path: Path) -> None:
     ).save(manifest, 7)
 
 
+def test_draft_finalization_uses_only_official_exact_parameters(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    manifest = _submission_manifest(
+        replace(
+            manifest.event,
+            submission_drafts=True,
+            requires_submission_statement=True,
+            submission_statement="I agree",
+        ),
+        manifest.report_markdown,
+    )
+
+    class FinalizeClient(_StatusClient):
+        def call(self, function: str, parameters: object = None) -> object:
+            assert function == "mod_assign_submit_for_grading"
+            assert parameters == {"assignmentid": 43, "acceptsubmissionstatement": 1}
+            return []
+
+    current = SimpleNamespace(
+        assignment_id=43,
+        task_key=manifest.event.task_key,
+        revision_digest=manifest.event.revision_digest,
+    )
+    MoodleSubmissionClient(
+        MoodleConnectionConfig("https://moodle.test", "token"),
+        FinalizeClient(manifest.report_digest),
+        _Site((current,)),
+    ).finalize(manifest)
+
+
+@pytest.mark.parametrize(
+    ("assignment_change", "status_change", "error"),
+    (
+        ({"team_submission": True}, {}, "mode is not supported"),
+        ({"no_submissions": True}, {}, "mode is not supported"),
+        ({"file_submission_enabled": False}, {}, "plugin is disabled"),
+        ({"file_submission_max_files": 2}, {}, "one exact file"),
+        ({"file_submission_max_bytes": 0}, {}, "size is invalid"),
+        ({}, {"lastattempt": {"submissionsenabled": False}}, "not currently editable"),
+        ({}, {"lastattempt": {"locked": True}}, "not currently editable"),
+        ({}, {"lastattempt": {"canedit": False}}, "not currently editable"),
+    ),
+)
+def test_preflight_blocks_assignment_and_status_policy(
+    tmp_path: Path,
+    assignment_change: dict[str, object],
+    status_change: dict[str, object],
+    error: str,
+) -> None:
+    manifest = _manifest(tmp_path)
+    current = SimpleNamespace(
+        assignment_id=43,
+        task_key=manifest.event.task_key,
+        revision_digest=manifest.event.revision_digest,
+        **assignment_change,
+    )
+
+    class StatusClient(_StatusClient):
+        def call(self, function: str, parameters: object = None) -> object:
+            payload = super().call(function, parameters)
+            assert isinstance(payload, dict)
+            attempt = payload["lastattempt"]
+            assert isinstance(attempt, dict)
+            attempt.pop("submission")
+            nested_status = status_change.get("lastattempt", {})
+            assert isinstance(nested_status, Mapping)
+            for key, value in nested_status.items():
+                attempt[key] = value
+            return payload
+
+    client = MoodleSubmissionClient(
+        MoodleConnectionConfig("https://moodle.test", "token"),
+        StatusClient(manifest.report_digest),
+        _Site((current,)),
+    )
+    client._verified = True
+    with pytest.raises(PermanentSubmissionOfferError, match=error):
+        client._preflight(manifest.event)
+
+
+def test_preflight_accepts_status_without_optional_gradingsummary(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    current = SimpleNamespace(
+        assignment_id=43,
+        task_key=manifest.event.task_key,
+        revision_digest=manifest.event.revision_digest,
+    )
+
+    class StatusClient(_StatusClient):
+        def call(self, function: str, parameters: object = None) -> object:
+            payload = super().call(function, parameters)
+            assert isinstance(payload, dict)
+            attempt = payload["lastattempt"]
+            assert isinstance(attempt, dict)
+            attempt.pop("submission")
+            payload.pop("gradingsummary")
+            return payload
+
+    client = MoodleSubmissionClient(
+        MoodleConnectionConfig("https://moodle.test", "token"),
+        StatusClient(manifest.report_digest),
+        _Site((current,)),
+    )
+    client._verified = True
+    client._preflight(manifest.event)
+
+
+@pytest.mark.parametrize("status", ("draft", "submitted"))
+def test_preflight_rejects_any_existing_submission_content(tmp_path: Path, status: str) -> None:
+    manifest = _manifest(tmp_path)
+    current = SimpleNamespace(
+        assignment_id=43,
+        task_key=manifest.event.task_key,
+        revision_digest=manifest.event.revision_digest,
+    )
+
+    class StatusClient(_StatusClient):
+        def call(self, function: str, parameters: object = None) -> object:
+            payload = super().call(function, parameters)
+            assert isinstance(payload, dict)
+            attempt = payload["lastattempt"]
+            assert isinstance(attempt, dict)
+            submission = attempt["submission"]
+            assert isinstance(submission, dict)
+            submission["status"] = status
+            return payload
+
+    client = MoodleSubmissionClient(
+        MoodleConnectionConfig("https://moodle.test", "token"),
+        StatusClient(manifest.report_digest),
+        _Site((current,)),
+    )
+    client._verified = True
+    with pytest.raises(PermanentSubmissionOfferError, match="already has a submission"):
+        client._preflight(manifest.event)
+
+
 @pytest.mark.parametrize(
     "mutate",
     (
@@ -360,7 +501,9 @@ def test_submission_receipt_requires_one_exact_file_in_one_relevant_area(
     files = areas[0]["files"]
     assert isinstance(files, list)
     if mutation == "extra":
-        files.append({"filename": "different.md", "filesize": 6, "fileurl": "https://moodle.test/x"})
+        files.append(
+            {"filename": "different.md", "filesize": 6, "fileurl": "https://moodle.test/x"}
+        )
     elif mutation == "duplicate-area":
         areas.append(deepcopy(areas[0]))
     elif mutation == "duplicate-plugin":
