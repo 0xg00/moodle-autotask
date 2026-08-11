@@ -118,6 +118,19 @@ function Write-Evidence {
     Assert-NonReparsePath -Path $parent
     Assert-NonReparsePath -Path $EvidencePath -AllowMissingLeaf
     if (Test-Path -LiteralPath $EvidencePath -PathType Container) { Fail 'Evidence target is not a file.' }
+    $backup = Join-Path $parent ('.central-e2e-' + $RunId + '.evidence.bak')
+    Assert-NonReparsePath -Path $backup -AllowMissingLeaf
+    if (Test-Path -LiteralPath $backup) {
+        if (Test-Path -LiteralPath $backup -PathType Container) { Fail 'Evidence backup is not a file.' }
+        Assert-NonReparsePath -Path $backup
+        if (Test-Path -LiteralPath $EvidencePath) {
+            Assert-NonReparsePath -Path $EvidencePath
+            [System.IO.File]::Delete($backup)
+        } else {
+            [System.IO.File]::Move($backup, $EvidencePath)
+            Assert-NonReparsePath -Path $EvidencePath
+        }
+    }
     $json = $script:Evidence | ConvertTo-Json -Depth 12
     $temporary = Join-Path $parent ('.central-e2e-' + $RunId + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
@@ -129,12 +142,22 @@ function Write-Evidence {
         } finally { $stream.Dispose() }
         if (Test-Path -LiteralPath $EvidencePath) {
             Assert-NonReparsePath -Path $EvidencePath
-            [System.IO.File]::Replace($temporary, $EvidencePath, $null)
+            [System.IO.File]::Replace($temporary, $EvidencePath, $backup)
         } else {
             [System.IO.File]::Move($temporary, $EvidencePath)
         }
+        Assert-NonReparsePath -Path $parent
+        Assert-NonReparsePath -Path $EvidencePath
+        if (-not (Test-Path -LiteralPath $EvidencePath -PathType Leaf)) { Fail 'Evidence publish did not produce a file.' }
+        if (Test-Path -LiteralPath $backup) {
+            Assert-NonReparsePath -Path $backup
+            [System.IO.File]::Delete($backup)
+        }
     } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $temporary) {
+            Assert-NonReparsePath -Path $temporary
+            [System.IO.File]::Delete($temporary)
+        }
     }
 }
 

@@ -1001,12 +1001,12 @@ def test_scope_transaction_is_executable_durable_and_fail_closed_in_linux_docker
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_evidence_writer_rejects_reparse_paths_and_cleans_failed_atomic_temp(
+def test_evidence_writer_replaces_existing_file_atomically_and_rejects_reparse_paths(
     tmp_path: Path,
 ) -> None:
-    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    powershell = shutil.which("powershell.exe")
     if powershell is None:
-        pytest.skip("PowerShell is unavailable")
+        pytest.skip("Windows PowerShell 5 is unavailable")
     source = read(HARNESS)
     start = source.index("function Assert-ContainedRuntimePath")
     end = source.index("function Get-AwsCli")
@@ -1025,14 +1025,26 @@ def test_evidence_writer_rejects_reparse_paths_and_cleans_failed_atomic_temp(
         + source[start:end]
         + "\nWrite-Evidence\n"
         + "if (-not (Test-Path -LiteralPath $EvidencePath -PathType Leaf)) { exit 2 }\n"
+        + "$script:Evidence.status = 'second'\nWrite-Evidence\n"
+        + "$published = Get-Content -LiteralPath $EvidencePath -Raw | ConvertFrom-Json\n"
+        + "if ($published.status -ne 'second') { exit 3 }\n"
+        + "[System.IO.File]::Delete($EvidencePath); $backup = Join-Path (Split-Path -Parent $EvidencePath) '.central-e2e-run-0001.evidence.bak'; [System.IO.File]::WriteAllText($backup, 'interrupted')\n"  # noqa: E501
+        + "$script:Evidence.status = 'recovered'\nWrite-Evidence\n"
+        + "$published = Get-Content -LiteralPath $EvidencePath -Raw | ConvertFrom-Json\n"
+        + "if ($published.status -ne 'recovered') { exit 4 }\n"
+        + "if (Get-ChildItem -LiteralPath $RuntimeRoot -Recurse -Force | Where-Object { $_.Name -like '.central-e2e-run-0001.*.tmp' -or $_.Name -eq '.central-e2e-run-0001.evidence.bak' }) { exit 4 }\n"  # noqa: E501
         + "New-Item -ItemType Directory -Path (Join-Path $RuntimeRoot 'broken') | Out-Null\n"
         + "$EvidencePath = Join-Path $RuntimeRoot 'broken'\n"
-        + "try { Write-Evidence; exit 3 } catch {}\n"
-        + "if (Get-ChildItem -LiteralPath $RuntimeRoot -Recurse -Force -Filter '.central-e2e-run-0001.*.tmp') { exit 4 }\n"  # noqa: E501
+        + "try { Write-Evidence; exit 5 } catch {}\n"
         + f"$link = Join-Path $RuntimeRoot 'link'; New-Item -ItemType SymbolicLink -Path $link -Target '{outside}' | Out-Null\n"  # noqa: E501
         + "$EvidencePath = Join-Path $link 'missing\\evidence.json'\n"
-        + "try { Write-Evidence; exit 5 } catch {}\n"
-        + "if (Test-Path -LiteralPath (Join-Path $outside 'missing')) { exit 6 }\n",
+        + "try { Write-Evidence; exit 6 } catch {}\n"
+        + "if (Test-Path -LiteralPath (Join-Path $outside 'missing')) { exit 7 }\n"
+        + "$outsideEvidence = Join-Path $outside 'outside.evidence.json'; [System.IO.File]::WriteAllText($outsideEvidence, 'outside')\n"  # noqa: E501
+        + "$linkedEvidence = Join-Path $RuntimeRoot 'linked.evidence.json'; New-Item -ItemType SymbolicLink -Path $linkedEvidence -Target $outsideEvidence | Out-Null\n"  # noqa: E501
+        + "$EvidencePath = $linkedEvidence\n"
+        + "try { Write-Evidence; exit 8 } catch {}\n"
+        + "if ([System.IO.File]::ReadAllText($outsideEvidence) -ne 'outside') { exit 9 }\n",
         encoding="utf-8",
     )
     result = subprocess.run(
