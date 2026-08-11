@@ -185,8 +185,38 @@ def test_operator_alerts_and_reaper_failure_capture_are_scoped_and_actionable() 
         'protocol  = "email"' in subscription
         and "endpoint  = var.operator_alert_email" in subscription
     )
-    assert 'identifiers = ["cloudwatch.amazonaws.com"]' in topic_policy
-    assert "aws:SourceAccount" in topic_policy and "aws:SourceArn" in topic_policy
+    owner_match = re.search(
+        r'(?s)statement \{\s+sid\s*=\s*"AllowAccountAdministration"(.*?)\n  \}',
+        topic_policy,
+    )
+    cloudwatch_match = re.search(
+        r'(?s)statement \{\s+sid\s*=\s*"AllowCloudWatchAlarms"(.*?)\n  \}',
+        topic_policy,
+    )
+    assert owner_match is not None and cloudwatch_match is not None
+    owner = owner_match.group(1)
+    cloudwatch = cloudwatch_match.group(1)
+    assert 'actions   = ["sns:*"]' not in topic_policy
+    assert set(re.findall(r'"(sns:[^"]+)"', owner)) == {
+        "sns:GetTopicAttributes",
+        "sns:SetTopicAttributes",
+        "sns:AddPermission",
+        "sns:RemovePermission",
+        "sns:DeleteTopic",
+        "sns:Subscribe",
+        "sns:ListSubscriptionsByTopic",
+        "sns:Publish",
+    }
+    owner_root = (
+        "identifiers = [\"arn:${data.aws_partition.current.partition}:iam::"
+        "${data.aws_caller_identity.current.account_id}:root\"]"
+    )
+    assert owner_root in owner
+    assert "resources = [aws_sns_topic.operator_alerts.arn]" in owner
+    assert 'actions   = ["sns:Publish"]' in cloudwatch
+    assert 'identifiers = ["cloudwatch.amazonaws.com"]' in cloudwatch
+    assert "aws:SourceAccount" in cloudwatch and "aws:SourceArn" in cloudwatch
+    assert "identifiers = [\"*\"]" not in topic_policy
     assert "policy = data.aws_iam_policy_document.operator_alerts.json" in topic_policy_attachment
 
     queue = _terraform_block(reaper, "resource", "aws_sqs_queue", "lab_reaper_failures")

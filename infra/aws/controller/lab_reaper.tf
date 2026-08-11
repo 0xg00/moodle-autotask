@@ -34,9 +34,18 @@ resource "aws_sns_topic" "operator_alerts" {
 
 data "aws_iam_policy_document" "operator_alerts" {
   statement {
-    sid       = "AllowAccountAdministration"
-    effect    = "Allow"
-    actions   = ["sns:*"]
+    sid    = "AllowAccountAdministration"
+    effect = "Allow"
+    actions = [
+      "sns:GetTopicAttributes",
+      "sns:SetTopicAttributes",
+      "sns:AddPermission",
+      "sns:RemovePermission",
+      "sns:DeleteTopic",
+      "sns:Subscribe",
+      "sns:ListSubscriptionsByTopic",
+      "sns:Publish",
+    ]
     resources = [aws_sns_topic.operator_alerts.arn]
 
     principals {
