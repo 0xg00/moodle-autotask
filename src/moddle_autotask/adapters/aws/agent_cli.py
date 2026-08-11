@@ -990,7 +990,7 @@ def _acquire_bundle_publish_lock(
         ):
             raise AgentSpoolError("bundle lock is unsafe")
         if os.name == "nt":
-            import msvcrt
+            msvcrt: Any = __import__("msvcrt")
 
             os.lseek(descriptor, 0, os.SEEK_SET)
             try:
@@ -1020,7 +1020,7 @@ def _acquire_bundle_publish_lock(
 def _release_bundle_publish_lock(descriptor: int) -> None:
     try:
         if os.name == "nt":
-            import msvcrt
+            msvcrt: Any = __import__("msvcrt")
 
             os.lseek(descriptor, 0, os.SEEK_SET)
             msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
