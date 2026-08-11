@@ -63,8 +63,11 @@ def _transported_commands(commands: list[str]) -> list[str]:
         "$bashTransport = 'if [ -z \"${BASH_VERSION:-}\" ]; then exec /bin/bash "
         "\"$0\" \"$@\"; fi'"
     ) in source
-    assert "$parameters = @{ commands = @($bashTransport) + $Commands }" in source
-    return [_BASH_TRANSPORT, *commands]
+    assert "SSM commands must not contain NUL bytes." in source
+    assert '$command.Replace("`r`n", "`n").Replace("`r", "`n")' in source
+    assert "$parameters = @{ commands = @($bashTransport) + $normalizedCommands }" in source
+    normalized = [command.replace("\r\n", "\n").replace("\r", "\n") for command in commands]
+    return [_BASH_TRANSPORT, *normalized]
 
 
 def _activate_payload() -> str:
@@ -126,10 +129,38 @@ def test_ssm_bash_transport_reexecs_once_and_preserves_status_traps_and_argument
     assert lines[1] == "trap-status=23"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX /bin/sh invocation")
+def test_ssm_normalized_heredoc_runs_from_bin_sh(tmp_path: Path) -> None:
+    commands = _transported_commands(
+        [
+            "set -eu",
+            "python3 - <<'PY'\r\n"
+            "print(\"heredoc: Straße and 'quotes'\")\r"
+            "PY\r",
+        ]
+    )
+    assert all("\r" not in command for command in commands)
+    script = tmp_path / "_script.sh"
+    script.write_text("\n".join(commands) + "\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        ["/bin/sh", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "heredoc: Straße and 'quotes'\n"
+
+
 def test_every_controller_ssm_action_uses_the_bash_first_command_contract() -> None:
     source = _DEPLOY.read_text(encoding="utf-8")
     transport = source.index("$bashTransport =")
-    parameters = source.index("$parameters = @{ commands = @($bashTransport) + $Commands }")
+    parameters = source.index(
+        "$parameters = @{ commands = @($bashTransport) + $normalizedCommands }"
+    )
 
     assert transport < parameters
     assert source.count("exec /bin/bash") == 1

@@ -410,7 +410,15 @@ function Send-ControllerCommand {
     # AWS-RunShellScript starts its generated script with /bin/sh. Re-exec the
     # complete script under Bash before any command payload can use Bash syntax.
     $bashTransport = 'if [ -z "${BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi'
-    $parameters = @{ commands = @($bashTransport) + $Commands } | ConvertTo-Json -Compress
+    $normalizedCommands = @(
+        foreach ($command in $Commands) {
+            if ($command.IndexOf([char]0) -ge 0) {
+                throw 'SSM commands must not contain NUL bytes.'
+            }
+            $command.Replace("`r`n", "`n").Replace("`r", "`n")
+        }
+    )
+    $parameters = @{ commands = @($bashTransport) + $normalizedCommands } | ConvertTo-Json -Compress
     $parametersPath = Join-Path $runtimeRoot "ssm-$([Guid]::NewGuid().ToString('N')).json"
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($parametersPath, $parameters, $utf8NoBom)

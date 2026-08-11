@@ -347,6 +347,73 @@ New-SchedulerConfigJson -SelectedCourseShortnames $names -UseAllCourses $false -
     assert "At most 64" in deploy_rejected.stderr
 
 
+@pytest.mark.parametrize(
+    "powershell",
+    [
+        executable
+        for executable in (shutil.which("powershell"), shutil.which("pwsh"))
+        if executable is not None
+    ],
+    ids=lambda executable: Path(executable).stem,
+)
+def test_send_controller_command_normalizes_newlines_before_ssm_serialization(
+    powershell: str,
+) -> None:
+    path = (ROOT / "scripts" / "aws-deploy.ps1").as_posix().replace("'", "''")
+    harness = f"""
+$source = [IO.File]::ReadAllText('{path}')
+$pattern = '(?s)function Send-ControllerCommand \\{{.*?\\r?\\n\\}}\\r?\\n\\r?\\n\\$script:awsCli'
+$match = [regex]::Match($source, $pattern)
+if (-not $match.Success) {{ throw 'could not extract Send-ControllerCommand' }}
+$definition = $match.Value -replace '\\r?\\n\\r?\\n\\$script:awsCli$', ''
+Invoke-Expression $definition
+$runtimeRoot = [IO.Path]::GetTempPath()
+$script:serialized = ''
+function Invoke-Aws {{
+    param([string[]]$Arguments)
+    $parametersIndex = [Array]::IndexOf($Arguments, '--parameters')
+    if ($parametersIndex -lt 0) {{ throw 'missing SSM parameters' }}
+    $parametersPath = ([Uri]$Arguments[$parametersIndex + 1]).LocalPath
+    $script:serialized = [IO.File]::ReadAllText($parametersPath, [Text.Encoding]::UTF8)
+    '12345678-1234-1234-1234-123456789abc'
+}}
+function Wait-SsmCommand {{ param([string]$CommandId, [string]$TargetInstanceId) }}
+$heredoc = [string]::Concat("python3 - <<'PY'", "`r`n", 'print("Straße")', "`r", 'PY', "`r`n")
+Send-ControllerCommand -TargetInstanceId 'i-12345678' -Comment 'newline regression' -Commands @(
+    'set -eu', $heredoc, 'printf ''quoted $value'''
+)
+$nulRejected = $false
+try {{
+    Send-ControllerCommand -TargetInstanceId 'i-12345678' -Comment 'NUL regression' -Commands @(
+        [string]::Concat('invalid', [char]0)
+    )
+}}
+catch {{
+    $nulRejected = $_.Exception.Message -eq 'SSM commands must not contain NUL bytes.'
+}}
+if (-not $nulRejected) {{ throw 'NUL command was not rejected' }}
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::Write($script:serialized)
+"""
+    rendered = subprocess.run(
+        [powershell, "-NoProfile", "-Command", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    payload = json.loads(rendered.stdout)
+
+    assert payload["commands"] == [
+        'if [ -z "${BASH_VERSION:-}" ]; then exec /bin/bash "$0" "$@"; fi',
+        "set -eu",
+        "python3 - <<'PY'\nprint(\"Straße\")\nPY\n",
+        "printf 'quoted $value'",
+    ]
+    assert all("\r" not in command for command in payload["commands"])
+
+
 def test_state_and_artifact_storage_are_private_and_encrypted() -> None:
     bootstrap = (AWS_ROOT / "bootstrap" / "main.tf").read_text(encoding="utf-8")
     storage = (AWS_ROOT / "controller" / "storage.tf").read_text(encoding="utf-8")
