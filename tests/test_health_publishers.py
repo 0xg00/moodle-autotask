@@ -108,7 +108,16 @@ class _PublisherHarness:
             'if [ "$command" = show ]; then unit="$1"; else unit="${@: -1}"; fi\n'
             'mapfile -t fields <"$FAKE_SYSTEMCTL_DIR/$unit"\n'
             'case "$command" in\n'
-            '  show) printf \'%s\\n\' "${fields[1]}" "${fields[2]}" "${fields[3]}" ;;\n'
+            '  show)\n'
+            '    if [[ " $* " = *" --value "* ]]; then\n'
+            '      printf \'%s\\n\' "${fields[1]}" "${fields[2]}" "${fields[3]}"\n'
+            '    elif [ "${#fields[@]}" -gt 4 ]; then\n'
+            '      printf \'%s\\n\' "${fields[@]:4}"\n'
+            '    else\n'
+            '      printf \'NRestarts=%s\\nActiveState=%s\\nSubState=%s\\n\' "${fields[3]}" \\\n'
+            '        "${fields[1]}" "${fields[2]}"\n'
+            '    fi\n'
+            '    ;;\n'
             '  is-enabled) [ "${fields[0]}" = enabled ] ;;\n'
             '  is-active) [ "${fields[1]}" = active ] ;;\n'
             "  *) exit 64 ;;\nesac\n",
@@ -153,14 +162,18 @@ class _PublisherHarness:
         active: bool = False,
         restarts: int = 0,
         partial_active: str | None = None,
+        show_lines: tuple[str, ...] | None = None,
     ) -> None:
         for service in _SERVICES:
             service_active = active or service == partial_active
             state = "active" if service_active else "inactive"
             substate = "running" if service_active else "dead"
             enabled_state = "enabled" if enabled else "disabled"
+            content = f"{enabled_state}\n{state}\n{substate}\n{restarts}\n"
+            if show_lines is not None:
+                content += "\n".join(show_lines) + "\n"
             (self.systemctl / f"moodle-autotask-{service}.service").write_text(
-                f"{enabled_state}\n{state}\n{substate}\n{restarts}\n", encoding="utf-8"
+                content, encoding="utf-8"
             )
 
     def precreate_pulses(self, now: int, *, stale_service: str | None = None) -> None:
@@ -312,6 +325,63 @@ def test_generated_expected_active_fresh_stable_restarts_are_healthy(tmp_path: P
     assert first.returncode == second.returncode == 0
     _assert_metric_batch(harness, aggregate=1, expected=1)
     assert [metric["Value"] for metric in harness.metrics()[:4]] == [1, 1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "show_lines",
+    (
+        ("NRestarts=0", "ActiveState=active", "SubState=running"),
+        ("SubState=running", "ActiveState=active", "NRestarts=0"),
+        ("ActiveState=active", "NRestarts=0", "SubState=running"),
+    ),
+)
+def test_generated_named_systemctl_properties_are_order_independent_and_store_restarts(
+    tmp_path: Path, show_lines: tuple[str, ...]
+) -> None:
+    harness = _PublisherHarness(tmp_path)
+    harness.precreate_pulses(10_000)
+    harness.enable_expected()
+    harness.set_services(enabled=True, active=True, show_lines=show_lines)
+
+    result = harness.run(harness.generated_source())
+
+    assert result.returncode == 0, result.stderr
+    _assert_metric_batch(harness, aggregate=1, expected=1)
+    assert [metric["Value"] for metric in harness.metrics()[:4]] == [1, 1, 1, 1]
+    for service in _SERVICES:
+        restart_count, changed = (harness.state / service).read_text(encoding="utf-8").split()
+        assert restart_count == "0" and restart_count != "running"
+        assert restart_count.isdecimal() and changed.isdecimal()
+
+
+@pytest.mark.parametrize(
+    "show_lines",
+    (
+        ("NRestarts=0", "ActiveState=active"),
+        ("NRestarts=0", "ActiveState=active", "ActiveState=active", "SubState=running"),
+        ("NRestarts=0", "ActiveState=active", "SubState=running", "Unexpected=value"),
+        ("NRestarts=running", "ActiveState=active", "SubState=running"),
+        ("NRestarts=0", "ActiveState=", "SubState=running"),
+    ),
+)
+def test_generated_named_systemctl_properties_fail_closed_when_malformed(
+    tmp_path: Path, show_lines: tuple[str, ...]
+) -> None:
+    harness = _PublisherHarness(tmp_path)
+    harness.precreate_pulses(10_000)
+    harness.enable_expected()
+    harness.set_services(enabled=True, active=True, show_lines=show_lines)
+
+    result = harness.run(harness.generated_source())
+
+    assert result.returncode == 0, result.stderr
+    _assert_metric_batch(harness, aggregate=0, expected=1)
+    assert [metric["Value"] for metric in harness.metrics()[:4]] == [0, 0, 0, 0]
+    for service in _SERVICES:
+        state_file = harness.state / service
+        if state_file.exists():
+            restart_count, changed = state_file.read_text(encoding="utf-8").split()
+            assert restart_count.isdecimal() and changed.isdecimal()
 
 
 @pytest.mark.parametrize("stale_service", _SERVICES)

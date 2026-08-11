@@ -496,27 +496,49 @@ for index in "${{!services[@]}}"; do
   test -n "$gid"; test ! -L "$pulse"
   metadata="$(stat -c '%F:%u:%g:%a:%s:%Y' "$pulse" 2>/dev/null || true)"; mtime="${{metadata##*:}}"
   [[ "$metadata" = regular\\ empty\\ file:0:$gid:620:0:* && "$mtime" =~ ^[0-9]+$ ]] || healthy=0
-  mapfile -t details < <(systemctl show "$unit" --property=ActiveState \\
-    --property=SubState --property=NRestarts --value 2>/dev/null || true)
-  restarts="${{details[2]:-invalid}}"
+  active_state=""; sub_state=""; restarts=""
+  active_seen=false; sub_seen=false; restarts_seen=false
+  details="$(systemctl show "$unit" --property=ActiveState --property=SubState \\
+    --property=NRestarts 2>/dev/null || true)"
+  while IFS= read -r detail || [ -n "$detail" ]; do
+    case "$detail" in
+      ActiveState=*)
+        [ "$active_seen" = false ] || healthy=0
+        active_state="${{detail#ActiveState=}}"; active_seen=true
+        ;;
+      SubState=*)
+        [ "$sub_seen" = false ] || healthy=0
+        sub_state="${{detail#SubState=}}"; sub_seen=true
+        ;;
+      NRestarts=*)
+        [ "$restarts_seen" = false ] || healthy=0
+        restarts="${{detail#NRestarts=}}"; restarts_seen=true
+        ;;
+      *) healthy=0 ;;
+    esac
+  done <<<"$details"
+  [ "$active_seen" = true ] && [ "$sub_seen" = true ] && [ "$restarts_seen" = true ] || healthy=0
+  [[ "$active_state" =~ ^[a-z]+$ && "$sub_state" =~ ^[a-z-]+$ \\
+    && "$restarts" =~ ^[0-9]+$ ]] || healthy=0
   if [ "$expected" -eq 1 ]; then
-    systemctl is-enabled --quiet "$unit" && [ "${{details[0]:-}}" = active ] \\
-      && [ "${{details[1]:-}}" = running ] || healthy=0
+    systemctl is-enabled --quiet "$unit" && [ "$active_state" = active ] \\
+      && [ "$sub_state" = running ] || healthy=0
     [ $((now-mtime)) -le "$threshold" ] 2>/dev/null || healthy=0
-    [[ "$restarts" =~ ^[0-9]+$ ]] || healthy=0
-    restart_file="$state/$service"; changed=$((now-300))
-    if [ -e "$restart_file" ] || [ -L "$restart_file" ]; then
-      test -f "$restart_file" && test ! -L "$restart_file" \\
-        && test "$(stat -c '%u:%a' "$restart_file")" = '0:600'
-      read -r prior changed <"$restart_file" || healthy=0
-      [[ "$prior" =~ ^[0-9]+$ && "$changed" =~ ^[0-9]+$ ]] || healthy=0
-      [ "$prior" = "$restarts" ] || changed="$now"
+    if [[ "$restarts" =~ ^[0-9]+$ ]]; then
+      restart_file="$state/$service"; changed=$((now-300))
+      if [ -e "$restart_file" ] || [ -L "$restart_file" ]; then
+        test -f "$restart_file" && test ! -L "$restart_file" \\
+          && test "$(stat -c '%u:%a' "$restart_file")" = '0:600'
+        read -r prior changed <"$restart_file" || healthy=0
+        [[ "$prior" =~ ^[0-9]+$ && "$changed" =~ ^[0-9]+$ ]] || healthy=0
+        [ "$prior" = "$restarts" ] || changed="$now"
+      fi
+      temporary="$(mktemp "$state/.$service.XXXXXX")"
+      printf '%s %s\\n' "$restarts" "$changed" >"$temporary"
+      chmod 0600 "$temporary"; chown root:root "$temporary"
+      mv -f "$temporary" "$restart_file"
+      [ $((now-changed)) -ge 300 ] || healthy=0
     fi
-    temporary="$(mktemp "$state/.$service.XXXXXX")"
-    printf '%s %s\\n' "$restarts" "$changed" >"$temporary"
-    chmod 0600 "$temporary"; chown root:root "$temporary"
-    mv -f "$temporary" "$restart_file"
-    [ $((now-changed)) -ge 300 ] || healthy=0
   else
     ! systemctl is-enabled --quiet "$unit" && ! systemctl is-active --quiet "$unit" || healthy=0
   fi

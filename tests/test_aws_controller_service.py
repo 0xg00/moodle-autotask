@@ -70,6 +70,8 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "ServicesExpectedRunning" in health_text
     assert "ServiceStateMatchesExpectation" in health_text
     assert "NRestarts" in health_text and "moodle-autotask-health" in health_text
+    assert "ActiveState=*)" in health_text and "SubState=*)" in health_text
+    assert "--property=NRestarts --value" not in health_text
     assert "ExecStartPre=/usr/local/sbin/moodle-autotask-health-prepare" in (
         health_unit.read_text(encoding="utf-8")
     )
