@@ -293,7 +293,7 @@ def _process_claim(
         if not state.retry_work(claim, "lab_failed", _retry_delay(item.attempts), now=now):
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("retry", item.selected_mode)
-    if not state.retry_work(claim, "lab_pending", 30, now=now):
+    if not state.retry_work(claim, "lab_pending", 30, now=now, exhaustible=False):
         return WorkerCycle("ownership_lost", item.selected_mode)
     return WorkerCycle("lab_pending", item.selected_mode)
 

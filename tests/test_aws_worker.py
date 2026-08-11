@@ -774,6 +774,56 @@ def test_lab_work_provisions_once_then_waits_for_ssm(tmp_path: Path) -> None:
     assert provider.teardowns == [(LabHandle("lab:test"), "cleanup-" + item.provision_key)]
 
 
+def test_lab_readiness_pending_retries_without_exhaustion_then_becomes_ready(
+    tmp_path: Path,
+) -> None:
+    state, task_key, revision = _approved(tmp_path, lab=True)
+    provider = _Provider()
+    transfer = _Transfer()
+
+    assert process_one(state, provider, owner="worker", now=10).result == "lab_provisioned"
+    for attempt in range(25):
+        assert (
+            process_one(state, provider, owner="worker", now=41 + attempt * 31).result
+            == "lab_pending"
+        )
+    waiting = state.work_status(task_key, revision)
+    assert waiting is not None and waiting.status == "lab_pending" and waiting.attempts == 26
+    assert len(provider.provisions) == 1
+
+    provider.readiness_value = LabReadiness.READY
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            guest_input_transfer=transfer,
+            now=817,
+        ).result
+        == "lab_ready"
+    )
+    ready = state.work_status(task_key, revision)
+    assert ready is not None and ready.status == "ready" and len(provider.provisions) == 1
+
+
+def test_failed_lab_readiness_remains_exhaustible(tmp_path: Path) -> None:
+    state, task_key, revision = _approved(tmp_path, lab=True)
+    provider = _Provider(readiness_value=LabReadiness.FAILED)
+
+    assert process_one(state, provider, owner="worker", now=10).result == "lab_provisioned"
+    for attempt in range(20):
+        cycle = process_one(state, provider, owner="worker", now=4_000 + attempt * 3_601)
+        failed = state.work_status(task_key, revision)
+        if failed is not None and failed.status == "failed":
+            break
+        assert cycle.result == "retry"
+    else:
+        raise AssertionError("failed lab readiness did not exhaust retries")
+    assert failed is not None and failed.status == "failed" and failed.error_code == "lab_failed"
+    assert len(provider.provisions) == 1
+
+
 @pytest.mark.parametrize("mode", (ExecutionMode.HYBRID, ExecutionMode.IN_GUEST))
 def test_noncentral_ready_without_transfer_retries_before_broker_dispatch(
     tmp_path: Path, mode: ExecutionMode, monkeypatch: pytest.MonkeyPatch
