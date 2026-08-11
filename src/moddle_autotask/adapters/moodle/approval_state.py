@@ -1,4 +1,5 @@
 """Durable human decisions for exact Moodle notification revisions."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -26,6 +27,13 @@ class ApprovalStateError(RuntimeError):
 class ApprovalButtons:
     approve: str
     ignore: str
+    details: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionButtons:
+    submit: str
+    decline: str
     details: str
 
 
@@ -62,8 +70,51 @@ class ExecutionNotification:
     report_markdown: str
 
 
+@dataclass(frozen=True, slots=True)
+class SubmissionManifest:
+    event: NotificationEvent
+    manifest_digest: str
+    filename: str
+    report_markdown: str
+    report_digest: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "artifacts": [
+                {
+                    "filename": self.filename,
+                    "sha256": self.report_digest,
+                    "sizeBytes": len(self.report_markdown.encode("utf-8")),
+                }
+            ],
+            "assignmentId": self.event.assignment_id,
+            "submissionDrafts": self.event.submission_drafts,
+            "requireSubmissionStatement": self.event.requires_submission_statement,
+            "manifestDigest": self.manifest_digest,
+            "reportDigest": self.report_digest,
+            "reportMarkdown": self.report_markdown,
+            "revisionDigest": self.event.revision_digest,
+            "taskKey": self.event.task_key,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionClaim:
+    manifest: SubmissionManifest
+    lease_token: str
+    phase: str
+    draft_item_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionNotification:
+    manifest: SubmissionManifest
+    status: str
+    reference: str | None
+
+
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32}$")
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "4"
 _METADATA_SQL = "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 _REQUESTS_SQL = (
     "CREATE TABLE requests ("
@@ -122,6 +173,32 @@ _WORK_CLAIMABLE_INDEX_SQL = (
 _OUTBOX_PENDING_INDEX_SQL = (
     "CREATE INDEX execution_outbox_pending_idx ON execution_outbox(delivered_at, created_at)"
 )
+_SUBMISSIONS_SQL = (
+    "CREATE TABLE submissions (event_id TEXT PRIMARY KEY NOT NULL, manifest_digest TEXT NOT NULL, "
+    "payload TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN "
+    "('awaiting_approval','approved','declined','uploading','saving','submitted','failed')), "
+    "decided_by INTEGER, decided_at INTEGER, lease_token TEXT, lease_expires_at INTEGER, "
+    "draft_item_id INTEGER, receipt_reference TEXT, error_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, "
+    "FOREIGN KEY(event_id) REFERENCES requests(event_id), "
+    "CHECK ((lease_token IS NULL AND lease_expires_at IS NULL) OR "
+    "(lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)), "
+    "CHECK ((status IN ('uploading','saving')) = (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)), "
+    "CHECK (status != 'saving' OR draft_item_id IS NOT NULL), "
+    "CHECK (draft_item_id IS NULL OR draft_item_id > 0))"
+)
+_SUBMISSION_CALLBACKS_SQL = (
+    "CREATE TABLE submission_callbacks (token TEXT PRIMARY KEY NOT NULL, event_id TEXT NOT NULL, "
+    "action TEXT NOT NULL CHECK (action IN ('submit','decline','details')), "
+    "UNIQUE(event_id, action), FOREIGN KEY(event_id) REFERENCES submissions(event_id))"
+)
+_SUBMISSION_OUTBOX_SQL = (
+    "CREATE TABLE submission_outbox (event_id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, "
+    "delivered_at INTEGER, created_at INTEGER NOT NULL, FOREIGN KEY(event_id) REFERENCES submissions(event_id), "
+    "CHECK (delivered_at IS NULL OR delivered_at >= created_at))"
+)
+_SUBMISSION_OUTBOX_PENDING_INDEX_SQL = (
+    "CREATE INDEX submission_outbox_pending_idx ON submission_outbox(delivered_at, created_at)"
+)
 _LEASE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _MAX_WORK_ATTEMPTS = 20
@@ -164,6 +241,7 @@ class ApprovalState:
                     connection.execute(_WORK_CLAIMABLE_INDEX_SQL)
                     connection.execute(_OUTBOX_SQL)
                     connection.execute(_OUTBOX_PENDING_INDEX_SQL)
+                    _create_submission_schema(connection)
                     connection.execute(
                         "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
                         (_SCHEMA_VERSION,),
@@ -182,6 +260,7 @@ class ApprovalState:
                         connection.execute(_WORK_CLAIMABLE_INDEX_SQL)
                         connection.execute(_OUTBOX_SQL)
                         connection.execute(_OUTBOX_PENDING_INDEX_SQL)
+                        _create_submission_schema(connection)
                         connection.execute(
                             "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                             (_SCHEMA_VERSION,),
@@ -210,6 +289,15 @@ class ApprovalState:
                         connection.execute(_WORK_CLAIMABLE_INDEX_SQL)
                         connection.execute(_OUTBOX_SQL)
                         connection.execute(_OUTBOX_PENDING_INDEX_SQL)
+                        _create_submission_schema(connection)
+                        connection.execute(
+                            "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                            (_SCHEMA_VERSION,),
+                        )
+                    elif version == ("3",):
+                        if not _valid_schema(connection, "3"):
+                            raise ApprovalStateError("approval state schema is corrupt")
+                        _create_submission_schema(connection)
                         connection.execute(
                             "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                             (_SCHEMA_VERSION,),
@@ -643,6 +731,262 @@ class ApprovalState:
         except sqlite3.Error as error:
             raise ApprovalStateError("could not record execution notification") from error
 
+    def prepare_submission(
+        self,
+        event: NotificationEvent,
+        summary: str,
+        report_markdown: str,
+        now: int | None = None,
+    ) -> tuple[SubmissionManifest, SubmissionButtons]:
+        if not isinstance(event, NotificationEvent) or event.assignment_id is None:
+            raise ApprovalStateError("submission manifest has no exact assignment identity")
+        if event.submission_drafts or event.requires_submission_statement:
+            raise ApprovalStateError("submission policy is not supported")
+        if not isinstance(summary, str) or not isinstance(report_markdown, str):
+            raise ApprovalStateError("submission manifest is invalid")
+        manifest = _submission_manifest(event, report_markdown)
+        payload = json.dumps(
+            manifest.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        moment = _now(now)
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT manifest_digest, payload FROM submissions WHERE event_id = ?",
+                    (event.event_id,),
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO submissions(event_id, manifest_digest, payload, status, created_at, updated_at) "
+                        "VALUES (?, ?, ?, 'awaiting_approval', ?, ?)",
+                        (event.event_id, manifest.manifest_digest, payload, moment, moment),
+                    )
+                    for action in ("submit", "decline", "details"):
+                        connection.execute(
+                            "INSERT INTO submission_callbacks(token, event_id, action) VALUES (?, ?, ?)",
+                            (_new_token(), event.event_id, action),
+                        )
+                elif row != (manifest.manifest_digest, payload):
+                    raise ApprovalStateError("stored submission manifest conflicts")
+                tokens = dict(
+                    connection.execute(
+                        "SELECT action, token FROM submission_callbacks WHERE event_id = ?",
+                        (event.event_id,),
+                    ).fetchall()
+                )
+                if set(tokens) != {"submit", "decline", "details"} or any(
+                    not isinstance(token, str) or not _TOKEN.fullmatch(token)
+                    for token in tokens.values()
+                ):
+                    raise ApprovalStateError("stored submission callbacks are corrupt")
+                connection.execute("COMMIT")
+                return manifest, SubmissionButtons(
+                    tokens["submit"], tokens["decline"], tokens["details"]
+                )
+        except ApprovalStateError:
+            raise
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not prepare submission approval") from error
+
+    def resolve_submission(
+        self, token: str, user_id: int, allowed_user_id: int, now: int | None = None
+    ) -> tuple[str, str, SubmissionManifest]:
+        if not isinstance(token, str) or not _TOKEN.fullmatch(token):
+            raise ApprovalStateError("submission callback is invalid")
+        _positive_id(user_id, "user")
+        _positive_id(allowed_user_id, "allowed user")
+        if user_id != allowed_user_id:
+            raise ApprovalStateError("submission callback is unauthorized")
+        moment = _now(now)
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT c.action, s.payload, s.manifest_digest, s.status, r.payload "
+                    "FROM submission_callbacks c JOIN submissions s ON s.event_id = c.event_id "
+                    "JOIN requests r ON r.event_id = s.event_id WHERE c.token = ?",
+                    (token,),
+                ).fetchone()
+                if row is None:
+                    raise ApprovalStateError("submission callback is unknown")
+                action, payload, digest, status, event_payload = row
+                manifest = _manifest_from_json(
+                    str(payload), str(digest), _event_from_json(str(event_payload))
+                )
+                if action == "details":
+                    result = "details"
+                else:
+                    requested = "approved" if action == "submit" else "declined"
+                    if status == "awaiting_approval":
+                        updated = connection.execute(
+                            "UPDATE submissions SET status = ?, decided_by = ?, decided_at = ?, updated_at = ? "
+                            "WHERE event_id = ? AND status = 'awaiting_approval'",
+                            (requested, user_id, moment, moment, manifest.event.event_id),
+                        ).rowcount
+                        if updated != 1:
+                            raise ApprovalStateError("could not apply submission callback")
+                        result = requested
+                    elif status == requested:
+                        result = f"already_{requested}"
+                    else:
+                        result = "conflict"
+                connection.execute("COMMIT")
+                return str(action), result, manifest
+        except ApprovalStateError:
+            raise
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not apply submission callback") from error
+
+    def claim_submission(
+        self, owner: str, lease_seconds: int, now: int | None = None
+    ) -> SubmissionClaim | None:
+        if not isinstance(owner, str) or not owner or len(owner) > 128:
+            raise ApprovalStateError("submission lease owner is invalid")
+        if not isinstance(lease_seconds, int) or not 6 <= lease_seconds <= 3600:
+            raise ApprovalStateError("submission lease duration is invalid")
+        moment = _now(now)
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                # An upload whose item id was never recorded cannot have reached the
+                # assignment, so it is safe to offer it again.  A saved draft might
+                # have reached Moodle: claim it solely for remote verification.
+                connection.execute(
+                    "UPDATE submissions SET status = 'approved', lease_token = NULL, "
+                    "lease_expires_at = NULL, updated_at = ? WHERE status = 'uploading' "
+                    "AND lease_expires_at <= ?",
+                    (moment, moment),
+                )
+                stale = connection.execute(
+                    "SELECT s.event_id, s.payload, s.manifest_digest, r.payload FROM submissions s "
+                    "JOIN requests r ON r.event_id = s.event_id WHERE s.status = 'saving' "
+                    "AND s.lease_expires_at <= ?",
+                    (moment,),
+                ).fetchall()
+                for _event_id, payload, digest, event_payload in stale:
+                    _manifest_from_json(
+                        str(payload), str(digest), _event_from_json(str(event_payload))
+                    )
+                row = connection.execute(
+                    "SELECT s.payload, s.manifest_digest, s.status, s.draft_item_id, r.payload "
+                    "FROM submissions s JOIN requests r ON r.event_id = s.event_id "
+                    "WHERE s.status = 'approved' OR (s.status = 'saving' AND s.lease_expires_at <= ?) "
+                    "ORDER BY CASE s.status WHEN 'saving' THEN 0 ELSE 1 END, s.created_at, s.event_id LIMIT 1",
+                    (moment,),
+                ).fetchone()
+                if row is None:
+                    connection.execute("COMMIT")
+                    return None
+                manifest = _manifest_from_json(
+                    str(row[0]), str(row[1]), _event_from_json(str(row[4]))
+                )
+                phase = str(row[2])
+                draft_item_id = row[3]
+                if phase == "saving" and (not isinstance(draft_item_id, int) or draft_item_id <= 0):
+                    raise ApprovalStateError("stored submission attempt is corrupt")
+                token = secrets.token_urlsafe(32)
+                if not _LEASE_TOKEN.fullmatch(token):
+                    raise ApprovalStateError("could not create submission lease")
+                updated = connection.execute(
+                    "UPDATE submissions SET status = CASE WHEN status = 'approved' THEN 'uploading' ELSE status END, "
+                    "lease_token = ?, lease_expires_at = ?, updated_at = ? WHERE event_id = ? "
+                    "AND (status = 'approved' OR (status = 'saving' AND lease_expires_at <= ?))",
+                    (token, moment + lease_seconds, moment, manifest.event.event_id, moment),
+                ).rowcount
+                if updated != 1:
+                    raise ApprovalStateError("could not acquire submission lease")
+                connection.execute("COMMIT")
+                return SubmissionClaim(
+                    manifest, token, "saving" if phase == "saving" else "uploading", draft_item_id
+                )
+        except ApprovalStateError:
+            raise
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not claim approved submission") from error
+
+    def complete_submission(
+        self, claim: SubmissionClaim, reference: str, now: int | None = None
+    ) -> bool:
+        return self._finish_submission(claim, "submitted", reference, None, now)
+
+    def record_submission_draft(
+        self, claim: SubmissionClaim, item_id: int, now: int | None = None
+    ) -> SubmissionClaim | None:
+        if (
+            not isinstance(claim, SubmissionClaim)
+            or claim.phase != "uploading"
+            or not _LEASE_TOKEN.fullmatch(claim.lease_token)
+            or not isinstance(item_id, int)
+            or isinstance(item_id, bool)
+            or item_id <= 0
+        ):
+            raise ApprovalStateError("submission draft is invalid")
+        moment = _now(now)
+        try:
+            with self._connect() as connection:
+                updated = connection.execute(
+                    "UPDATE submissions SET status = 'saving', draft_item_id = ?, updated_at = ? "
+                    "WHERE event_id = ? AND status = 'uploading' AND lease_token = ? "
+                    "AND lease_expires_at > ?",
+                    (item_id, moment, claim.manifest.event.event_id, claim.lease_token, moment),
+                ).rowcount
+                if updated != 1:
+                    return None
+                return SubmissionClaim(claim.manifest, claim.lease_token, "saving", item_id)
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not persist submission draft") from error
+
+    def fail_submission(
+        self, claim: SubmissionClaim, error_code: str, now: int | None = None
+    ) -> bool:
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) is None:
+            raise ApprovalStateError("submission error code is invalid")
+        return self._finish_submission(claim, "failed", None, error_code, now)
+
+    def pending_submission_notification(self) -> SubmissionNotification | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT s.payload, s.manifest_digest, o.payload, r.payload FROM submission_outbox o "
+                    "JOIN submissions s ON s.event_id = o.event_id "
+                    "JOIN requests r ON r.event_id = s.event_id WHERE o.delivered_at IS NULL "
+                    "ORDER BY o.created_at, o.event_id LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    return None
+                manifest = _manifest_from_json(
+                    str(row[0]), str(row[1]), _event_from_json(str(row[3]))
+                )
+                payload = json.loads(str(row[2]))
+                if not isinstance(payload, dict) or set(payload) != {"reference", "status"}:
+                    raise ApprovalStateError("stored submission completion is corrupt")
+                status, reference = payload["status"], payload["reference"]
+                if status not in {"submitted", "failed"} or (
+                    reference is not None and not isinstance(reference, str)
+                ):
+                    raise ApprovalStateError("stored submission completion is corrupt")
+                return SubmissionNotification(manifest, status, reference)
+        except (ValueError, sqlite3.Error) as error:
+            raise ApprovalStateError("could not read submission completion") from error
+
+    def mark_submission_notification_delivered(
+        self, notification: SubmissionNotification, now: int | None = None
+    ) -> bool:
+        if not isinstance(notification, SubmissionNotification):
+            raise ApprovalStateError("submission completion is invalid")
+        try:
+            with self._connect() as connection:
+                return bool(
+                    connection.execute(
+                        "UPDATE submission_outbox SET delivered_at = ? WHERE event_id = ? "
+                        "AND delivered_at IS NULL",
+                        (_now(now), notification.manifest.event.event_id),
+                    ).rowcount
+                )
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not record submission notification") from error
+
     def fail_execution(self, claim: WorkClaim, error_code: str, now: int | None = None) -> bool:
         if claim.item.status != "ready" or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code):
             raise ApprovalStateError("work claim cannot fail execution")
@@ -755,12 +1099,182 @@ class ApprovalState:
         except sqlite3.Error as error:
             raise ApprovalStateError(f"could not {action}") from error
 
+    def _finish_submission(
+        self,
+        claim: SubmissionClaim,
+        status: str,
+        reference: str | None,
+        error_code: str | None,
+        now: int | None,
+    ) -> bool:
+        if (
+            not isinstance(claim, SubmissionClaim)
+            or not _LEASE_TOKEN.fullmatch(claim.lease_token)
+            or status not in {"submitted", "failed"}
+            or (status == "submitted" and (not isinstance(reference, str) or not reference))
+        ):
+            raise ApprovalStateError("submission completion is invalid")
+        moment = _now(now)
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                updated = connection.execute(
+                    "UPDATE submissions SET status = ?, lease_token = NULL, lease_expires_at = NULL, "
+                    "receipt_reference = ?, error_code = ?, updated_at = ? WHERE event_id = ? "
+                    "AND status IN ('uploading','saving') AND lease_token = ? AND lease_expires_at > ?",
+                    (
+                        status,
+                        reference,
+                        error_code,
+                        moment,
+                        claim.manifest.event.event_id,
+                        claim.lease_token,
+                        moment,
+                    ),
+                ).rowcount
+                if updated:
+                    _enqueue_submission_notification(
+                        connection, claim.manifest, status, reference, moment
+                    )
+                connection.execute("COMMIT")
+                return bool(updated)
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not persist submission completion") from error
+
 
 def _new_token() -> str:
     token = secrets.token_urlsafe(24)
     if not _TOKEN.fullmatch(token):
         raise ApprovalStateError("could not create approval callback")
     return token
+
+
+def _submission_manifest(event: NotificationEvent, report_markdown: str) -> SubmissionManifest:
+    if event.assignment_id is None:
+        raise ApprovalStateError("submission manifest has no exact assignment identity")
+    encoded = report_markdown.encode("utf-8")
+    if not encoded or len(encoded) > 2 * 1024 * 1024:
+        raise ApprovalStateError("submission report is invalid")
+    report_digest = sha256(encoded).hexdigest()
+    filename = f"autotask-{event.revision_digest.removeprefix('moodle-assignment-v1:')[:16]}.md"
+    candidate = {
+        "artifacts": [{"filename": filename, "sha256": report_digest, "sizeBytes": len(encoded)}],
+        "assignmentId": event.assignment_id,
+        "submissionDrafts": event.submission_drafts,
+        "requireSubmissionStatement": event.requires_submission_statement,
+        "reportDigest": report_digest,
+        "reportMarkdown": report_markdown,
+        "revisionDigest": event.revision_digest,
+        "taskKey": event.task_key,
+    }
+    digest = sha256(
+        json.dumps(candidate, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return SubmissionManifest(event, digest, filename, report_markdown, report_digest)
+
+
+def _manifest_from_json(payload: str, digest: str, event: NotificationEvent) -> SubmissionManifest:
+    try:
+        raw = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ApprovalStateError("stored submission manifest is corrupt") from error
+    if not isinstance(raw, dict) or set(raw) != {
+        "artifacts",
+        "assignmentId",
+        "submissionDrafts",
+        "requireSubmissionStatement",
+        "manifestDigest",
+        "reportDigest",
+        "reportMarkdown",
+        "revisionDigest",
+        "taskKey",
+    }:
+        raise ApprovalStateError("stored submission manifest is corrupt")
+    assignment_id = raw["assignmentId"]
+    submission_drafts = raw["submissionDrafts"]
+    requires_submission_statement = raw["requireSubmissionStatement"]
+    artifacts = raw["artifacts"]
+    report = raw["reportMarkdown"]
+    report_digest = raw["reportDigest"]
+    if (
+        not isinstance(assignment_id, int)
+        or isinstance(assignment_id, bool)
+        or assignment_id <= 0
+        or not isinstance(submission_drafts, bool)
+        or not isinstance(requires_submission_statement, bool)
+        or not isinstance(artifacts, list)
+        or len(artifacts) != 1
+        or not isinstance(artifacts[0], dict)
+        or set(artifacts[0]) != {"filename", "sha256", "sizeBytes"}
+        or not isinstance(report, str)
+        or not isinstance(report_digest, str)
+        or not _DIGEST.fullmatch(report_digest)
+    ):
+        raise ApprovalStateError("stored submission manifest is corrupt")
+    if (
+        not isinstance(event, NotificationEvent)
+        or event.assignment_id != assignment_id
+        or event.submission_drafts != submission_drafts
+        or event.requires_submission_statement != requires_submission_statement
+        or event.task_key != raw["taskKey"]
+        or event.revision_digest != raw["revisionDigest"]
+    ):
+        raise ApprovalStateError("stored submission manifest is corrupt")
+    expected_report = sha256(report.encode("utf-8")).hexdigest()
+    if expected_report != report_digest:
+        raise ApprovalStateError("stored submission manifest is corrupt")
+    candidate = {
+        "artifacts": artifacts,
+        "assignmentId": assignment_id,
+        "submissionDrafts": submission_drafts,
+        "requireSubmissionStatement": requires_submission_statement,
+        "reportDigest": report_digest,
+        "reportMarkdown": report,
+        "revisionDigest": event.revision_digest,
+        "taskKey": event.task_key,
+    }
+    expected_manifest = sha256(
+        json.dumps(candidate, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if raw["manifestDigest"] != digest or digest != expected_manifest:
+        raise ApprovalStateError("stored submission manifest is corrupt")
+    filename = artifacts[0]["filename"]
+    size = artifacts[0]["sizeBytes"]
+    if (
+        not isinstance(filename, str)
+        or filename
+        != f"autotask-{event.revision_digest.removeprefix('moodle-assignment-v1:')[:16]}.md"
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size != len(report.encode("utf-8"))
+        or artifacts[0]["sha256"] != report_digest
+    ):
+        raise ApprovalStateError("stored submission manifest is corrupt")
+    return SubmissionManifest(event, digest, filename, report, report_digest)
+
+
+def _enqueue_submission_notification(
+    connection: sqlite3.Connection,
+    manifest: SubmissionManifest,
+    status: str,
+    reference: str | None,
+    moment: int,
+) -> None:
+    payload = json.dumps(
+        {"reference": reference, "status": status},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO submission_outbox(event_id, payload, delivered_at, created_at) "
+        "VALUES (?, ?, NULL, ?)",
+        (manifest.event.event_id, payload, moment),
+    )
 
 
 def _now(value: int | None) -> int:
@@ -773,6 +1287,13 @@ def _now(value: int | None) -> int:
 def _positive_id(value: int, name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value < 2**63:
         raise ApprovalStateError(f"Telegram {name} identity is invalid")
+
+
+def _create_submission_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(_SUBMISSIONS_SQL)
+    connection.execute(_SUBMISSION_CALLBACKS_SQL)
+    connection.execute(_SUBMISSION_OUTBOX_SQL)
+    connection.execute(_SUBMISSION_OUTBOX_PENDING_INDEX_SQL)
 
 
 def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
@@ -790,7 +1311,7 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
         ("index", "sqlite_autoindex_callbacks_1", "callbacks", None),
         ("index", "sqlite_autoindex_callbacks_2", "callbacks", None),
     }
-    if version in {"2", _SCHEMA_VERSION}:
+    if version in {"2", "3", _SCHEMA_VERSION}:
         expected.update(
             {
                 (
@@ -809,7 +1330,7 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
                 ),
             }
         )
-    if version == _SCHEMA_VERSION:
+    if version in {"3", _SCHEMA_VERSION}:
         expected.update(
             {
                 ("table", "execution_outbox", "execution_outbox", _OUTBOX_SQL),
@@ -819,6 +1340,44 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
                     "execution_outbox_pending_idx",
                     "execution_outbox",
                     _OUTBOX_PENDING_INDEX_SQL,
+                ),
+            }
+        )
+    if version == _SCHEMA_VERSION:
+        expected.update(
+            {
+                ("table", "submissions", "submissions", _SUBMISSIONS_SQL),
+                (
+                    "table",
+                    "submission_callbacks",
+                    "submission_callbacks",
+                    _SUBMISSION_CALLBACKS_SQL,
+                ),
+                ("table", "submission_outbox", "submission_outbox", _SUBMISSION_OUTBOX_SQL),
+                ("index", "sqlite_autoindex_submissions_1", "submissions", None),
+                (
+                    "index",
+                    "sqlite_autoindex_submission_callbacks_1",
+                    "submission_callbacks",
+                    None,
+                ),
+                (
+                    "index",
+                    "sqlite_autoindex_submission_callbacks_2",
+                    "submission_callbacks",
+                    None,
+                ),
+                (
+                    "index",
+                    "sqlite_autoindex_submission_outbox_1",
+                    "submission_outbox",
+                    None,
+                ),
+                (
+                    "index",
+                    "submission_outbox_pending_idx",
+                    "submission_outbox",
+                    _SUBMISSION_OUTBOX_PENDING_INDEX_SQL,
                 ),
             }
         )

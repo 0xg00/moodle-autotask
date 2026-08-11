@@ -16,6 +16,14 @@ class MoodleServiceError(RuntimeError):
     pass
 
 
+class MoodleUploadCapabilityError(MoodleServiceError):
+    """The authenticated site-info response definitively disallows uploads."""
+
+
+class MoodleRequiredFunctionCapabilityError(MoodleServiceError):
+    """The authenticated site-info response definitively lacks a required function."""
+
+
 class MoodleCaller(Protocol):
     def call(self, function: str, parameters: Mapping[str, str | int] | None = None) -> object: ...
 
@@ -31,9 +39,22 @@ class MoodleService:
         self.config = config
         self.client = client or MoodleClient(config)
         self._site_url: str | None = None
+        self._functions: frozenset[str] | None = None
+        self._uploadfiles: bool | None = None
 
-    def verified_site_url(self) -> str:
-        if self._site_url is not None:
+    def verified_site_url(
+        self,
+        required_functions: frozenset[str] = frozenset(),
+        *,
+        require_uploadfiles: bool = False,
+    ) -> str:
+        if self._site_url is not None and self._functions is not None:
+            if not required_functions <= self._functions:
+                raise MoodleRequiredFunctionCapabilityError(
+                    "Moodle does not advertise required mobile functions"
+                )
+            if require_uploadfiles and self._uploadfiles is not True:
+                raise MoodleUploadCapabilityError("Moodle upload capability was not verified")
             return self._site_url
         try:
             result = self.client.call("core_webservice_get_site_info")
@@ -60,10 +81,25 @@ class MoodleService:
         advertised = {item["name"] for item in functions}
         if len(advertised) != len(functions):
             raise MoodleServiceError("Moodle function advertisement is malformed")
-        required = {"core_webservice_get_site_info", "mod_assign_get_assignments"}
+        required = {
+            "core_webservice_get_site_info",
+            "mod_assign_get_assignments",
+        } | required_functions
         if not required <= advertised:
-            raise MoodleServiceError("Moodle does not advertise required mobile functions")
+            raise MoodleRequiredFunctionCapabilityError(
+                "Moodle does not advertise required mobile functions"
+            )
+        # Moodle serializes external booleans as either JSON true or integer 1.
+        # Missing, null, false, and strings are not authorization to upload.
+        raw_uploadfiles = result.get("uploadfiles")
+        uploadfiles = raw_uploadfiles is True or (
+            type(raw_uploadfiles) is int and raw_uploadfiles == 1
+        )
+        if require_uploadfiles and uploadfiles is not True:
+            raise MoodleUploadCapabilityError("Moodle upload capability was not verified")
         self._site_url = site_url
+        self._functions = frozenset(advertised)
+        self._uploadfiles = uploadfiles
         return site_url
 
     def assignments(self) -> tuple[MoodleAssignmentSnapshot, ...]:

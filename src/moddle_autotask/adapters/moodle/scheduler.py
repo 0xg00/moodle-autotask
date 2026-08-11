@@ -129,6 +129,9 @@ def draft_from_assignment(assignment: MoodleAssignmentSnapshot) -> NotificationD
         grading_due_date=assignment.grading_due_date,
         time_modified=assignment.time_modified,
         attachments=attachments,
+        assignment_id=assignment.assignment_id,
+        submission_drafts=assignment.submission_drafts,
+        requires_submission_statement=assignment.requires_submission_statement,
     )
 
 

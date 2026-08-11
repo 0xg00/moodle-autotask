@@ -174,6 +174,10 @@ def test_v1_database_migrates_and_backfills_prior_approval(tmp_path: Path) -> No
     event = _event(tmp_path, "b")
     _approve(state, event, now=9)
     with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX submission_outbox_pending_idx")
+        connection.execute("DROP TABLE submission_callbacks")
+        connection.execute("DROP TABLE submission_outbox")
+        connection.execute("DROP TABLE submissions")
         connection.execute("DROP INDEX work_claimable_idx")
         connection.execute("DROP INDEX execution_outbox_pending_idx")
         connection.execute("DROP TABLE execution_outbox")

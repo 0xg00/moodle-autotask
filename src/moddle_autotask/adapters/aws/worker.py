@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Protocol, cast, runtime_checkable
 
 from moddle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
     ApprovalStateError,
+    SubmissionManifest,
     WorkClaim,
 )
 from moddle_autotask.adapters.moodle.state import NotificationEvent
+from moddle_autotask.adapters.moodle.submission import (
+    PermanentSubmissionOfferError,
+    UnsupportedSubmissionPolicyError,
+)
 from moddle_autotask.domain.models import (
     ExecutionMode,
     LabHandle,
@@ -41,6 +46,25 @@ class ExecutionNotifier(Protocol):
     def notify(self, event: NotificationEvent, progress: ExecutionProgress) -> None: ...
 
 
+@runtime_checkable
+class SubmissionNotifier(Protocol):
+    def notify_submission_ready(self, manifest: object, buttons: object) -> None: ...
+
+    def notify_submission_result(self, notification: object) -> None: ...
+
+    def notify_submission_blocked(self, event: NotificationEvent, reason: str) -> None: ...
+
+
+class SubmissionService(Protocol):
+    def can_offer_submission(self, event: NotificationEvent) -> None: ...
+
+    def upload(self, manifest: SubmissionManifest) -> int: ...
+
+    def save(self, manifest: SubmissionManifest, draft_item_id: int) -> None: ...
+
+    def verify(self, manifest: SubmissionManifest) -> object | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerCycle:
     result: str
@@ -56,12 +80,17 @@ def process_one(
     image_importer: ImageImporter | None = None,
     execution_broker: ExecutionBroker | None = None,
     execution_notifier: ExecutionNotifier | None = None,
+    submission_service: SubmissionService | None = None,
     lease_seconds: int = 300,
     now: int | None = None,
 ) -> WorkerCycle:
     claim = state.claim_work(owner, lease_seconds, now=now)
     if claim is None:
-        _deliver_pending_notification(state, execution_notifier, now)
+        _deliver_pending_notification(state, execution_notifier, submission_service, now)
+        submission_cycle = _process_submission(state, submission_service, owner, lease_seconds, now)
+        if submission_cycle is not None:
+            _deliver_pending_notification(state, execution_notifier, submission_service, now)
+            return submission_cycle
         return WorkerCycle("idle")
     try:
         cycle = _process_claim(
@@ -74,7 +103,7 @@ def process_one(
             execution_notifier=execution_notifier,
             now=now,
         )
-        _deliver_pending_notification(state, execution_notifier, now)
+        _deliver_pending_notification(state, execution_notifier, submission_service, now)
         return cycle
     except ApprovalStateError:
         raise
@@ -132,9 +161,7 @@ def _process_claim(
         return WorkerCycle("lab_cleaned", item.selected_mode)
     if item.status == "pending":
         if item.selected_mode is ExecutionMode.CENTRAL:
-            if not state.mark_ready(
-                claim, now=now, for_execution=execution_broker is not None
-            ):
+            if not state.mark_ready(claim, now=now, for_execution=execution_broker is not None):
                 return WorkerCycle("ownership_lost", item.selected_mode)
             return WorkerCycle("central_ready", item.selected_mode)
         image_id: str | None = None
@@ -184,21 +211,25 @@ def _process_claim(
             cast(LabCommandExecutor, provider),
         )
         if progress.status == "pending":
-            if not state.retry_work(
-                claim, "agent_pending", 15, now=now, exhaustible=False
-            ):
+            if not state.retry_work(claim, "agent_pending", 15, now=now, exhaustible=False):
                 return WorkerCycle("ownership_lost", item.selected_mode)
             return WorkerCycle("agent_pending", item.selected_mode)
         if progress.status == "failed":
             if not state.complete_execution(
-                claim, succeeded=False, summary=progress.summary,
-                report_markdown=progress.report_markdown, now=now
+                claim,
+                succeeded=False,
+                summary=progress.summary,
+                report_markdown=progress.report_markdown,
+                now=now,
             ):
                 return WorkerCycle("ownership_lost", item.selected_mode)
             return WorkerCycle("execution_failed", item.selected_mode)
         if not state.complete_execution(
-            claim, succeeded=True, summary=progress.summary,
-            report_markdown=progress.report_markdown, now=now
+            claim,
+            succeeded=True,
+            summary=progress.summary,
+            report_markdown=progress.report_markdown,
+            now=now,
         ):
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("execution_complete", item.selected_mode)
@@ -207,15 +238,11 @@ def _process_claim(
         raise ApprovalStateError("claimed work has an invalid state")
     readiness = provider.readiness(item.lab_handle)
     if readiness is LabReadiness.READY:
-        if not state.mark_ready(
-            claim, now=now, for_execution=execution_broker is not None
-        ):
+        if not state.mark_ready(claim, now=now, for_execution=execution_broker is not None):
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("lab_ready", item.selected_mode)
     if readiness is LabReadiness.FAILED:
-        if not state.retry_work(
-            claim, "lab_failed", _retry_delay(item.attempts), now=now
-        ):
+        if not state.retry_work(claim, "lab_failed", _retry_delay(item.attempts), now=now):
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("retry", item.selected_mode)
     if not state.retry_work(claim, "lab_pending", 30, now=now):
@@ -239,29 +266,134 @@ def _retry_delay(attempts: int) -> int:
 
 
 def _deliver_pending_notification(
-    state: ApprovalState, notifier: ExecutionNotifier | None, now: int | None
+    state: ApprovalState,
+    notifier: ExecutionNotifier | None,
+    submission_service: SubmissionService | None,
+    now: int | None,
 ) -> None:
-    if notifier is None:
-        return
     notification = state.pending_execution_notification()
-    if notification is None:
+    if notification is not None and notifier is not None:
+        progress = ExecutionProgress(
+            "succeeded" if notification.succeeded else "failed",
+            notification.summary,
+            notification.report_markdown,
+        )
+        try:
+            notifier.notify(notification.event, progress)
+            if notification.succeeded and notification.event.assignment_id is not None:
+                _offer_submission_approval(
+                    state, notifier, submission_service, notification, now
+                )
+        except RuntimeError:
+            return
+        state.mark_execution_notification_delivered(notification, now=now)
+    if notifier is None or not isinstance(notifier, SubmissionNotifier):
         return
-    progress = ExecutionProgress(
-        "succeeded" if notification.succeeded else "failed",
-        notification.summary,
-        notification.report_markdown,
-    )
+    submission = state.pending_submission_notification()
+    if submission is None:
+        return
     try:
-        notifier.notify(notification.event, progress)
+        notifier.notify_submission_result(submission)
     except RuntimeError:
         return
-    state.mark_execution_notification_delivered(notification, now=now)
+    state.mark_submission_notification_delivered(submission, now=now)
+
+
+def _offer_submission_approval(
+    state: ApprovalState,
+    notifier: ExecutionNotifier,
+    service: SubmissionService | None,
+    notification: object,
+    now: int | None,
+) -> None:
+    event = getattr(notification, "event", None)
+    if not isinstance(event, NotificationEvent) or not isinstance(notifier, SubmissionNotifier):
+        return
+    if event.submission_drafts or event.requires_submission_statement:
+        notifier.notify_submission_blocked(
+            event, "la actividad exige la declaración de entrega del alumno"
+        )
+        return
+    if service is None:
+        raise RuntimeError("Moodle submission service is unavailable")
+    try:
+        service.can_offer_submission(event)
+    except UnsupportedSubmissionPolicyError:
+        notifier.notify_submission_blocked(
+            event, "la actividad exige la declaración de entrega del alumno"
+        )
+        return
+    except PermanentSubmissionOfferError:
+        notifier.notify_submission_blocked(
+            event, "Moodle no habilita una entrega verificable para esta revisión"
+        )
+        return
+    manifest, buttons = state.prepare_submission(
+        event,
+        getattr(notification, "summary", ""),
+        getattr(notification, "report_markdown", ""),
+        now=now,
+    )
+    notifier.notify_submission_ready(manifest, buttons)
+
+
+def _process_submission(
+    state: ApprovalState,
+    service: SubmissionService | None,
+    owner: str,
+    lease_seconds: int,
+    now: int | None,
+) -> WorkerCycle | None:
+    if service is None:
+        return None
+    claim = state.claim_submission(owner, lease_seconds, now=now)
+    if claim is None:
+        return None
+    try:
+        if claim.phase == "saving":
+            receipt = service.verify(claim.manifest)
+            if receipt is None:
+                state.fail_submission(claim, "submission_ambiguous", now=now)
+                return WorkerCycle("submission_ambiguous")
+            reference = getattr(receipt, "reference", None)
+            if not isinstance(reference, str) or not reference:
+                raise RuntimeError("submission receipt is invalid")
+            state.complete_submission(claim, reference, now=now)
+            return WorkerCycle("submission_confirmed")
+        draft_item_id = service.upload(claim.manifest)
+        persisted = state.record_submission_draft(claim, draft_item_id, now=now)
+        if persisted is None:
+            return WorkerCycle("submission_ownership_lost")
+        try:
+            service.save(persisted.manifest, draft_item_id)
+        except RuntimeError:
+            receipt = service.verify(persisted.manifest)
+            if receipt is not None:
+                reference = getattr(receipt, "reference", None)
+                if isinstance(reference, str) and reference:
+                    state.complete_submission(persisted, reference, now=now)
+                    return WorkerCycle("submission_confirmed")
+            state.fail_submission(persisted, "submission_ambiguous", now=now)
+            return WorkerCycle("submission_ambiguous")
+        receipt = service.verify(persisted.manifest)
+        if receipt is None:
+            state.fail_submission(persisted, "submission_unverified", now=now)
+            return WorkerCycle("submission_unverified")
+        reference = getattr(receipt, "reference", None)
+        if not isinstance(reference, str) or not reference:
+            raise RuntimeError("submission receipt is invalid")
+        state.complete_submission(persisted, reference, now=now)
+        return WorkerCycle("submission_confirmed")
+    except (ApprovalStateError, RuntimeError, ValueError):
+        # Never retry an uncertain Moodle save automatically; durable state and
+        # the next operator notification make the boundary explicit.
+        if state.fail_submission(claim, "submission_failed", now=now):
+            return WorkerCycle("submission_failed")
+        return WorkerCycle("submission_ownership_lost")
 
 
 def _requires_image_import(event: NotificationEvent) -> bool:
     return any(
-        attachment.filename.lower().endswith(
-            (".ova", ".ovf", ".vdi", ".vmdk", ".vhd", ".vhdx")
-        )
+        attachment.filename.lower().endswith((".ova", ".ovf", ".vdi", ".vmdk", ".vhd", ".vhdx"))
         for attachment in event.attachments
     )

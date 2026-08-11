@@ -283,9 +283,23 @@ The first process sends each durable event; the second uses outbound Telegram lo
 persists the update cursor. No webhook or inbound firewall rule is required. Only the exact
 `allowedUserId` in the exact `chatId` can decide. `Hacer tarea` records approval of that exact
 revision, `Ignorar` records the opposite terminal decision, and `Ver detalles` is read-only. Replayed
-buttons are idempotent and an updated Moodle revision needs its own decision. This milestone does
-not consume an approval to start AWS or agents yet, and it never treats notification delivery as
-approval.
+buttons are idempotent and an updated Moodle revision needs its own decision. Successful execution
+does not submit anything. For a notification carrying an exact Moodle assignment ID, the delivered
+report receives independent `Entregar`, `No entregar`, and `Ver detalles` controls. `Entregar` is
+one-use and bound to the manifest digest (task key, revision, assignment ID, report bytes and
+SHA-256); Moodle is re-enumerated immediately before submission and a changed/deleted assignment
+fails closed. The worker uses Moodle's `upload.php` and `mod_assign_save_submission`, persists the
+draft ID before the final save, and confirms it through `mod_assign_get_submission_status` before
+reporting success. Legacy notifications without an assignment ID remain executable but cannot be
+submitted until safely re-enumerated as a new exact revision.
+
+The development fixture sets `submissiondrafts=0` and `requiresubmissionstatement=0`. If Moodle reports either policy as `1`, the
+worker does not show `Entregar`: Moodle 5.2.1's official `mod_assign_submit_for_grading` requires
+the student's `acceptsubmissionstatement`, which this service must not assert on the student's
+behalf. The execution report remains available and Telegram states that delivery was not offered.
+This policy is part of the assignment revision and submission manifest. Site info must explicitly
+advertise `uploadfiles=true` or Moodle's numeric `uploadfiles=1` before an approval or upload is
+offered; absent, null, false, and strings fail closed.
 
 Notification delivery remains at-least-once: a crash after Telegram accepts `sendMessage` but before
 local commit can repeat a message with the same buttons. Download selection uses keys returned by

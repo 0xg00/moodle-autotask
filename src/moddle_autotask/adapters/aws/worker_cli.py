@@ -13,6 +13,7 @@ from typing import Never
 
 from moddle_autotask.adapters.moodle.approval_state import ApprovalState
 from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moddle_autotask.adapters.moodle.submission import MoodleSubmissionClient
 from moddle_autotask.adapters.moodle.telegram import TelegramClient, TelegramConfig
 
 from .agent_spool import FileAgentBroker
@@ -50,9 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--working-directory", type=Path, default=Path("/var/lib/moodle-autotask/artifacts")
     )
-    parser.add_argument(
-        "--agent-jobs", type=Path, default=Path("/var/spool/moodle-autotask/jobs")
-    )
+    parser.add_argument("--agent-jobs", type=Path, default=Path("/var/spool/moodle-autotask/jobs"))
     parser.add_argument(
         "--agent-results", type=Path, default=Path("/var/spool/moodle-autotask/results")
     )
@@ -104,6 +103,9 @@ def main(argv: list[str] | None = None) -> int:
         execution_notifier = TelegramExecutionNotifier(
             telegram_config, TelegramClient(telegram_config)
         )
+        submission_service = MoodleSubmissionClient(
+            MoodleConnectionConfig.from_token_file(args.token_file)
+        )
         owner = f"{socket.gethostname()}:{os.getpid()}"
         while True:
             cycle = process_one(
@@ -114,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_importer=image_importer,
                 execution_broker=execution_broker,
                 execution_notifier=execution_notifier,
+                submission_service=submission_service,
                 lease_seconds=3600,
             )
             print(

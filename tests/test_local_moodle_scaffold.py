@@ -255,6 +255,7 @@ def test_moodle_docker_preserves_sql_and_container_paths_through_windows_powersh
         check=False,
         text=True,
         timeout=10,
+        env={**os.environ, "MOODLE_AUTOTASK_BIND_IP": ""},
     )
     assert result.returncode == 0, result.stderr
     captured = [base64.b64decode(value).decode("utf-8") for value in json.loads(result.stdout)]
@@ -702,6 +703,8 @@ def test_fixture_v3_migration_surfaces_only_bounded_verification_reasons() -> No
     assert "verify_fixture_v3($loaded['data'], $loaded['digest'], false, $reason)" in expand
     assert "rich fixture verification failed during v3 migration: " in expand
     assert "(int)$row->introformat !== (int)FORMAT_HTML" in fixture
+    assert "(int)$row->requiresubmissionstatement !== 0" in fixture
+    assert "$assignment->requiresubmissionstatement = 0;" in fixture
 
 
 @pytest.mark.skipif(shutil.which("php") is None, reason="PHP CLI is required for fixture harness")
@@ -751,7 +754,12 @@ def test_fixture_v3_transaction_and_v2_partial_contracts_are_explicit() -> None:
     assert expand.index("$transaction = $DB->start_delegated_transaction()") < expand.index(
         "$campaign = create_course"
     )
-    assert expand.index("set_config(AUTOTASK_FIXTURE_CONFIG, '3')") < expand.index(
+    # The optional complete-v3 plugin repair has its own earlier transaction;
+    # the v2-to-v3 migration still stores the revision before its own commit.
+    assert expand.index("complete-v3-submission-config-legacy") < expand.index(
+        "$transaction = $DB->start_delegated_transaction()"
+    )
+    assert expand.index("set_config(AUTOTASK_FIXTURE_CONFIG, '3')") < expand.rindex(
         "$transaction->allow_commit()"
     )
     assert "get_config('core', AUTOTASK_FIXTURE_ANCHOR_CONFIG) === false" in expand

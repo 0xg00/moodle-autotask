@@ -31,6 +31,8 @@ def _assignment(base: str, url: str, size: int = 3) -> MoodleAssignmentSnapshot:
                             "cmid": 3,
                             "name": "A",
                             "timemodified": 1,
+                            "submissiondrafts": 0,
+                            "requiresubmissionstatement": 0,
                             "introattachments": [
                                 {
                                     "filename": "same.txt",
@@ -216,6 +218,8 @@ def test_same_name_different_revisions_do_not_collide(tmp_path: Path) -> None:
                             "cmid": 10,
                             "name": "B",
                             "timemodified": 1,
+                            "submissiondrafts": 0,
+                            "requiresubmissionstatement": 0,
                             "introattachments": [
                                 {
                                     "filename": "same.txt",
@@ -254,6 +258,8 @@ def test_same_task_revision_attachment_names_do_not_collide(tmp_path: Path) -> N
                                 "cmid": 3,
                                 "name": "A",
                                 "timemodified": 1,
+                                "submissiondrafts": 0,
+                                "requiresubmissionstatement": 0,
                                 "introfiles": [
                                     {
                                         "filename": "same.txt",

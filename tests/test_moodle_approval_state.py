@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from moddle_autotask.adapters.moodle.approval_state import (
     _WORK_SQL_V2,
     ApprovalState,
     ApprovalStateError,
+    _submission_manifest,
 )
 from moddle_autotask.adapters.moodle.state import (
     MoodleState,
@@ -40,10 +42,108 @@ def _event(tmp_path: Path, revision: str = "b", *, lab: bool = True) -> Notifica
         0,
         1,
         (NotificationAttachment("lab.ova", 123, "application/octet-stream", True),) if lab else (),
+        43,
     )
     event = MoodleState(tmp_path / f"moodle-{revision}.sqlite3").enqueue(draft, now=1)
     assert event is not None
     return event
+
+
+def test_submission_approval_is_bound_to_manifest_and_persists_draft_before_save(
+    tmp_path: Path,
+) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = _event(tmp_path, lab=False)
+    state.prepare(event, now=1)
+    manifest, buttons = state.prepare_submission(event, "ok", "# report", now=2)
+    assert state.prepare_submission(event, "ok", "# report", now=3) == (manifest, buttons)
+    with pytest.raises(ApprovalStateError, match="conflicts"):
+        state.prepare_submission(event, "ok", "changed", now=3)
+    assert state.resolve_submission(buttons.submit, 42, 42, now=4)[1] == "approved"
+    claim = state.claim_submission("worker", 60, now=5)
+    assert claim is not None and claim.phase == "uploading"
+    saved = state.record_submission_draft(claim, 123, now=6)
+    assert saved is not None and saved.phase == "saving" and saved.draft_item_id == 123
+    restarted = ApprovalState(tmp_path / "approval.sqlite3")
+    recovered = restarted.claim_submission("worker2", 60, now=67)
+    assert recovered is not None and recovered.phase == "saving" and recovered.draft_item_id == 123
+    assert restarted.complete_submission(recovered, "moodle-submission:9", now=68)
+    pending = restarted.pending_submission_notification()
+    assert pending is not None and pending.status == "submitted"
+
+
+def test_submission_manifest_binds_submission_policies(tmp_path: Path) -> None:
+    event = _event(tmp_path, lab=False)
+    direct = _submission_manifest(event, "report")
+    draft = _submission_manifest(replace(event, submission_drafts=True), "report")
+    statement = _submission_manifest(replace(event, requires_submission_statement=True), "report")
+
+    assert direct.manifest_digest != draft.manifest_digest
+    assert direct.as_dict()["submissionDrafts"] is False
+    assert draft.as_dict()["submissionDrafts"] is True
+    assert statement.manifest_digest != direct.manifest_digest
+    assert statement.as_dict()["requireSubmissionStatement"] is True
+
+
+@pytest.mark.parametrize("policy", ("submission_drafts", "requires_submission_statement"))
+def test_submission_policy_cannot_create_a_second_approval(tmp_path: Path, policy: str) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = _event(tmp_path, lab=False)
+    state.prepare(event, now=1)
+    blocked = (
+        replace(event, submission_drafts=True)
+        if policy == "submission_drafts"
+        else replace(event, requires_submission_statement=True)
+    )
+    with pytest.raises(ApprovalStateError, match="policy is not supported"):
+        state.prepare_submission(blocked, "ok", "# report", now=2)
+
+
+@pytest.mark.parametrize(
+    ("legacy_version", "with_submission"),
+    (("1", False), ("1", True), ("2", True), ("3", True)),
+)
+def test_legacy_marker_with_v4_submission_schema_is_corrupt(
+    tmp_path: Path, legacy_version: str, with_submission: bool
+) -> None:
+    """A marker/schema disagreement is corrupt, including an empty future table."""
+
+    path = tmp_path / "approval.sqlite3"
+    state = ApprovalState(path)
+    if with_submission:
+        event = _event(tmp_path, lab=False)
+        state.prepare(event, now=1)
+        state.prepare_submission(event, "ok", "# report", now=2)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'schema_version'", (legacy_version,)
+        )
+
+    with pytest.raises(ApprovalStateError, match="schema is corrupt"):
+        ApprovalState(path)
+
+
+def test_legacy_event_cannot_create_unbound_submission(tmp_path: Path) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = _event(tmp_path)
+    legacy_event = NotificationEvent(
+        event.event_id,
+        event.kind,
+        event.status,
+        event.task_key,
+        event.revision_digest,
+        event.course_name,
+        event.course_shortname,
+        event.assignment_title,
+        event.allows_submissions_from,
+        event.due_date,
+        event.cutoff_date,
+        event.grading_due_date,
+        event.time_modified,
+        event.attachments,
+    )
+    with pytest.raises(ApprovalStateError, match="exact assignment"):
+        state.prepare_submission(legacy_event, "ok", "report", now=1)
 
 
 def test_prepare_is_stable_and_decision_is_bound_to_exact_revision(tmp_path: Path) -> None:

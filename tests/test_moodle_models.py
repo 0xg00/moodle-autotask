@@ -22,6 +22,8 @@ def test_assignment_keys_and_revision_are_stable() -> None:
                         "name": "Task",
                         "intro": "Read",
                         "timemodified": 1,
+                        "submissiondrafts": 0,
+                        "requiresubmissionstatement": 0,
                         "introattachments": [
                             {
                                 "filename": "brief.txt",
@@ -45,6 +47,34 @@ def test_assignment_keys_and_revision_are_stable() -> None:
     assert first.attachments[0].attachment_key.startswith("moodle-attachment-v1:")
 
 
+def test_submission_policies_are_strict_and_revision_bound() -> None:
+    payload = _valid()
+    assignment = payload["courses"][0]["assignments"][0]  # type: ignore[index]
+    assignment["submissiondrafts"] = 0
+    direct = parse_assignments(payload, "https://example.test")[0]
+    assignment["submissiondrafts"] = 1
+    draft = parse_assignments(payload, "https://example.test")[0]
+
+    assert not direct.submission_drafts and draft.submission_drafts
+    assert direct.task_key == draft.task_key
+    assert direct.revision_digest != draft.revision_digest
+    assignment["submissiondrafts"] = True
+    with pytest.raises(MoodlePayloadError, match="draft policy"):
+        parse_assignments(payload, "https://example.test")
+    assignment["submissiondrafts"] = 0
+    assignment["requiresubmissionstatement"] = 1
+    statement = parse_assignments(payload, "https://example.test")[0]
+    assert statement.requires_submission_statement
+    assert statement.revision_digest != direct.revision_digest
+    assignment.pop("requiresubmissionstatement")
+    with pytest.raises(MoodlePayloadError, match="statement policy"):
+        parse_assignments(payload, "https://example.test")
+    assignment["requiresubmissionstatement"] = 0
+    assignment.pop("submissiondrafts")
+    with pytest.raises(MoodlePayloadError, match="draft policy"):
+        parse_assignments(payload, "https://example.test")
+
+
 def _valid() -> dict[str, object]:
     return {
         "warnings": [],
@@ -59,6 +89,8 @@ def _valid() -> dict[str, object]:
                         "cmid": 3,
                         "name": "A",
                         "timemodified": 1,
+                        "submissiondrafts": 0,
+                        "requiresubmissionstatement": 0,
                         "introattachments": [
                             {
                                 "filename": "x.txt",
@@ -139,6 +171,8 @@ def test_duplicate_attachment_identity_rejected() -> None:
                         "cmid": 3,
                         "name": "A",
                         "timemodified": 1,
+                        "submissiondrafts": 0,
+                        "requiresubmissionstatement": 0,
                         "introattachments": [attachment, attachment],
                     }
                 ],
@@ -170,6 +204,8 @@ def test_userinfo_attachment_url_rejected() -> None:
                         "cmid": 3,
                         "name": "A",
                         "timemodified": 1,
+                        "submissiondrafts": 0,
+                        "requiresubmissionstatement": 0,
                         "introattachments": [attachment],
                     }
                 ],

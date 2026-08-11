@@ -19,6 +19,10 @@ from moddle_autotask.adapters.moodle.state import (
     NotificationDraft,
     NotificationEvent,
 )
+from moddle_autotask.adapters.moodle.submission import (
+    MoodleSubmissionError,
+    PermanentSubmissionOfferError,
+)
 from moddle_autotask.domain.models import ExecutionMode, LabHandle, LabProvisionRequest
 from moddle_autotask.ports.contracts import LabReadiness
 
@@ -118,6 +122,41 @@ class _Notifier:
 
 
 @dataclass
+class _SubmissionNotifier(_Notifier):
+    ready: list[object] = field(default_factory=list)
+    blocked: list[tuple[NotificationEvent, str]] = field(default_factory=list)
+
+    def notify_submission_ready(self, manifest: object, buttons: object) -> None:
+        self.ready.append((manifest, buttons))
+
+    def notify_submission_result(self, notification: object) -> None:
+        del notification
+
+    def notify_submission_blocked(self, event: NotificationEvent, reason: str) -> None:
+        self.blocked.append((event, reason))
+
+
+@dataclass
+class _SubmissionService:
+    offered: list[NotificationEvent] = field(default_factory=list)
+    preflight_error: RuntimeError | None = None
+
+    def can_offer_submission(self, event: NotificationEvent) -> None:
+        if self.preflight_error is not None:
+            raise self.preflight_error
+        self.offered.append(event)
+
+    def upload(self, manifest: object) -> int:
+        raise AssertionError("draft policy must not upload")
+
+    def save(self, manifest: object, draft_item_id: int) -> None:
+        raise AssertionError("draft policy must not save")
+
+    def verify(self, manifest: object) -> object | None:
+        raise AssertionError("draft policy must not verify")
+
+
+@dataclass
 class _FailingNotifier:
     calls: int = 0
 
@@ -134,7 +173,13 @@ class _InvalidNotifier:
 
 
 def _approved(
-    tmp_path: Path, *, lab: bool, filename: str = "capture.pcap"
+    tmp_path: Path,
+    *,
+    lab: bool,
+    filename: str = "capture.pcap",
+    assignment_id: int | None = None,
+    submission_drafts: bool = False,
+    requires_submission_statement: bool = False,
 ) -> tuple[ApprovalState, str, str]:
     attachment = (NotificationAttachment(filename, 123, None, True),) if lab else ()
     event = MoodleState(tmp_path / "moodle.sqlite3").enqueue(
@@ -150,6 +195,9 @@ def _approved(
             0,
             1,
             attachment,
+            assignment_id,
+            submission_drafts,
+            requires_submission_statement,
         ),
         now=1,
     )
@@ -221,6 +269,98 @@ def test_central_work_waits_for_agent_then_completes_exact_revision(tmp_path: Pa
     assert item is not None and item.status == "cleaned" and item.error_code is None
     assert broker.calls == [ExecutionMode.CENTRAL, ExecutionMode.CENTRAL]
     assert len(notifier.calls) == 1
+
+
+@pytest.mark.parametrize("policy", ("submission_drafts", "requires_submission_statement"))
+def test_submission_policy_never_offers_second_approval(tmp_path: Path, policy: str) -> None:
+    state, _, _ = (
+        _approved(tmp_path, lab=False, assignment_id=43, submission_drafts=True)
+        if policy == "submission_drafts"
+        else _approved(tmp_path, lab=False, assignment_id=43, requires_submission_statement=True)
+    )
+    provider = _Provider()
+    notifier = _SubmissionNotifier()
+    service = _SubmissionService()
+    broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
+
+    assert process_one(
+        state,
+        provider,
+        owner="worker",
+        artifact_preparer=_Preparer(),
+        execution_broker=broker,
+        execution_notifier=notifier,
+        submission_service=service,
+        now=10,
+    ).result == "central_ready"
+    assert process_one(
+        state,
+        provider,
+        owner="worker",
+        artifact_preparer=_Preparer(),
+        execution_broker=broker,
+        execution_notifier=notifier,
+        submission_service=service,
+        now=11,
+    ).result == "execution_complete"
+
+    assert notifier.ready == []
+    assert service.offered == []
+    assert notifier.blocked and "declaración" in notifier.blocked[0][1]
+
+
+def test_submission_preflight_transient_retries_execution_notification(tmp_path: Path) -> None:
+    state, _, _ = _approved(tmp_path, lab=False, assignment_id=43)
+    provider = _Provider()
+    notifier = _SubmissionNotifier()
+    service = _SubmissionService(preflight_error=MoodleSubmissionError("Moodle timeout"))
+    broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
+
+    assert process_one(
+        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
+        execution_notifier=notifier, submission_service=service, now=10,
+    ).result == "central_ready"
+    assert process_one(
+        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
+        execution_notifier=notifier, submission_service=service, now=11,
+    ).result == "execution_complete"
+    assert state.pending_execution_notification() is not None
+    assert notifier.ready == [] and notifier.blocked == []
+
+    service.preflight_error = None
+    assert process_one(
+        state, provider, owner="worker", execution_notifier=notifier,
+        submission_service=service, now=12,
+    ).result == "idle"
+    assert state.pending_execution_notification() is None
+    assert len(service.offered) == 1 and len(notifier.ready) == 1
+
+
+def test_submission_preflight_permanent_rejection_blocks_and_delivers(tmp_path: Path) -> None:
+    state, _, _ = _approved(tmp_path, lab=False, assignment_id=43)
+    provider = _Provider()
+    notifier = _SubmissionNotifier()
+    service = _SubmissionService(
+        preflight_error=PermanentSubmissionOfferError("Moodle upload capability is not enabled")
+    )
+    broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
+
+    assert process_one(
+        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
+        execution_notifier=notifier, submission_service=service, now=10,
+    ).result == "central_ready"
+    assert process_one(
+        state, provider, owner="worker", artifact_preparer=_Preparer(), execution_broker=broker,
+        execution_notifier=notifier, submission_service=service, now=11,
+    ).result == "execution_complete"
+    assert state.pending_execution_notification() is None
+    assert notifier.ready == [] and len(notifier.blocked) == 1
+    assert "Moodle no habilita" in notifier.blocked[0][1]
+    assert process_one(
+        state, provider, owner="worker", execution_notifier=notifier,
+        submission_service=service, now=12,
+    ).result == "idle"
+    assert len(notifier.blocked) == 1
 
 
 def test_completion_delivery_retries_runtime_error_but_propagates_value_error(

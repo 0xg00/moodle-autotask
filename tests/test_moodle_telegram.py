@@ -8,7 +8,11 @@ from typing import Any, cast
 
 import pytest
 
-from moddle_autotask.adapters.moodle.approval_state import ApprovalButtons, ApprovalState
+from moddle_autotask.adapters.moodle.approval_state import (
+    ApprovalButtons,
+    ApprovalState,
+    SubmissionButtons,
+)
 from moddle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationDraft,
@@ -65,9 +69,7 @@ class _Connection:
         self.response = response
         self.calls = calls
 
-    def request(
-        self, method: str, path: str, body: bytes, headers: dict[str, str]
-    ) -> None:
+    def request(self, method: str, path: str, body: bytes, headers: dict[str, str]) -> None:
         self.calls.append((method, path, body, headers))
 
     def getresponse(self) -> _Response:
@@ -101,9 +103,7 @@ def test_config_file_is_exact_and_secret_is_not_in_repr(tmp_path: Path) -> None:
     assert config.chat_id == config.allowed_user_id == 42
     assert TOKEN not in repr(config)
     path.write_text(
-        json.dumps(
-            {"botToken": TOKEN, "chatId": 42, "allowedUserId": 42, "extra": True}
-        ),
+        json.dumps({"botToken": TOKEN, "chatId": 42, "allowedUserId": 42, "extra": True}),
         encoding="utf-8",
     )
     with pytest.raises(TelegramError, match="shape"):
@@ -120,9 +120,7 @@ def test_config_rejects_invalid_tokens(token: str) -> None:
 
 
 def test_send_message_uses_post_form_and_exact_inline_buttons() -> None:
-    client, calls = _client(
-        {"ok": True, "result": {"message_id": 7, "chat": {"id": 42}}}
-    )
+    client, calls = _client({"ok": True, "result": {"message_id": 7, "chat": {"id": 42}}})
     buttons = ApprovalButtons("a" * 32, "b" * 32, "c" * 32)
     assert client.send_message(42, "Hola á", buttons) == 7
     method, path, body, headers = cast(tuple[str, str, bytes, dict[str, str]], calls[0])
@@ -141,9 +139,7 @@ def test_send_message_uses_post_form_and_exact_inline_buttons() -> None:
 
 
 def test_send_document_uses_bounded_multipart_without_putting_token_in_body() -> None:
-    client, calls = _client(
-        {"ok": True, "result": {"message_id": 8, "chat": {"id": 42}}}
-    )
+    client, calls = _client({"ok": True, "result": {"message_id": 8, "chat": {"id": 42}}})
 
     assert client.send_document(42, "practica.md", b"# Informe\n", "Terminada") == 8
 
@@ -196,9 +192,7 @@ def test_transport_rejects_redirects_incomplete_invalid_and_oversize_bodies(
     def factory(*args: object, **kwargs: object) -> Any:
         return _Connection(response, calls)
 
-    client = TelegramClient(
-        TelegramConfig(TOKEN, 42, 42), connection_factory=factory
-    )
+    client = TelegramClient(TelegramConfig(TOKEN, 42, 42), connection_factory=factory)
     with pytest.raises(TelegramError) as error:
         client.send_message(42, "safe")
     assert TOKEN not in str(error.value)
@@ -217,9 +211,7 @@ def test_get_updates_and_callback_answer_use_bounded_post_parameters() -> None:
     def factory(*args: object, **kwargs: object) -> Any:
         return _Connection(next(responses), calls)
 
-    client = TelegramClient(
-        TelegramConfig(TOKEN, 42, 42), connection_factory=factory
-    )
+    client = TelegramClient(TelegramConfig(TOKEN, 42, 42), connection_factory=factory)
     assert client.get_updates(7, 0) == ({"update_id": 7},)
     client.answer_callback("callback", "Hecho")
     requests = [item for item in calls if isinstance(item, tuple)]
@@ -238,9 +230,7 @@ def test_network_failure_does_not_expose_token_or_original_exception() -> None:
     def factory(*args: object, **kwargs: object) -> Any:
         raise OSError(TOKEN)
 
-    client = TelegramClient(
-        TelegramConfig(TOKEN, 42, 42), connection_factory=factory
-    )
+    client = TelegramClient(TelegramConfig(TOKEN, 42, 42), connection_factory=factory)
     with pytest.raises(TelegramError) as caught:
         client.send_message(42, "safe")
     assert TOKEN not in str(caught.value)
@@ -250,11 +240,14 @@ def test_network_failure_does_not_expose_token_or_original_exception() -> None:
 class _Transport:
     def __init__(self, updates: tuple[object, ...] = ()) -> None:
         self.updates = updates
-        self.sent: list[tuple[int, str, ApprovalButtons | None]] = []
+        self.sent: list[tuple[int, str, ApprovalButtons | SubmissionButtons | None]] = []
         self.answers: list[tuple[str, str]] = []
 
     def send_message(
-        self, chat_id: int, text: str, buttons: ApprovalButtons | None = None
+        self,
+        chat_id: int,
+        text: str,
+        buttons: ApprovalButtons | SubmissionButtons | None = None,
     ) -> int:
         self.sent.append((chat_id, text, buttons))
         return len(self.sent)

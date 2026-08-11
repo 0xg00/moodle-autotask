@@ -63,8 +63,12 @@ VM Import/Export service role. It verifies the import task's tags and S3 source,
 AMI and snapshots, and passes that exact AMI to the lab provider. Cleanup terminates the lab,
 deregisters the imported AMI, and deletes its snapshots before completing the work item.
 
-The connector remains read-only: password login, scraping/browser automation, and Moodle submission
-remain outside this milestone. Telegram uses long polling over outbound HTTPS;
+The connector never uses password login, scraping, or browser automation. Its only mutation is the
+explicit submission boundary: after a distinct Telegram `Entregar` decision it verifies the current
+task/revision/assignment identity, uploads one Markdown report to Moodle `upload.php`, persists the
+draft item ID before `mod_assign_save_submission`, then verifies the final result through
+`mod_assign_get_submission_status`. A crash after a saved draft is resolved by verification, never a
+blind second save. Telegram uses long polling over outbound HTTPS;
 the controller exposes no webhook or inbound port. Bot credentials are read only from a protected
 file and never accepted as a command-line value or placed in callback data.
 

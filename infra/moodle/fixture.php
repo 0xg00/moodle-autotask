@@ -272,8 +272,11 @@ function fixture_state(): string {
     }
     if ($version === '3') {
         $catalog = fixture_v3_catalog();
-        return $catalog !== null && verify_fixture_v3($catalog['data'], $catalog['digest'], true)
-            ? 'complete-v3' : 'partial';
+        if ($catalog !== null && verify_fixture_v3($catalog['data'], $catalog['digest'], true)) {
+            return 'complete-v3';
+        }
+        return $catalog !== null && verify_fixture_v3($catalog['data'], $catalog['digest'], true, $ignored, false)
+            ? 'complete-v3-submission-config-legacy' : 'partial';
     }
     if ($version !== '1' && $version !== '2') {
         return 'partial';
@@ -296,7 +299,12 @@ function create_assignment(object $course, array $spec, int $now): void {
         'modulename' => 'assign', 'module' => $module->id, 'course' => $course->id,
         'section' => 0, 'visible' => 1, 'showdescription' => 0, 'name' => $spec['name'],
         'cmidnumber' => $spec['idnumber'], 'intro' => $spec['intro'], 'introformat' => FORMAT_HTML,
-        'alwaysshowdescription' => 1, 'submissionattachments' => 0, 'submissiondrafts' => 0,
+        'alwaysshowdescription' => 1, 'submissionattachments' => !empty($spec['submissionfile']) ? 1 : 0, 'submissiondrafts' => 0,
+        'assignsubmission_file_enabled' => !empty($spec['submissionfile']) ? 1 : 0,
+        'assignsubmission_file_maxfiles' => !empty($spec['submissionfile']) ? 1 : 0,
+        'assignsubmission_file_maxsizebytes' => !empty($spec['submissionfile']) ? 2097152 : 0,
+        'assignsubmission_file_filetypes' => !empty($spec['submissionfile']) ? '.md' : '',
+        'assignsubmission_onlinetext_enabled' => 0,
         'requiresubmissionstatement' => 0, 'sendnotifications' => 0, 'sendlatenotifications' => 0,
         'sendstudentnotifications' => 0,
         'duedate' => fixture_timestamp($now, $spec['dueoffset']),
@@ -668,12 +676,35 @@ function fixture_v3_has_exact_assignments(int $courseid, array $expected): bool 
     return $actual === $expected;
 }
 
+function fixture_v3_submission_file_enabled(int $assignmentid): bool {
+    global $DB;
+    $rows = $DB->get_records('assign_plugin_config', [
+        'assignment' => $assignmentid, 'subtype' => 'assignsubmission', 'plugin' => 'file',
+    ], '', 'name,value');
+    $expected = [
+        'enabled' => '1', 'maxfilesubmissions' => '1',
+        'maxsubmissionsizebytes' => '2097152', 'filetypeslist' => '.md',
+    ];
+    if (count($rows) < count($expected)) {
+        return false;
+    }
+    foreach ($expected as $name => $value) {
+        if (!isset($rows[$name]) || (string)$rows[$name]->value !== $value) {
+            return false;
+        }
+    }
+    $online = $DB->get_field('assign_plugin_config', 'value', [
+        'assignment' => $assignmentid, 'subtype' => 'assignsubmission', 'plugin' => 'onlinetext', 'name' => 'enabled',
+    ]);
+    return (string)$online === '0';
+}
+
 function fixture_v3_verification_failure(?string &$reason, string $code): bool {
     $reason = $code;
     return false;
 }
 
-function verify_fixture_v3(array $catalog, string $digest, bool $requirestored, ?string &$reason = null): bool {
+function verify_fixture_v3(array $catalog, string $digest, bool $requirestored, ?string &$reason = null, bool $checksubmission = true): bool {
     global $DB;
     $reason = null;
     $phase = 'legacy-v2';
@@ -762,6 +793,11 @@ function verify_fixture_v3(array $catalog, string $digest, bool $requirestored, 
             if ((int)$row->allowsubmissionsfromdate !== fixture_timestamp($anchor, $spec['allowoffset'])) {
                 return fixture_v3_verification_failure($reason, $assignment . '-allow-date');
             }
+            if ($checksubmission && ((int)$row->submissionattachments !== 1 || (int)$row->submissiondrafts !== 0
+                || (int)$row->requiresubmissionstatement !== 0
+                    || !fixture_v3_submission_file_enabled((int)$row->id))) {
+                return fixture_v3_verification_failure($reason, $assignment . '-submission-config');
+            }
             $phase = $assignment . '-attachment';
             if (!fixture_v3_verify_files(context_module::instance($row->cmid)->id, $spec['files'])) {
                 return fixture_v3_verification_failure($reason, $assignment . '-attachment');
@@ -793,7 +829,44 @@ function fixture_v3_create_assignment(object $course, array $spec, int $anchor):
     create_assignment($course, [
         'idnumber' => $module->idnumber, 'name' => $module->name, 'intro' => $module->intro,
         'dueoffset' => $module->dueoffset, 'allowoffset' => $module->allowoffset, 'files' => $module->files,
+        'submissionfile' => true,
     ], $anchor);
+}
+
+function fixture_v3_enable_submission_file(int $assignmentid): void {
+    global $DB;
+    $assignment = $DB->get_record('assign', ['id' => $assignmentid], '*', MUST_EXIST);
+    $assignment->submissionattachments = 1;
+    $assignment->submissiondrafts = 0;
+    $assignment->requiresubmissionstatement = 0;
+    $DB->update_record('assign', $assignment);
+    foreach ([
+        'enabled' => '1', 'maxfilesubmissions' => '1',
+        'maxsubmissionsizebytes' => '2097152', 'filetypeslist' => '.md',
+    ] as $name => $value) {
+        $existing = $DB->get_record('assign_plugin_config', [
+            'assignment' => $assignmentid, 'subtype' => 'assignsubmission', 'plugin' => 'file', 'name' => $name,
+        ]);
+        if ($existing) {
+            $existing->value = $value;
+            $DB->update_record('assign_plugin_config', $existing);
+        } else {
+            $DB->insert_record('assign_plugin_config', (object)[
+                'assignment' => $assignmentid, 'subtype' => 'assignsubmission', 'plugin' => 'file', 'name' => $name, 'value' => $value,
+            ]);
+        }
+    }
+    $online = $DB->get_record('assign_plugin_config', [
+        'assignment' => $assignmentid, 'subtype' => 'assignsubmission', 'plugin' => 'onlinetext', 'name' => 'enabled',
+    ]);
+    if ($online) {
+        $online->value = '0';
+        $DB->update_record('assign_plugin_config', $online);
+    } else {
+        $DB->insert_record('assign_plugin_config', (object)[
+            'assignment' => $assignmentid, 'subtype' => 'assignsubmission', 'plugin' => 'onlinetext', 'name' => 'enabled', 'value' => '0',
+        ]);
+    }
 }
 
 function expand_fixture(): void {
@@ -805,6 +878,22 @@ function expand_fixture(): void {
     $state = fixture_state();
     if ($state === 'complete-v3') {
         return;
+    }
+    if ($state === 'complete-v3-submission-config-legacy') {
+        $transaction = $DB->start_delegated_transaction();
+        try {
+            foreach ($loaded['data']['assignments'] as $spec) {
+                $assignment = $DB->get_record_sql("SELECT a.* FROM {assign} a JOIN {course_modules} cm ON cm.instance = a.id JOIN {modules} m ON m.id = cm.module WHERE cm.idnumber = ? AND m.name = 'assign'", [$spec['idnumber']], MUST_EXIST);
+                fixture_v3_enable_submission_file((int)$assignment->id);
+            }
+            if (!verify_fixture_v3($loaded['data'], $loaded['digest'], true)) {
+                throw new RuntimeException('v3 submission configuration verification failed');
+            }
+            $transaction->allow_commit();
+            return;
+        } catch (Throwable $error) {
+            $transaction->rollback($error);
+        }
     }
     if ($state === 'partial') {
         throw new RuntimeException('rich fixture is partial');

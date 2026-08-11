@@ -1,4 +1,5 @@
 """Outbound-only Telegram transport and exact human approval handling."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -16,7 +17,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from .approval_state import ApprovalButtons, ApprovalState, ApprovalStateError
+from .approval_state import (
+    ApprovalButtons,
+    ApprovalState,
+    ApprovalStateError,
+    SubmissionButtons,
+    SubmissionManifest,
+)
 from .path_safety import assert_no_indirection
 from .state import NotificationEvent
 
@@ -77,7 +84,7 @@ class TelegramConfig:
 
 class TelegramTransport(Protocol):
     def send_message(
-        self, chat_id: int, text: str, buttons: ApprovalButtons | None = None
+        self, chat_id: int, text: str, buttons: ApprovalButtons | SubmissionButtons | None = None
     ) -> int: ...
 
     def get_updates(self, offset: int, timeout_seconds: int) -> tuple[object, ...]: ...
@@ -98,14 +105,14 @@ class TelegramClient:
         self._connection_factory = connection_factory
 
     def send_message(
-        self, chat_id: int, text: str, buttons: ApprovalButtons | None = None
+        self, chat_id: int, text: str, buttons: ApprovalButtons | SubmissionButtons | None = None
     ) -> int:
         if chat_id != self.config.chat_id or not isinstance(text, str) or not text:
             raise TelegramError("Telegram message is invalid")
         if len(text) > _MAX_MESSAGE_LENGTH:
             raise TelegramError("Telegram message is too long")
         parameters: dict[str, str] = {"chat_id": str(chat_id), "text": text}
-        if buttons is not None:
+        if isinstance(buttons, ApprovalButtons):
             parameters["reply_markup"] = json.dumps(
                 {
                     "inline_keyboard": [
@@ -128,6 +135,23 @@ class TelegramClient:
                 separators=(",", ":"),
                 ensure_ascii=False,
             )
+        elif isinstance(buttons, SubmissionButtons):
+            parameters["reply_markup"] = json.dumps(
+                {
+                    "inline_keyboard": [
+                        [
+                            {"text": "Entregar", "callback_data": f"ma:{buttons.submit}"},
+                            {"text": "No entregar", "callback_data": f"ma:{buttons.decline}"},
+                        ],
+                        [{"text": "Ver detalles", "callback_data": f"ma:{buttons.details}"}],
+                    ]
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        elif buttons is not None:
+            raise TelegramError("Telegram buttons are invalid")
         result = self._post("sendMessage", parameters)
         if not isinstance(result, dict):
             raise TelegramError("Telegram response is invalid")
@@ -167,9 +191,7 @@ class TelegramClient:
             raise TelegramError("Telegram response is invalid")
         return tuple(result)
 
-    def send_document(
-        self, chat_id: int, filename: str, content: bytes, caption: str
-    ) -> int:
+    def send_document(self, chat_id: int, filename: str, content: bytes, caption: str) -> int:
         if (
             chat_id != self.config.chat_id
             or not isinstance(filename, str)
@@ -226,9 +248,7 @@ class TelegramClient:
             or len(text) > 200
         ):
             raise TelegramError("Telegram callback answer is invalid")
-        self._post(
-            "answerCallbackQuery", {"callback_query_id": callback_id, "text": text}
-        )
+        self._post("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
 
     def _post(
         self, method: str, parameters: dict[str, str], timeout_seconds: float | None = None
@@ -299,8 +319,7 @@ class TelegramClient:
 
 def _multipart_field(boundary: str, name: str, value: str) -> bytes:
     return (
-        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
-        f"{value}\r\n"
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
     ).encode()
 
 
@@ -316,9 +335,7 @@ class TelegramApprovalSink:
         if not isinstance(value, NotificationEvent):
             raise TelegramError("notification event is invalid")
         buttons = self.state.prepare(value)
-        message_id = self.client.send_message(
-            self.config.chat_id, _summary_message(value), buttons
-        )
+        message_id = self.client.send_message(self.config.chat_id, _summary_message(value), buttons)
         self.state.mark_notified(value, self.config.chat_id, message_id)
 
 
@@ -329,9 +346,7 @@ def process_updates(
     *,
     timeout_seconds: int = 0,
 ) -> int:
-    updates = sorted(
-        client.get_updates(state.next_update_id(), timeout_seconds), key=_update_id
-    )
+    updates = sorted(client.get_updates(state.next_update_id(), timeout_seconds), key=_update_id)
     processed = 0
     for raw in updates:
         update_id = _update_id(raw)
@@ -398,7 +413,23 @@ def _process_callback(
         client.answer_callback(callback_id, "Acción no válida")
         return
     try:
-        outcome = state.resolve(match.group(1), user_id, config.allowed_user_id)
+        token = match.group(1)
+        try:
+            outcome = state.resolve(token, user_id, config.allowed_user_id)
+        except ApprovalStateError:
+            action, result, manifest = state.resolve_submission(
+                token, user_id, config.allowed_user_id
+            )
+            if result == "details":
+                client.send_message(config.chat_id, _submission_details_message(manifest))
+                client.answer_callback(callback_id, "Detalles enviados")
+            elif result in {"approved", "already_approved"}:
+                client.answer_callback(callback_id, "Entrega aprobada")
+            elif result in {"declined", "already_declined"}:
+                client.answer_callback(callback_id, "Entrega descartada")
+            else:
+                client.answer_callback(callback_id, "La entrega ya tiene otra decisión")
+            return
     except ApprovalStateError:
         client.answer_callback(callback_id, "Acción caducada o no válida")
         return
@@ -445,26 +476,37 @@ def _details_message(event: NotificationEvent) -> str:
     if event.allows_submissions_from:
         lines.append(
             "Disponible: "
-            + time.strftime(
-                "%Y-%m-%d %H:%M UTC", time.gmtime(event.allows_submissions_from)
-            )
+            + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(event.allows_submissions_from))
         )
     if event.due_date:
         lines.append("Entrega: " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(event.due_date)))
     if event.cutoff_date:
         lines.append(
-            "Cierre: "
-            + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(event.cutoff_date))
+            "Cierre: " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(event.cutoff_date))
         )
     lines.append("Adjuntos:")
     if event.attachments:
         lines.extend(
-            f"- {item.filename} ({item.size_bytes} bytes)"
-            for item in event.attachments[:50]
+            f"- {item.filename} ({item.size_bytes} bytes)" for item in event.attachments[:50]
         )
     else:
         lines.append("- Ninguno")
     return _bounded_message(lines)
+
+
+def _submission_details_message(manifest: object) -> str:
+    if not isinstance(manifest, SubmissionManifest):
+        raise TelegramError("submission details are invalid")
+    return _bounded_message(
+        [
+            "Revisión de entrega",
+            f"Actividad: {manifest.event.assignment_title}",
+            f"Asignación: {manifest.event.assignment_id}",
+            f"Archivo: {manifest.filename}",
+            f"SHA-256: {manifest.report_digest}",
+            f"Manifiesto: {manifest.manifest_digest}",
+        ]
+    )
 
 
 def _bounded_message(lines: list[str]) -> str:

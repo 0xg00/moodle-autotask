@@ -73,6 +73,8 @@ class MoodleAssignmentSnapshot:
     grading_due_date: int
     time_modified: int
     attachments: tuple[MoodleAttachment, ...]
+    submission_drafts: bool = False
+    requires_submission_statement: bool = False
 
 
 def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentSnapshot, ...]:
@@ -113,6 +115,20 @@ def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentS
             }
             if any(_int(value, name) < 0 for name, value in fields.items()):
                 raise MoodlePayloadError("assignment date is invalid")
+            submission_drafts = assignment.get("submissiondrafts")
+            if (
+                not isinstance(submission_drafts, int)
+                or isinstance(submission_drafts, bool)
+                or submission_drafts not in {0, 1}
+            ):
+                raise MoodlePayloadError("assignment submission draft policy is invalid")
+            requires_submission_statement = assignment.get("requiresubmissionstatement")
+            if (
+                not isinstance(requires_submission_statement, int)
+                or isinstance(requires_submission_statement, bool)
+                or requires_submission_statement not in {0, 1}
+            ):
+                raise MoodlePayloadError("assignment submission statement policy is invalid")
             attachments: list[MoodleAttachment] = []
             for area in ("introfiles", "introattachments", "activityattachments"):
                 files = assignment.get(area, [])
@@ -135,6 +151,8 @@ def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentS
                 "course_module_id": cmid,
                 "title": title,
                 "intro": intro,
+                "submission_drafts": bool(submission_drafts),
+                "requires_submission_statement": bool(requires_submission_statement),
                 **fields,
                 "attachments": [
                     {
@@ -162,6 +180,8 @@ def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentS
                     title,
                     intro,
                     attachments=tuple(attachments),
+                    submission_drafts=bool(submission_drafts),
+                    requires_submission_statement=bool(requires_submission_statement),
                     **fields,
                 )
             )

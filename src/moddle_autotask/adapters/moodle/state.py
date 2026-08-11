@@ -70,6 +70,9 @@ class NotificationDraft:
     grading_due_date: int
     time_modified: int
     attachments: tuple[NotificationAttachment, ...]
+    assignment_id: int | None = None
+    submission_drafts: bool = False
+    requires_submission_statement: bool = False
 
     def __post_init__(self) -> None:
         _validate_identity(self.task_key, self.revision_digest)
@@ -91,6 +94,16 @@ class NotificationDraft:
             or len(self.attachments) > 1000
         ):
             raise ValueError("too many notification attachments")
+        if self.assignment_id is not None and (
+            not isinstance(self.assignment_id, int)
+            or isinstance(self.assignment_id, bool)
+            or self.assignment_id <= 0
+        ):
+            raise ValueError("notification assignment identity is invalid")
+        if not isinstance(self.submission_drafts, bool):
+            raise ValueError("notification submission draft policy is invalid")
+        if not isinstance(self.requires_submission_statement, bool):
+            raise ValueError("notification submission statement policy is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +122,9 @@ class NotificationEvent:
     grading_due_date: int
     time_modified: int
     attachments: tuple[NotificationAttachment, ...]
+    assignment_id: int | None = None
+    submission_drafts: bool = False
+    requires_submission_statement: bool = False
 
     def __post_init__(self) -> None:
         if not _EVENT_ID.fullmatch(self.event_id):
@@ -130,6 +146,9 @@ class NotificationEvent:
             self.grading_due_date,
             self.time_modified,
             self.attachments,
+            self.assignment_id,
+            self.submission_drafts,
+            self.requires_submission_statement,
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -148,6 +167,9 @@ class NotificationEvent:
             "grading_due_date": self.grading_due_date,
             "time_modified": self.time_modified,
             "attachments": [item.as_dict() for item in self.attachments],
+            "assignment_id": self.assignment_id,
+            "submission_drafts": self.submission_drafts,
+            "requires_submission_statement": self.requires_submission_statement,
         }
 
 
@@ -649,6 +671,9 @@ def _event_from_draft(draft: NotificationDraft, status: str) -> NotificationEven
         draft.grading_due_date,
         draft.time_modified,
         draft.attachments,
+        draft.assignment_id,
+        draft.submission_drafts,
+        draft.requires_submission_statement,
     )
 
 
@@ -669,7 +694,7 @@ def _event_id(task_key: str, revision_digest: str) -> str:
 def _event_from_json(payload: str) -> NotificationEvent:
     try:
         raw = json.loads(payload)
-        if not isinstance(raw, dict) or set(raw) != {
+        required = {
             "kind",
             "event_id",
             "status",
@@ -684,7 +709,17 @@ def _event_from_json(payload: str) -> NotificationEvent:
             "grading_due_date",
             "time_modified",
             "attachments",
-        }:
+        }
+        permitted_keys = {
+            frozenset(required),
+            frozenset(required | {"assignment_id"}),
+            frozenset(required | {"assignment_id", "submission_drafts"}),
+            frozenset(
+                required
+                | {"assignment_id", "submission_drafts", "requires_submission_statement"}
+            ),
+        }
+        if not isinstance(raw, dict) or set(raw) not in permitted_keys:
             raise ValueError
         attachments = raw["attachments"]
         if not isinstance(attachments, list) or any(
@@ -708,6 +743,9 @@ def _event_from_json(payload: str) -> NotificationEvent:
             raw["grading_due_date"],
             raw["time_modified"],
             tuple(NotificationAttachment(**item) for item in attachments),
+            raw.get("assignment_id"),
+            raw.get("submission_drafts", False),
+            raw.get("requires_submission_statement", False),
         )
         if (
             not _EVENT_ID.fullmatch(event.event_id)

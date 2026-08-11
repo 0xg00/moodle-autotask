@@ -4,14 +4,15 @@ Private-development repository for a provider-neutral task automation foundation
 
 Current functionality includes a narrow Moodle mobile-service connector: it verifies a configured
 site identity, enumerates assignments and official attachment metadata, records explicit local
-acknowledgements, and safely downloads selected plugin-file attachments. It does not submit work,
-use password login, or scrape or automate a browser. The scheduler can emit compact
+acknowledgements, and safely downloads selected plugin-file attachments. It never submits work
+automatically, uses no password login, and does not scrape or automate a browser. The scheduler can emit compact
 JSON locally or send an outbound Telegram message with `Hacer tarea`, `Ignorar`, and `Ver detalles`
 buttons. An exact `Hacer tarea` decision atomically creates durable work. The controller selects
 `central`, `hybrid`, or `in_guest`; modes requiring a machine provision one idempotent Windows lab,
 wait for Systems Manager, execute the exact approved revision through an isolated Codex service,
-return its Markdown report through Telegram, and enforce a two-hour cleanup deadline. Moodle
-submission remains a separate, unimplemented approval boundary. For a practice with exactly one
+return its Markdown report through Telegram, and enforce a two-hour cleanup deadline. A separate
+`Entregar`/`No entregar` Telegram decision binds one canonical report manifest to the exact Moodle
+assignment ID and revision; no successful execution submits automatically. For a practice with exactly one
 `.ova`, the worker re-reads the approved Moodle revision, verifies and stages every attachment in
 private S3, imports the appliance through AWS VM Import/Export with an idempotent token, and launches
 only the resulting owned AMI. Other virtual-disk layouts remain blocked; a blank Windows lab is never
