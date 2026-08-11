@@ -212,11 +212,11 @@ def _deploy_order_contract() -> str:
         "mv -Tf /opt/moodle-autotask/current.next /opt/moodle-autotask/current",
         "moodle-autotask-controller' install",
         "systemctl daemon-reload",
+        "/usr/local/sbin/moodle-autotask-health-prepare",
         "systemctl start moodle-autotask-scheduler.service",
         "systemctl start moodle-autotask-telegram.service",
         "systemctl start moodle-autotask-worker.service",
         "systemctl enable --now moodle-autotask-agent.service",
-        "moodle-autotask-health-prepare",
         "activation_started=$(date +%s)",
         "health-enabled",
         "systemctl enable --now moodle-autotask-health.timer",
@@ -276,6 +276,9 @@ unit_for() {
   unit=$(printf '%s' "${1#moodle-autotask-}" | sed 's/\\.service$//')
   if [ "$unit" = health.timer ]; then printf timer; else printf '%s' "$unit"; fi
 }
+timer_unit_exists() {
+  test -f "$FAKE_ROOT/etc/systemd/system/moodle-autotask-health.timer"
+}
 failed() {
   key="$1"
   [ "${FAKE_FAIL:-}" = "$key" ] && [ ! -e "$FAKE_STATE/failed-$key" ] \\
@@ -293,13 +296,30 @@ case "$command" in
       *' SubState '*) printf '%s\n' "$substate" ;;
       *) printf '%s\n%s\n' "$state" "$substate" ;;
     esac ;;
-  cat) test -f "$FAKE_STATE/unit-agent" ;;
+  cat)
+    case "$1" in
+      moodle-autotask-agent.service) test -f "$FAKE_STATE/unit-agent" ;;
+      moodle-autotask-health.timer) timer_unit_exists ;;
+      *) exit 1 ;;
+    esac ;;
   daemon-reload) if failed daemon-reload; then exit 92; fi ;;
   start|stop|enable|disable)
     now=false; if [ "${1:-}" = --now ]; then now=true; shift; fi
     if failed "$command"; then exit 92; fi
     for service in "$@"; do
       unit=$(unit_for "$service")
+      if [ "${FAKE_STRICT_TIMER_UNIT:-false}" = true ] && [ "$unit" = timer ] \
+        && ! timer_unit_exists; then
+        printf 'Failed to %s unit: Unit file moodle-autotask-health.timer does not exist.\n' \
+          "$command" >&2
+        exit 5
+      fi
+      if [ "$command" = start ] && [ "$unit" = scheduler ]; then
+        test -d "$FAKE_ROOT/run/moodle-autotask-health" \
+          && test ! -L "$FAKE_ROOT/run/moodle-autotask-health" \
+          && test "$(stat -c '%u:%g:%a' "$FAKE_ROOT/run/moodle-autotask-health")" = 0:0:711
+        touch "$FAKE_STATE/scheduler-health-root-ready"
+      fi
       if failed "$command-$unit"; then exit 92; fi
       case "$command" in
         start) touch "$FAKE_STATE/active-$unit" ;;
@@ -320,8 +340,11 @@ esac
             "run/moodle-autotask-health",
             "opt/moodle-autotask/current/venv/bin",
             "usr/local/sbin",
+            "etc/codex",
+            "etc/systemd/system",
         ):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
+        (self.root / "run/moodle-autotask-health").chmod(0o711)
         for service in _SERVICES:
             pulse = self.root / "run/moodle-autotask-health" / service
             pulse.touch()
@@ -382,12 +405,15 @@ esac
             payload = payload.replace(original, str(replacement))
         return payload.replace("__HARNESS_RELEASE_PATH__", harness_release)
 
-    def run(self, payload: str, *, failure: str = "") -> subprocess.CompletedProcess[str]:
+    def run(
+        self, payload: str, *, failure: str = "", strict_timer_unit: bool = False
+    ) -> subprocess.CompletedProcess[str]:
         environment = os.environ | {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "FAKE_FAIL": failure,
             "FAKE_ROOT": str(self.root),
             "FAKE_STATE": str(self.state),
+            "FAKE_STRICT_TIMER_UNIT": str(strict_timer_unit).lower(),
         }
         return subprocess.run(
             ["bash", "-c", self.render(payload)],
@@ -479,7 +505,24 @@ def _post_guard_payload(
     for relative, mode in _CONTROLLER_FILES:
         target = f"/{relative}"
         if relative.endswith("moodle-autotask-health-prepare"):
-            lines.append(f"printf '#!/usr/bin/env bash\\nexit 0\\n' > {shlex.quote(target)}")
+            prepare = "\n".join(
+                (
+                    "#!/usr/bin/env bash",
+                    "set -eu",
+                    "root=/run/moodle-autotask-health",
+                    'if [ -e "$root" ] || [ -L "$root" ]; then',
+                    "  test -d \"$root\" && test ! -L \"$root\" && "
+                    "test \"$(stat -c '%u:%g:%a' \"$root\")\" = 0:0:711",
+                    "else",
+                    '  install -d -o root -g root -m 0711 "$root"',
+                    "fi",
+                    "for pulse in scheduler telegram worker agent; do",
+                    '  install -o root -g root -m 0620 /dev/null "$root/$pulse"',
+                    "done",
+                    "",
+                )
+            )
+            lines.append(f"printf %s {shlex.quote(prepare)} > {shlex.quote(target)}")
         else:
             lines.append(f"printf '%s' new-{shlex.quote(relative)} > {shlex.quote(target)}")
         lines.append(f"chmod {mode:o} {shlex.quote(target)}")
@@ -487,6 +530,7 @@ def _post_guard_payload(
         (
             "fault after-controller-files",
             "systemctl daemon-reload",
+            "/usr/local/sbin/moodle-autotask-health-prepare",
             'if [ "$scheduler_was_active" = true ]; then systemctl start '
             "moodle-autotask-scheduler.service; fi",
             'if [ "$telegram_was_active" = true ]; then systemctl start '
@@ -865,6 +909,55 @@ def test_legacy_three_success_creates_marker_after_agent_upgrade_and_fresh_pulse
         frozenset({"scheduler", "telegram", "worker", "agent", "timer"}),
     )
     _assert_no_deploy_backups(harness)
+
+
+def test_legacy_controller_creates_health_root_before_the_first_scheduler_start(
+    tmp_path: Path,
+) -> None:
+    harness = _RemoteHarness(tmp_path)
+    harness.set_states(
+        {"scheduler", "telegram", "worker"},
+        {"scheduler", "telegram", "worker"},
+        timer=(False, False),
+        agent_unit=False,
+    )
+    new_release, _ = _deploy_fixture(harness, controller_files=False, marker=False)
+    shutil.rmtree(harness.root / "run/moodle-autotask-health")
+    config = harness.root / "etc/moodle-autotask/scheduler.json"
+
+    result = harness.run(_post_guard_payload(harness, new_release, config))
+
+    health_root = harness.root / "run/moodle-autotask-health"
+    assert result.returncode == 0, result.stderr
+    assert (harness.state / "scheduler-health-root-ready").is_file()
+    assert health_root.is_dir() and not health_root.is_symlink()
+    assert (health_root.stat().st_uid, health_root.stat().st_gid) == (0, 0)
+    assert health_root.stat().st_mode & 0o777 == 0o711
+
+
+def test_legacy_health_timer_absence_keeps_the_scheduler_failure_status_on_rollback(
+    tmp_path: Path,
+) -> None:
+    harness = _RemoteHarness(tmp_path)
+    harness.set_states(
+        {"scheduler", "telegram", "worker"},
+        {"scheduler", "telegram", "worker"},
+        timer=(False, False),
+        agent_unit=False,
+    )
+    new_release, _ = _deploy_fixture(harness, controller_files=False, marker=False)
+    shutil.rmtree(harness.root / "run/moodle-autotask-health")
+    config = harness.root / "etc/moodle-autotask/scheduler.json"
+    prior = harness.snapshot()
+
+    payload = _post_guard_payload(harness, new_release, config)
+    result = harness.run(payload, failure="start-scheduler", strict_timer_unit=True)
+
+    assert result.returncode == 92
+    assert "Failed to disable unit" not in result.stderr
+    assert (harness.state / "scheduler-health-root-ready").is_file()
+    assert harness.snapshot() == prior
+    assert not (harness.root / "etc/systemd/system/moodle-autotask-health.timer").exists()
 
 
 def test_legacy_three_pulse_timeout_leaves_the_marker_absent(tmp_path: Path) -> None:
