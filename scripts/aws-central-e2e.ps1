@@ -177,11 +177,11 @@ function Test-LocalMoodleTokenFile {
         Fail 'Local Moodle token file is incomplete.'
     }
     try { $uri = [Uri][string]$baseUrl } catch { Fail 'Local Moodle token URL is invalid.' }
-    $host = $uri.Host
-    $localHost = $host -eq 'localhost' -or $host -eq '127.0.0.1' -or
-        $host -match '^10\.' -or $host -match '^192\.168\.' -or
-        $host -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.' -or
-        $host -match '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'
+    $uriHost = $uri.Host
+    $localHost = $uriHost -eq 'localhost' -or $uriHost -eq '127.0.0.1' -or
+        $uriHost -match '^10\.' -or $uriHost -match '^192\.168\.' -or
+        $uriHost -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.' -or
+        $uriHost -match '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'
     if ($uri.Scheme -ne 'http' -or -not $localHost) {
         Fail 'Central E2E accepts only the local fictitious Moodle token file.'
     }

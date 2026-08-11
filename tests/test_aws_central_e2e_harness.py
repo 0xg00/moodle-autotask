@@ -40,6 +40,51 @@ def test_harness_requires_explicit_scoped_live_inputs_and_bounded_timeout() -> N
     assert "Get-RestoreScopeScript" in script
 
 
+def test_local_moodle_token_validation_executes_under_windows_powershell_5(tmp_path: Path) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell 5 is unavailable")
+    source = read(HARNESS)
+    helpers = source[source.index("function Fail {") : source.index("function Write-Evidence {")]
+    start = source.index("function Test-LocalMoodleTokenFile {")
+    function = source[start : source.index("function Get-ControllerPreflightScript {", start)]
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    token = runtime / "moodle-token.json"
+    base_url = "http://127.0.0.1:8080"
+    token_value = "local-test-token"
+    token.write_text(json.dumps({"baseUrl": base_url, "token": token_value}), encoding="utf-8")
+    expected = hashlib.sha256(
+        b"moodle-autotask-e2e-credential-v1\0" + base_url.encode() + b"\0" + token_value.encode()
+    ).hexdigest()
+    driver = tmp_path / "token-validation.ps1"
+    driver.write_text(
+        "Set-StrictMode -Version Latest\n$ErrorActionPreference = 'Stop'\n"
+        f"$RuntimeRoot = '{runtime}'\n$MoodleTokenFile = '{token}'\n"
+        "$script:Evidence = [ordered]@{ phases = @() }\n"
+        + helpers
+        + function
+        + f"\n$digest = Test-LocalMoodleTokenFile\nif ($digest -ne '{expected}') {{ exit 7 }}\n"
+        + "if ($script:Evidence.phases.Count -ne 1) { exit 8 }\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(driver),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_run_id_contract_is_exact_and_shared_with_disposable_fixture() -> None:
     expected = r"^[a-z0-9](?:[a-z0-9-]{6,38}[a-z0-9])$"
     assert expected in read(HARNESS)
