@@ -47,7 +47,14 @@ only the approved assignment snapshot and verified non-appliance attachments to 
 directory is synced and renamed; startup revalidates prior inputs and replaces an incomplete stale
 directory before Codex can run. A root-owned Codex policy denies sandboxed commands access to the authentication
 cache and application secrets, disables tool network access, and prevents permission escalation.
-Central work returns a structured Markdown report. Lab work first returns bounded PowerShell
+Central work is three fresh, stateless `central_planner`, `central_executor`, and
+`central_reviewer` jobs. The planner has no operational authority; its ordered plan binds the
+executor's exact `outputs/` set and the reviewer receives only wrapper-validated plan, evidence,
+manifest, and dependency digests. The collector accepts 1--64 regular files (2 MiB each,
+1,900,000 raw bytes) with canonical POSIX paths and publishes a deterministic stored ZIP under
+its SHA-256. Central success is impossible without reviewer acceptance, all role/result digests,
+and immutable bundle provenance. Telegram sends the reviewed Markdown and verified ZIP at least
+once; crashes between sends may duplicate them. Lab work first returns bounded PowerShell
 commands; the worker validates the opaque handle and ownership tags, executes the plan with the
 official Systems Manager document, and sends the transcript back for an evidence-based final report.
 A guest-side execution marker makes retries idempotent and fails closed if a previous execution is

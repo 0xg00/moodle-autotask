@@ -335,8 +335,42 @@ def test_completion_outbox_survives_restart_without_reclaiming_central_work(tmp_
     assert state.mark_ready(pending, now=3, for_execution=True)
     ready = state.claim_work("worker", 300, now=4)
     assert ready is not None
+    manifest = {
+        "kind": "artifact-manifest-v1",
+        "files": [{"path": "report.md", "size": 1, "sha256": "0" * 64}],
+        "totals": {"bytes": 1, "files": 1},
+    }
+    manifest_digest = sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    planner, executor, reviewer = ("a" * 64, "b" * 64, "c" * 64)
+    provenance = {
+        "kind": "moodle-central-provenance-v2",
+        "roles": ["central_planner", "central_executor", "central_reviewer"],
+        "jobIds": [planner, executor, reviewer],
+        "plannerJobId": planner,
+        "executorJobId": executor,
+        "reviewerJobId": reviewer,
+        "selectedMode": "central",
+        "specificationDigest": "d" * 64,
+        "preparedInputManifestDigest": "e" * 64,
+        "planDigest": "f" * 64,
+        "plannerResultDigest": "1" * 64,
+        "executorResultDigest": "2" * 64,
+        "artifactManifestDigest": manifest_digest,
+        "artifactBundleDigest": "3" * 64,
+        "reviewerResultDigest": "4" * 64,
+        "reviewerAccepted": True,
+        "bundleLocator": f"bundles/{'3' * 64}.zip",
+        "artifactManifest": manifest,
+    }
     assert state.complete_execution(
-        ready, succeeded=True, summary="done", report_markdown="# done", now=4
+        ready,
+        succeeded=True,
+        summary="done",
+        report_markdown="# done",
+        provenance=provenance,
+        now=4,
     )
 
     restarted = ApprovalState(path)

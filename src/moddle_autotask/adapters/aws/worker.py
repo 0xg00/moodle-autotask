@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, cast, runtime_checkable
 
 from moddle_autotask.adapters.moodle.approval_state import (
@@ -207,7 +207,10 @@ def _process_claim(
     if item.status == "ready" and execution_broker is not None:
         if artifact_preparer is None:
             raise RuntimeError("artifact preparer is unavailable during execution")
-        prepared = artifact_preparer.prepare(item.event)
+        prepared = replace(
+            artifact_preparer.prepare(item.event),
+            specification_digest=item.specification_digest.value,
+        )
         progress = execution_broker.step(
             item.event,
             prepared,
@@ -225,6 +228,7 @@ def _process_claim(
                 succeeded=False,
                 summary=progress.summary,
                 report_markdown=progress.report_markdown,
+                provenance=progress.provenance,
                 now=now,
             ):
                 return WorkerCycle("ownership_lost", item.selected_mode)
@@ -234,6 +238,7 @@ def _process_claim(
             succeeded=True,
             summary=progress.summary,
             report_markdown=progress.report_markdown,
+            provenance=progress.provenance,
             now=now,
         ):
             return WorkerCycle("ownership_lost", item.selected_mode)
@@ -282,6 +287,7 @@ def _deliver_pending_notification(
             "succeeded" if notification.succeeded else "failed",
             notification.summary,
             notification.report_markdown,
+            notification.provenance,
         )
         try:
             notifier.notify(notification.event, progress)

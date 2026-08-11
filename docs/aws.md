@@ -246,6 +246,15 @@ network access, permits only the managed workspace profile, and denies sandboxed
 access to both `/var/lib/moodle-agent/.codex` and `/etc/moodle-autotask`. The systemd unit also blocks
 both EC2 Instance Metadata Service addresses, so the agent cannot obtain the controller role credentials.
 
+Central jobs are not a conversational terminal session. The spool executes three isolated Codex
+invocations (`central_planner`, `central_executor`, `central_reviewer`) with different job IDs and
+workspaces. Planner text is untrusted operational data and cannot enable commands, network,
+AWS, Moodle, or lab access. The executor must create only the planner's expected `outputs/` paths;
+the wrapper validates and publishes a deterministic ZIP (at most 64 regular files, 2 MiB per file,
+1,900,000 raw bytes, and 512 MiB retained-bundle quota). The reviewer binds every plan/executor
+digest and rejects terminally without an automatic replan. Bundle/report delivery is at least once;
+Telegram duplicates are possible after a crash. The existing lab plan/SSM/report split is unchanged.
+
 Start the headless device-code flow after the first deployment:
 
 ```powershell

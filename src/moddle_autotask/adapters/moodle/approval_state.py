@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass
 from hashlib import sha256
 from html.parser import HTMLParser
@@ -70,6 +71,7 @@ class ExecutionNotification:
     succeeded: bool
     summary: str
     report_markdown: str
+    provenance: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -669,6 +671,7 @@ class ApprovalState:
         succeeded: bool,
         summary: str,
         report_markdown: str,
+        provenance: dict[str, object] | None = None,
         now: int | None = None,
     ) -> bool:
         if claim.item.status != "ready" or not isinstance(succeeded, bool):
@@ -681,8 +684,25 @@ class ApprovalState:
         ):
             raise ApprovalStateError("execution completion is invalid")
         moment = _now(now)
+        central = claim.item.selected_mode is ExecutionMode.CENTRAL
+        if (
+            (central and succeeded and provenance is None)
+            or ((not central or not succeeded) and provenance is not None)
+            or (provenance is not None and not isinstance(provenance, dict))
+        ):
+            raise ApprovalStateError("execution provenance is invalid")
+        if provenance is not None:
+            _validate_execution_provenance(provenance)
+        payload_value: dict[str, object] = {
+            "reportMarkdown": report_markdown,
+            "succeeded": succeeded,
+            "summary": summary,
+        }
+        if provenance is not None:
+            payload_value["kind"] = "moodle-execution-outcome-v2"
+            payload_value["provenance"] = provenance
         payload = json.dumps(
-            {"reportMarkdown": report_markdown, "succeeded": succeeded, "summary": summary},
+            payload_value,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -728,19 +748,27 @@ class ApprovalState:
         try:
             with self._connect() as connection:
                 row = connection.execute(
-                    "SELECT r.payload, o.payload FROM execution_outbox o JOIN requests r "
-                    "ON r.event_id = o.event_id WHERE o.delivered_at IS NULL "
+                    "SELECT r.payload, o.payload, w.selected_mode FROM execution_outbox o JOIN requests r "
+                    "ON r.event_id = o.event_id JOIN work_items w ON w.event_id = o.event_id WHERE o.delivered_at IS NULL "
                     "ORDER BY o.created_at, o.event_id LIMIT 1"
                 ).fetchone()
                 if row is None:
                     return None
                 event = _event_from_json(str(row[0]))
                 payload = json.loads(str(row[1]))
-                if not isinstance(payload, dict) or set(payload) != {
-                    "reportMarkdown",
-                    "succeeded",
-                    "summary",
-                }:
+                if not isinstance(payload, dict):
+                    raise ApprovalStateError("stored execution completion is corrupt")
+                is_v2 = payload.get("kind") == "moodle-execution-outcome-v2"
+                if (str(row[2]) == "central" and bool(payload.get("succeeded")) and not is_v2) or (
+                    str(row[2]) != "central" and is_v2
+                ):
+                    raise ApprovalStateError("stored execution completion is corrupt")
+                expected = (
+                    {"kind", "provenance", "reportMarkdown", "succeeded", "summary"}
+                    if is_v2
+                    else {"reportMarkdown", "succeeded", "summary"}
+                )
+                if set(payload) != expected:
                     raise ApprovalStateError("stored execution completion is corrupt")
                 succeeded, summary, report = (
                     payload["succeeded"],
@@ -753,7 +781,12 @@ class ApprovalState:
                     or not isinstance(report, str)
                 ):
                     raise ApprovalStateError("stored execution completion is corrupt")
-                return ExecutionNotification(event, succeeded, summary, report)
+                provenance = payload.get("provenance") if is_v2 else None
+                if provenance is not None and not isinstance(provenance, dict):
+                    raise ApprovalStateError("stored execution completion is corrupt")
+                if provenance is not None:
+                    _validate_execution_provenance(provenance)
+                return ExecutionNotification(event, succeeded, summary, report, provenance)
         except (ValueError, sqlite3.Error) as error:
             raise ApprovalStateError("could not read execution completion") from error
 
@@ -1712,6 +1745,123 @@ def _provision_key(event: NotificationEvent, specification_digest: str) -> str:
     return sha256(
         f"moodle-work-provision-v1\0{event.event_id}\0{specification_digest}".encode()
     ).hexdigest()
+
+
+def _validate_execution_provenance(value: dict[str, object]) -> None:
+    """Strict v2 decoder: central outcomes never accept caller-defined metadata."""
+    required = {
+        "kind",
+        "roles",
+        "jobIds",
+        "selectedMode",
+        "specificationDigest",
+        "preparedInputManifestDigest",
+        "plannerJobId",
+        "executorJobId",
+        "reviewerJobId",
+        "planDigest",
+        "plannerResultDigest",
+        "executorResultDigest",
+        "artifactManifestDigest",
+        "artifactBundleDigest",
+        "reviewerResultDigest",
+        "reviewerAccepted",
+        "bundleLocator",
+        "artifactManifest",
+    }
+    if set(value) != required or value.get("kind") != "moodle-central-provenance-v2":
+        raise ApprovalStateError("execution provenance is invalid")
+    if value.get("roles") != ["central_planner", "central_executor", "central_reviewer"]:
+        raise ApprovalStateError("execution provenance is invalid")
+    job_ids = value.get("jobIds")
+    if (
+        not isinstance(job_ids, list)
+        or len(job_ids) != 3
+        or not all(isinstance(item, str) and _DIGEST.fullmatch(item) for item in job_ids)
+    ):
+        raise ApprovalStateError("execution provenance is invalid")
+    if len(set(job_ids)) != 3 or job_ids != [
+        value.get("plannerJobId"),
+        value.get("executorJobId"),
+        value.get("reviewerJobId"),
+    ]:
+        raise ApprovalStateError("execution provenance is invalid")
+    if value.get("selectedMode") != "central" or value.get("reviewerAccepted") is not True:
+        raise ApprovalStateError("execution provenance is invalid")
+    digest_fields = required - {
+        "kind",
+        "roles",
+        "jobIds",
+        "selectedMode",
+        "reviewerAccepted",
+        "bundleLocator",
+        "artifactManifest",
+    }
+    if not all(
+        isinstance(value.get(field), str) and _DIGEST.fullmatch(str(value[field]))
+        for field in digest_fields
+    ):
+        raise ApprovalStateError("execution provenance is invalid")
+    bundle = value.get("bundleLocator")
+    if bundle != f"bundles/{value['artifactBundleDigest']}.zip":
+        raise ApprovalStateError("execution provenance is invalid")
+    manifest = value.get("artifactManifest")
+    if not isinstance(manifest, dict):
+        raise ApprovalStateError("execution provenance is invalid")
+    _validate_outcome_manifest(manifest)
+    canonical = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    if sha256(canonical).hexdigest() != value["artifactManifestDigest"]:
+        raise ApprovalStateError("execution provenance is invalid")
+
+
+def _validate_outcome_manifest(manifest: dict[str, object]) -> None:
+    if (
+        set(manifest) != {"kind", "files", "totals"}
+        or manifest.get("kind") != "artifact-manifest-v1"
+    ):
+        raise ApprovalStateError("execution provenance is invalid")
+    files, totals = manifest.get("files"), manifest.get("totals")
+    if (
+        not isinstance(files, list)
+        or not 1 <= len(files) <= 64
+        or not isinstance(totals, dict)
+        or set(totals) != {"files", "bytes"}
+    ):
+        raise ApprovalStateError("execution provenance is invalid")
+    previous = b""
+    seen: set[str] = set()
+    total = 0
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            raise ApprovalStateError("execution provenance is invalid")
+        path, size, digest = item.get("path"), item.get("size"), item.get("sha256")
+        parts = path.split("/") if isinstance(path, str) else []
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or len(path.encode("utf-8")) > 240
+            or not 1 <= len(parts) <= 8
+            or any(not part or part in {".", ".."} for part in parts)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or _DIGEST.fullmatch(digest) is None
+        ):
+            raise ApprovalStateError("execution provenance is invalid")
+        encoded = path.encode("utf-8")
+        key = unicodedata.normalize("NFC", path).casefold()
+        if encoded <= previous or key in seen:
+            raise ApprovalStateError("execution provenance is invalid")
+        previous = encoded
+        seen.add(key)
+        total += size
+    if total > 1_900_000 or totals != {"files": len(files), "bytes": total}:
+        raise ApprovalStateError("execution provenance is invalid")
 
 
 def _assert_safe_path(path: Path) -> None:

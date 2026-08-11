@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         telegram_config = TelegramConfig.from_file(args.telegram_config_file)
         execution_notifier = TelegramExecutionNotifier(
-            telegram_config, TelegramClient(telegram_config)
+            telegram_config, TelegramClient(telegram_config), args.agent_results / "bundles"
         )
         submission_service = MoodleSubmissionClient(
             MoodleConnectionConfig.from_token_file(args.token_file)

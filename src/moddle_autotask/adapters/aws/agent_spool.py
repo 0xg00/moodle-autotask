@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import json
 import os
 import re
@@ -11,6 +12,8 @@ import secrets
 import shutil
 import stat
 import tempfile
+import unicodedata
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -24,13 +27,24 @@ from .labs import JsonCommandRunner, LabTranscript
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RESULT_BYTES = 2 * 1024 * 1024
+# Central results are embedded in subsequent immutable jobs.  Keep their
+# envelope deliberately small so an accepted upstream result cannot produce a
+# downstream job that exceeds the agent's maximum readable size.
+_MAX_CENTRAL_RESULT_BYTES = 256 * 1024
 _MAX_COMMANDS = 32
 _MAX_COMMAND_BYTES = 24 * 1024
 _DISPATCH_KIND = "moodle-lab-dispatch-v1"
 _COMMAND_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_CENTRAL_ROLES = ("central_planner", "central_executor", "central_reviewer")
+_CENTRAL_JOB_KIND = "moodle-agent-job-v2"
+_CENTRAL_RESULT_KIND = "moodle-agent-result-v2"
 
 
 class AgentSpoolError(RuntimeError):
+    pass
+
+
+class _CentralJobBudgetExceeded(AgentSpoolError):
     pass
 
 
@@ -53,6 +67,7 @@ class ExecutionProgress:
     status: str
     summary: str = ""
     report_markdown: str = ""
+    provenance: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"pending", "succeeded", "failed"}:
@@ -91,11 +106,7 @@ class FileAgentBroker:
         ):
             raise AgentSpoolError("prepared assignment does not match approval")
         if mode is ExecutionMode.CENTRAL:
-            job_id = self._ensure_job("central", event, prepared, None)
-            result = self._result(job_id, "central")
-            if result is None:
-                return ExecutionProgress("pending")
-            return _final_progress(result)
+            return self._step_central(event, prepared)
         if lab_handle is None:
             raise AgentSpoolError("lab execution requires a lab handle")
         plan_id = self._ensure_job("lab_plan", event, prepared, None)
@@ -129,6 +140,272 @@ class FileAgentBroker:
             return ExecutionProgress("pending")
         return _final_progress(report)
 
+    def _step_central(
+        self, event: NotificationEvent, prepared: PreparedAssignment
+    ) -> ExecutionProgress:
+        """Advance exactly one stateless, digest-bound central role at a time."""
+        try:
+            planner_id = self._ensure_central_job("central_planner", event, prepared, {})
+        except _CentralJobBudgetExceeded:
+            return ExecutionProgress("failed", "Central job exceeds serialized size budget")
+        planner = self._central_result(planner_id, "central_planner")
+        if planner is None:
+            return ExecutionProgress("pending")
+        if not bool(planner["succeeded"]):
+            return ExecutionProgress("failed", str(planner["summary"]))
+        plan = cast(dict[str, object], planner["plan"])
+        dependencies: dict[str, str] = {
+            "plannerJobId": planner_id,
+            "planDigest": cast(str, planner["planDigest"]),
+            "plannerResultDigest": cast(str, planner["plannerResultDigest"]),
+        }
+        try:
+            executor_id = self._ensure_central_job(
+                "central_executor", event, prepared, dependencies, plan=plan
+            )
+        except _CentralJobBudgetExceeded:
+            return ExecutionProgress("failed", "Central job exceeds serialized size budget")
+        executor = self._central_result(executor_id, "central_executor")
+        if executor is None:
+            return ExecutionProgress("pending")
+        if not bool(executor["succeeded"]):
+            return ExecutionProgress("failed", str(executor["summary"]))
+        self._verify_bundle(
+            cast(dict[str, object], executor["artifactManifest"]),
+            cast(str, executor["artifactBundleDigest"]),
+        )
+        expected_criteria = {
+            cast(str, criterion["id"])
+            for criterion in cast(list[dict[str, object]], plan["acceptanceCriteria"])
+        }
+        if set(cast(dict[str, object], executor["evidence"])) != expected_criteria:
+            raise AgentSpoolError("executor criterion coverage is invalid")
+        review_dependencies: dict[str, str] = {
+            **dependencies,
+            "executorJobId": executor_id,
+            "executorResultDigest": cast(str, executor["executorResultDigest"]),
+            "artifactManifestDigest": cast(str, executor["artifactManifestDigest"]),
+            "artifactBundleDigest": cast(str, executor["artifactBundleDigest"]),
+        }
+        try:
+            reviewer_id = self._ensure_central_job(
+                "central_reviewer",
+                event,
+                prepared,
+                review_dependencies,
+                plan=plan,
+                executor_result=executor,
+            )
+        except _CentralJobBudgetExceeded:
+            return ExecutionProgress("failed", "Central job exceeds serialized size budget")
+        reviewer = self._central_result(reviewer_id, "central_reviewer")
+        if reviewer is None:
+            return ExecutionProgress("pending")
+        if not bool(reviewer["succeeded"]):
+            return ExecutionProgress(
+                "failed", str(reviewer["summary"]), str(reviewer["reportMarkdown"])
+            )
+        expected_criteria = {
+            cast(str, criterion["id"])
+            for criterion in cast(list[dict[str, object]], plan["acceptanceCriteria"])
+        }
+        if set(cast(dict[str, object], reviewer.get("decisions", {}))) != expected_criteria:
+            raise AgentSpoolError("reviewer criterion coverage is invalid")
+        expected_digests = {
+            key: value for key, value in review_dependencies.items() if key.endswith("Digest")
+        }
+        if reviewer.get("dependencyDigests") != expected_digests:
+            raise AgentSpoolError("reviewer dependency binding is invalid")
+        if not bool(reviewer["accepted"]):
+            return ExecutionProgress(
+                "failed", str(reviewer["summary"]), str(reviewer["reportMarkdown"])
+            )
+        provenance = {
+            "kind": "moodle-central-provenance-v2",
+            "roles": list(_CENTRAL_ROLES),
+            "jobIds": [planner_id, executor_id, reviewer_id],
+            "plannerJobId": planner_id,
+            "executorJobId": executor_id,
+            "reviewerJobId": reviewer_id,
+            "selectedMode": "central",
+            "specificationDigest": prepared.specification_digest,
+            "preparedInputManifestDigest": self._prepared_manifest_digest(event, prepared),
+            **review_dependencies,
+            # The manifest is verified wrapper data carried in executorResult;
+            # it is not a string digest dependency in the reviewer job.
+            "artifactManifest": executor["artifactManifest"],
+            "reviewerResultDigest": reviewer["reviewerResultDigest"],
+            "reviewerAccepted": True,
+            "bundleLocator": executor["bundleLocator"],
+        }
+        return ExecutionProgress(
+            "succeeded", str(reviewer["summary"]), str(reviewer["reportMarkdown"]), provenance
+        )
+
+    def _verify_bundle(self, manifest: dict[str, object], digest: str) -> None:
+        path = self.results_root / "bundles" / f"{digest}.zip"
+        raw = _read_regular(path, _MAX_RESULT_BYTES)
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise AgentSpoolError("central artifact bundle digest is invalid")
+        files = manifest.get("files")
+        if not isinstance(files, list):
+            raise AgentSpoolError("central artifact manifest is invalid")
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                expected_names = [item.get("path") for item in files if isinstance(item, dict)]
+                if archive.namelist() != expected_names or len(expected_names) != len(files):
+                    raise AgentSpoolError("central artifact bundle entries are invalid")
+                for info, item in zip(archive.infolist(), files, strict=True):
+                    if not isinstance(item, dict):
+                        raise AgentSpoolError("central artifact manifest is invalid")
+                    content = archive.read(info)
+                    if (
+                        info.is_dir()
+                        or info.compress_type != zipfile.ZIP_STORED
+                        or len(content) != item.get("size")
+                        or hashlib.sha256(content).hexdigest() != item.get("sha256")
+                    ):
+                        raise AgentSpoolError("central artifact bundle contents are invalid")
+        except (OSError, zipfile.BadZipFile) as error:
+            raise AgentSpoolError("central artifact bundle is invalid") from error
+
+    def _prepared_manifest_digest(
+        self, event: NotificationEvent, prepared: PreparedAssignment
+    ) -> str:
+        return hashlib.sha256(
+            _canonical(
+                [
+                    {
+                        "filename": item.filename,
+                        "sizeBytes": item.size_bytes,
+                        "sha256": item.sha256,
+                        "attachmentKey": item.attachment_key,
+                        "path": f"inputs/{index:04d}-{item.filename}",
+                    }
+                    for index, item in enumerate(self._agent_artifacts(event, prepared))
+                ]
+            )
+        ).hexdigest()
+
+    def _ensure_central_job(
+        self,
+        role: str,
+        event: NotificationEvent,
+        prepared: PreparedAssignment,
+        dependencies: dict[str, str],
+        *,
+        plan: dict[str, object] | None = None,
+        executor_result: dict[str, object] | None = None,
+    ) -> str:
+        if role not in _CENTRAL_ROLES or _DIGEST.fullmatch(prepared.specification_digest) is None:
+            raise AgentSpoolError("central job authority is invalid")
+        snapshot = {
+            "courseName": prepared.course_name,
+            "courseShortname": prepared.course_shortname,
+            "title": prepared.title,
+            "intro": prepared.intro,
+        }
+        body: dict[str, object] = {
+            "kind": _CENTRAL_JOB_KIND,
+            "role": role,
+            "eventId": event.event_id,
+            "taskKey": event.task_key,
+            "revisionDigest": event.revision_digest,
+            "selectedMode": "central",
+            "specificationDigest": prepared.specification_digest,
+            "preparedInputManifestDigest": self._prepared_manifest_digest(event, prepared),
+            "assignmentSnapshot": snapshot,
+            "preparedInputs": [
+                {
+                    "attachmentKey": a.attachment_key,
+                    "filename": a.filename,
+                    "sizeBytes": a.size_bytes,
+                    "sha256": a.sha256,
+                    "path": f"inputs/{i:04d}-{a.filename}",
+                }
+                for i, a in enumerate(self._agent_artifacts(event, prepared))
+            ],
+            "dependencies": dependencies,
+        }
+        if plan is not None:
+            body["plan"] = plan
+        if executor_result is not None:
+            # The reviewer receives only verified wrapper data, never the workspace.
+            body["executorResult"] = executor_result
+        job_id = hashlib.sha256(_canonical(body)).hexdigest()
+        payload = {"jobId": job_id, **body}
+        if len(_canonical(payload)) > _MAX_RESULT_BYTES:
+            raise _CentralJobBudgetExceeded("central job exceeds serialized size budget")
+        self._publish_central_job(job_id, payload, event, prepared)
+        return job_id
+
+    def _publish_central_job(
+        self,
+        job_id: str,
+        payload: dict[str, object],
+        event: NotificationEvent,
+        prepared: PreparedAssignment,
+    ) -> None:
+        encoded = _canonical(payload)
+        if len(encoded) > _MAX_RESULT_BYTES:
+            raise AgentSpoolError("central job exceeds serialized size budget")
+        target = self.jobs_root / job_id
+        self._safe_root(self.jobs_root)
+        if target.exists() or target.is_symlink():
+            assert_no_indirection(target)
+            if (
+                not target.is_dir()
+                or _read_regular(target / "job.json", _MAX_RESULT_BYTES) != encoded
+            ):
+                raise AgentSpoolError("existing central job conflicts")
+            return
+        temporary = Path(tempfile.mkdtemp(prefix=f".{job_id}.", dir=self.jobs_root))
+        try:
+            # jobs_root is setgid to the controller/agent shared group.
+            # Retain it on every directory so file group access does not
+            # depend on the controller process's primary group.
+            os.chmod(temporary, 0o2750)
+            inputs = temporary / "inputs"
+            inputs.mkdir(mode=0o2750)
+            os.chmod(inputs, 0o2750)
+            for index, artifact in enumerate(self._agent_artifacts(event, prepared)):
+                self._download(artifact, inputs / f"{index:04d}-{artifact.filename}")
+            _write_exclusive(temporary / "job.json", encoded, 0o640)
+            _fsync_directory(inputs)
+            _fsync_directory(temporary)
+            try:
+                temporary.rename(target)
+                _fsync_directory(self.jobs_root)
+            except OSError as error:
+                if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                if (
+                    not target.is_dir()
+                    or _read_regular(target / "job.json", _MAX_RESULT_BYTES) != encoded
+                ):
+                    raise AgentSpoolError("concurrent agent job conflicts") from None
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+
+    def _central_result(self, job_id: str, role: str) -> dict[str, object] | None:
+        path = self.results_root / f"{job_id}.json"
+        self._safe_root(self.results_root)
+        if not path.exists() and not path.is_symlink():
+            return None
+        try:
+            result = cast(dict[str, object], json.loads(_read_regular(path, _MAX_RESULT_BYTES)))
+        except (json.JSONDecodeError, TypeError) as error:
+            raise AgentSpoolError("central result is invalid") from error
+        if (
+            result.get("kind") != _CENTRAL_RESULT_KIND
+            or result.get("jobId") != job_id
+            or result.get("role") != role
+        ):
+            raise AgentSpoolError("central result identity is invalid")
+        _validate_central_result(result, role)
+        return result
+
     def _dispatch_or_resume(
         self,
         lab_executor: LabCommandExecutor,
@@ -138,9 +415,7 @@ class FileAgentBroker:
         execution_key: str,
     ) -> LabTranscript | None:
         commands_digest = hashlib.sha256(_canonical(list(commands))).hexdigest()
-        intent = self._dispatch_payload(
-            execution_key, handle, plan_digest, commands_digest, None
-        )
+        intent = self._dispatch_payload(execution_key, handle, plan_digest, commands_digest, None)
         record = self._read_dispatch_record(execution_key, intent)
         if record is None:
             try:
@@ -168,9 +443,7 @@ class FileAgentBroker:
         stored_command_id = record.get("commandId")
         if not isinstance(stored_command_id, str):
             return None
-        return lab_executor.wait_powershell(
-            handle, stored_command_id, execution_key=execution_key
-        )
+        return lab_executor.wait_powershell(handle, stored_command_id, execution_key=execution_key)
 
     @staticmethod
     def _dispatch_payload(
@@ -316,10 +589,10 @@ class FileAgentBroker:
             return job_id
         temporary = Path(tempfile.mkdtemp(prefix=f".{job_id}.", dir=self.jobs_root))
         try:
-            os.chmod(temporary, 0o750)
+            os.chmod(temporary, 0o2750)
             inputs = temporary / "inputs"
-            inputs.mkdir(mode=0o750)
-            os.chmod(inputs, 0o750)
+            inputs.mkdir(mode=0o2750)
+            os.chmod(inputs, 0o2750)
             for index, artifact in enumerate(self._agent_artifacts(event, prepared)):
                 destination = inputs / f"{index:04d}-{artifact.filename}"
                 self._download(artifact, destination)
@@ -433,9 +706,7 @@ class FileAgentBroker:
         return tuple(selected)
 
     @staticmethod
-    def _job_id(
-        phase: str, event: NotificationEvent, context_digest: str | None
-    ) -> str:
+    def _job_id(phase: str, event: NotificationEvent, context_digest: str | None) -> str:
         payload = {
             "contextDigest": context_digest,
             "phase": phase,
@@ -456,9 +727,9 @@ class FileAgentBroker:
 
 
 def _canonical(value: object) -> bytes:
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
 
 
 def _file_sha256(path: Path) -> str:
@@ -492,9 +763,15 @@ def _write_exclusive(path: Path, data: bytes, mode: int) -> None:
 def _read_regular(path: Path, limit: int) -> bytes:
     try:
         assert_no_indirection(path)
-        descriptor = os.open(
-            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        )
+        initial = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(initial.st_mode)
+            or initial.st_nlink != 1
+            or initial.st_size > limit
+        ):
+            raise AgentSpoolError("agent spool file is unsafe")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except (OSError, ValueError) as error:
         raise AgentSpoolError("agent spool file is unsafe") from error
     try:
@@ -503,10 +780,18 @@ def _read_regular(path: Path, limit: int) -> bytes:
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
                 raise AgentSpoolError("agent spool file is unsafe")
             data = stream.read(limit + 1)
-        if len(data) != metadata.st_size:
+        assert_no_indirection(path)
+        after = path.lstat()
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or len(data) != metadata.st_size
+            or (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_size)
+            != (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size)
+        ):
             raise AgentSpoolError("agent spool file changed while reading")
         return data
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise AgentSpoolError("agent spool file is unsafe") from error
 
 
@@ -594,3 +879,207 @@ def _final_progress(result: dict[str, object]) -> ExecutionProgress:
     if not report.strip():
         raise AgentSpoolError("successful agent result has no report")
     return ExecutionProgress("succeeded", _result_summary(result), report)
+
+
+def _central_digest(value: object) -> str:
+    return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _central_text(value: object, name: str, maximum: int = 2_000_000) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > maximum:
+        raise AgentSpoolError(f"central result {name} is invalid")
+    return value
+
+
+def _safe_artifact_path(value: str) -> bool:
+    if (
+        not value
+        or "\\" in value
+        or ":" in value
+        or "\x00" in value
+        or value.startswith("/")
+        or len(value.encode("utf-8")) > 240
+    ):
+        return False
+    parts = value.split("/")
+    return len(parts) <= 8 and all(part and part not in {".", ".."} for part in parts)
+
+
+def _validate_artifact_manifest(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"kind", "files", "totals"}:
+        raise AgentSpoolError("artifact manifest is invalid")
+    files, totals = value.get("files"), value.get("totals")
+    if (
+        value.get("kind") != "artifact-manifest-v1"
+        or not isinstance(files, list)
+        or not 1 <= len(files) <= 64
+    ):
+        raise AgentSpoolError("artifact manifest is invalid")
+    if not isinstance(totals, dict) or set(totals) != {"files", "bytes"}:
+        raise AgentSpoolError("artifact manifest is invalid")
+    previous = b""
+    seen: set[str] = set()
+    total = 0
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            raise AgentSpoolError("artifact manifest is invalid")
+        path, size, digest = item.get("path"), item.get("size"), item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not _safe_artifact_path(path)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or _DIGEST.fullmatch(digest) is None
+        ):
+            raise AgentSpoolError("artifact manifest is invalid")
+        encoded = path.encode("utf-8")
+        normalized = unicodedata.normalize("NFC", path).casefold()
+        if encoded <= previous or normalized in seen:
+            raise AgentSpoolError("artifact manifest order is invalid")
+        previous = encoded
+        seen.add(normalized)
+        total += size
+    if total > 1_900_000 or totals != {"files": len(files), "bytes": total}:
+        raise AgentSpoolError("artifact manifest totals are invalid")
+    return value
+
+
+def _central_plan(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "steps",
+        "acceptanceCriteria",
+        "expectedArtifacts",
+    }:
+        raise AgentSpoolError("central plan is invalid")
+    steps, criteria, artifacts = (
+        value["steps"],
+        value["acceptanceCriteria"],
+        value["expectedArtifacts"],
+    )
+    if (
+        not isinstance(steps, list)
+        or not 1 <= len(steps) <= 64
+        or not all(isinstance(x, str) and x.strip() for x in steps)
+    ):
+        raise AgentSpoolError("central plan steps are invalid")
+    if not isinstance(criteria, list) or not 1 <= len(criteria) <= 64:
+        raise AgentSpoolError("central plan criteria are invalid")
+    ids: set[str] = set()
+    for criterion in criteria:
+        if not isinstance(criterion, dict) or set(criterion) != {"id", "text"}:
+            raise AgentSpoolError("central plan criteria are invalid")
+        identifier = _central_text(criterion.get("id"), "criterion id", 256)
+        _central_text(criterion.get("text"), "criterion text", 16384)
+        if identifier in ids:
+            raise AgentSpoolError("central plan criterion IDs are not unique")
+        ids.add(identifier)
+    seen: set[str] = set()
+    if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= 64:
+        raise AgentSpoolError("central expected artifacts are invalid")
+    for item in artifacts:
+        if not isinstance(item, str) or not _safe_artifact_path(item):
+            raise AgentSpoolError("central expected artifact path is invalid")
+        key = unicodedata.normalize("NFC", item).casefold()
+        if key in seen:
+            raise AgentSpoolError("central expected artifacts collide")
+        seen.add(key)
+    return value
+
+
+def _validate_central_result(result: dict[str, object], role: str) -> None:
+    try:
+        if len(_canonical(result)) > _MAX_CENTRAL_RESULT_BYTES:
+            raise AgentSpoolError("central result exceeds serialized size budget")
+    except (TypeError, ValueError) as error:
+        raise AgentSpoolError("central result is invalid") from error
+    common = {"kind", "jobId", "role", "succeeded", "summary", "reportMarkdown"}
+    if not isinstance(result.get("succeeded"), bool):
+        raise AgentSpoolError("central result success flag is invalid")
+    _central_text(result.get("summary"), "summary", 16_384)
+    report = result.get("reportMarkdown")
+    if not isinstance(report, str) or len(report.encode("utf-8")) > 2_000_000:
+        raise AgentSpoolError("central result report is invalid")
+    if result["succeeded"] and (not report.strip() or report.strip() == "# Informe"):
+        raise AgentSpoolError("central report has no evidence")
+    if not result["succeeded"]:
+        digest_key = {
+            "central_planner": "plannerResultDigest",
+            "central_executor": "executorResultDigest",
+            "central_reviewer": "reviewerResultDigest",
+        }[role]
+        if set(result) != common | {digest_key}:
+            raise AgentSpoolError("central failure shape is invalid")
+        unsigned = {k: v for k, v in result.items() if k != digest_key}
+        if result.get(digest_key) != _central_digest(unsigned):
+            raise AgentSpoolError("central failure digest is invalid")
+        return
+    if role == "central_planner":
+        if set(result) != common | {"plan", "planDigest", "plannerResultDigest"}:
+            raise AgentSpoolError("planner result shape is invalid")
+        plan = _central_plan(result["plan"])
+        if result["planDigest"] != _central_digest(plan):
+            raise AgentSpoolError("planner plan digest is invalid")
+        unsigned = {k: v for k, v in result.items() if k != "plannerResultDigest"}
+        if result["plannerResultDigest"] != _central_digest(unsigned):
+            raise AgentSpoolError("planner result digest is invalid")
+    elif role == "central_executor":
+        fields = {
+            "evidence",
+            "artifactManifest",
+            "artifactManifestDigest",
+            "artifactBundleDigest",
+            "bundleLocator",
+            "executorResultDigest",
+        }
+        if set(result) != common | fields or not isinstance(result["evidence"], dict):
+            raise AgentSpoolError("executor result shape is invalid")
+        if not all(
+            isinstance(k, str) and isinstance(v, str) and v.strip()
+            for k, v in result["evidence"].items()
+        ):
+            raise AgentSpoolError("executor evidence is invalid")
+        _validate_artifact_manifest(result["artifactManifest"])
+        if result["artifactManifestDigest"] != _central_digest(result["artifactManifest"]):
+            raise AgentSpoolError("artifact manifest digest is invalid")
+        if (
+            not isinstance(result["artifactBundleDigest"], str)
+            or _DIGEST.fullmatch(result["artifactBundleDigest"]) is None
+            or result["bundleLocator"] != f"bundles/{result['artifactBundleDigest']}.zip"
+        ):
+            raise AgentSpoolError("artifact bundle is invalid")
+        unsigned = {k: v for k, v in result.items() if k != "executorResultDigest"}
+        if result["executorResultDigest"] != _central_digest(unsigned):
+            raise AgentSpoolError("executor result digest is invalid")
+    else:
+        fields = {"accepted", "decisions", "findings", "dependencyDigests", "reviewerResultDigest"}
+        if set(result) != common | fields or not isinstance(result["accepted"], bool):
+            raise AgentSpoolError("reviewer result shape is invalid")
+        if (
+            not isinstance(result["decisions"], dict)
+            or not result["decisions"]
+            or not all(
+                isinstance(k, str) and v in {"accepted", "rejected"}
+                for k, v in result["decisions"].items()
+            )
+        ):
+            raise AgentSpoolError("reviewer decisions are invalid")
+        if (
+            not isinstance(result["findings"], list)
+            or len(result["findings"]) > 64
+            or not all(isinstance(x, str) and len(x) <= 4096 for x in result["findings"])
+        ):
+            raise AgentSpoolError("reviewer findings are invalid")
+        if not isinstance(result["dependencyDigests"], dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and _DIGEST.fullmatch(v)
+            for k, v in result["dependencyDigests"].items()
+        ):
+            raise AgentSpoolError("reviewer dependency digests are invalid")
+        if bool(result["accepted"]) != all(
+            decision == "accepted" for decision in result["decisions"].values()
+        ):
+            raise AgentSpoolError("reviewer acceptance is incoherent")
+        unsigned = {k: v for k, v in result.items() if k != "reviewerResultDigest"}
+        if result["reviewerResultDigest"] != _central_digest(unsigned):
+            raise AgentSpoolError("reviewer result digest is invalid")

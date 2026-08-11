@@ -8,15 +8,23 @@ import shutil
 import stat
 import subprocess
 import threading
-from collections.abc import Mapping
+import traceback
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from moddle_autotask.adapters.aws import agent_cli
-from moddle_autotask.adapters.aws.agent_cli import CodexSpoolRunner
+from moddle_autotask.adapters.aws.agent_cli import (
+    CodexSpoolRunner,
+    _BundlePublicationBusy,
+    _collect_artifact_bundle,
+    _load_job,
+)
 from moddle_autotask.adapters.aws.agent_spool import (
+    _MAX_RESULT_BYTES,
     AgentSpoolError,
     FileAgentBroker,
     _canonical,
@@ -125,6 +133,7 @@ def _prepared(event: NotificationEvent, runner: _S3Runner) -> PreparedAssignment
         "ASIX-M06",
         "Práctica controlada",
         "Genera un informe verificable.",
+        "d" * 64,
     )
 
 
@@ -179,7 +188,177 @@ def _ready_lab_dispatch(
     return broker._job_id("lab_report", event, plan_digest), plan_digest, commands
 
 
-def test_central_job_is_exact_idempotent_and_consumes_verified_result(tmp_path: Path) -> None:
+def _central_plan() -> dict[str, object]:
+    return {
+        "steps": ["Produce the report."],
+        "acceptanceCriteria": [{"id": "report", "text": "A report exists."}],
+        "expectedArtifacts": ["report.md"],
+    }
+
+
+def _seed_executor_job(
+    tmp_path: Path,
+) -> tuple[
+    FileAgentBroker,
+    Path,
+    Path,
+    _S3Runner,
+    NotificationEvent,
+    PreparedAssignment,
+    Path,
+    dict[str, object],
+]:
+    jobs, results = tmp_path / "jobs", tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    prepared = _prepared(event, runner)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    assert (
+        broker.step(event, prepared, ExecutionMode.CENTRAL, None, _LabExecutor()).status
+        == "pending"
+    )
+    planner_job = next(jobs.iterdir())
+    plan = _central_plan()
+    planner: dict[str, object] = {
+        "kind": "moodle-agent-result-v2",
+        "jobId": planner_job.name,
+        "role": "central_planner",
+        "succeeded": True,
+        "summary": "plan ready",
+        "reportMarkdown": "# Informe\nPlan verified.",
+        "plan": plan,
+        "planDigest": hashlib.sha256(_canonical(plan)).hexdigest(),
+    }
+    planner["plannerResultDigest"] = hashlib.sha256(_canonical(planner)).hexdigest()
+    (results / f"{planner_job.name}.json").write_bytes(_canonical(planner))
+    assert (
+        broker.step(event, prepared, ExecutionMode.CENTRAL, None, _LabExecutor()).status
+        == "pending"
+    )
+    executor_job = next(
+        job
+        for job in jobs.iterdir()
+        if json.loads((job / "job.json").read_text(encoding="utf-8"))["role"] == "central_executor"
+    )
+    return broker, jobs, results, runner, event, prepared, executor_job, plan
+
+
+def test_runner_publishes_terminal_failure_for_invalid_executor_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broker, jobs, results, _runner, event, prepared, executor_job, _plan = _seed_executor_job(
+        tmp_path
+    )
+
+    def invalid_executor(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        workspace = Path(arguments[arguments.index("-C") + 1])
+        outputs = workspace / "outputs"
+        outputs.mkdir()
+        (outputs / "report.md").write_bytes(b"verified\n")
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "succeeded": True,
+                    "summary": "executed",
+                    "reportMarkdown": "# Informe\nArtifact verified.",
+                    "evidence": {"wrong": "outputs/report.md"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", invalid_executor)
+    agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
+
+    assert agent.process_one() == "processed"
+    result = json.loads((results / f"{executor_job.name}.json").read_text(encoding="utf-8"))
+    assert result["kind"] == "moodle-agent-result-v2"
+    assert result["role"] == "central_executor"
+    assert result["succeeded"] is False
+    assert list((results / "bundles").glob("*.zip")) == []
+    assert (
+        broker.step(event, prepared, ExecutionMode.CENTRAL, None, _LabExecutor()).status
+        == "failed"
+    )
+
+
+def test_runner_publishes_terminal_failure_for_invalid_reviewer_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broker, jobs, results, _runner, event, prepared, executor_job, plan = _seed_executor_job(
+        tmp_path
+    )
+    outputs = tmp_path / "verified-outputs"
+    outputs.mkdir()
+    (outputs / "report.md").write_bytes(b"verified\n")
+    manifest, bundle_digest = _collect_artifact_bundle(outputs, ["report.md"], results / "bundles")
+    executor_result: dict[str, object] = {
+        "kind": "moodle-agent-result-v2",
+        "jobId": executor_job.name,
+        "role": "central_executor",
+        "succeeded": True,
+        "summary": "executed",
+        "reportMarkdown": "# Informe\nArtifact verified.",
+        "evidence": {"report": "outputs/report.md"},
+        "artifactManifest": manifest,
+        "artifactManifestDigest": hashlib.sha256(_canonical(manifest)).hexdigest(),
+        "artifactBundleDigest": bundle_digest,
+        "bundleLocator": f"bundles/{bundle_digest}.zip",
+    }
+    executor_result["executorResultDigest"] = hashlib.sha256(
+        _canonical(executor_result)
+    ).hexdigest()
+    (results / f"{executor_job.name}.json").write_bytes(_canonical(executor_result))
+    assert (
+        broker.step(event, prepared, ExecutionMode.CENTRAL, None, _LabExecutor()).status
+        == "pending"
+    )
+    reviewer_job = next(
+        job
+        for job in jobs.iterdir()
+        if json.loads((job / "job.json").read_text(encoding="utf-8"))["role"] == "central_reviewer"
+    )
+
+    def invalid_reviewer(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "succeeded": True,
+                    "summary": "reviewed",
+                    "reportMarkdown": "# Informe\nReview verified.",
+                    "accepted": True,
+                    "decisions": {"wrong": "accepted"},
+                    "findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", invalid_reviewer)
+    agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
+
+    assert agent.process_one() == "processed"
+    result = json.loads((results / f"{reviewer_job.name}.json").read_text(encoding="utf-8"))
+    assert result["kind"] == "moodle-agent-result-v2"
+    assert result["role"] == "central_reviewer"
+    assert result["succeeded"] is False
+    assert (
+        broker.step(event, prepared, ExecutionMode.CENTRAL, None, _LabExecutor()).status
+        == "failed"
+    )
+
+
+def test_central_planner_job_is_exact_idempotent_and_digest_bound(tmp_path: Path) -> None:
     jobs = tmp_path / "jobs"
     results = tmp_path / "results"
     runner = _S3Runner()
@@ -196,17 +375,229 @@ def test_central_job_is_exact_idempotent_and_consumes_verified_result(tmp_path: 
     assert len(runner.calls) == 1
     job = next(jobs.iterdir())
     assert (job / "inputs/0000-input.txt").read_bytes() == runner.body
-    _write_result(results, job)
-    assert broker.step(event, prepared, ExecutionMode.CENTRAL, None, executor).status == (
-        "succeeded"
-    )
+    payload = json.loads((job / "job.json").read_text(encoding="utf-8"))
+    assert payload["kind"] == "moodle-agent-job-v2"
+    assert payload["role"] == "central_planner"
+    assert payload["selectedMode"] == "central"
+    assert payload["specificationDigest"] == "d" * 64
+    assert payload["preparedInputs"][0]["attachmentKey"].startswith("moodle-attachment-v1:")
     assert executor.calls == []
+
+
+def test_central_oversized_planner_job_becomes_terminal_v2_failure(tmp_path: Path) -> None:
+    jobs = tmp_path / "jobs"
+    results = tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    prepared = _prepared(event, runner)
+    oversized = PreparedAssignment(
+        prepared.task_key,
+        prepared.revision_digest,
+        prepared.artifacts,
+        prepared.course_name,
+        prepared.course_shortname,
+        prepared.title,
+        "x" * (_MAX_RESULT_BYTES + 1),
+        prepared.specification_digest,
+    )
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+
+    progress = broker.step(event, oversized, ExecutionMode.CENTRAL, None, _LabExecutor())
+
+    assert progress.status == "failed"
+    assert not jobs.exists() or list(jobs.iterdir()) == []
+    assert list(results.glob("*.json")) == []
+
+
+def test_runner_converts_oversized_central_model_result_to_durable_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs = tmp_path / "jobs"
+    results = tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    progress = broker.step(
+        event, _prepared(event, runner), ExecutionMode.CENTRAL, None, _LabExecutor()
+    )
+    assert progress.status == "pending"
+    job = next(jobs.iterdir())
+
+    def oversized_run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "succeeded": False,
+                    "summary": "x",
+                    "reportMarkdown": "x" * (_MAX_RESULT_BYTES // 4),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", oversized_run)
+    agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
+
+    assert agent.process_one() == "processed"
+    result = json.loads((results / f"{job.name}.json").read_text(encoding="utf-8"))
+    assert result["kind"] == "moodle-agent-result-v2"
+    assert result["succeeded"] is False
+    assert result["summary"] == "Agent workspace is unsafe"
+    assert len(_canonical(result)) < _MAX_RESULT_BYTES
+
+
+@pytest.mark.parametrize("role", ["central_executor", "central_reviewer"])
+def test_oversized_downstream_central_job_becomes_terminal_v2_failure(
+    tmp_path: Path, role: str
+) -> None:
+    jobs = tmp_path / "jobs"
+    results = tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    prepared = _prepared(event, runner)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    plan: dict[str, object] = {"oversized": "x" * _MAX_RESULT_BYTES}
+    with pytest.raises(AgentSpoolError, match="size budget"):
+        broker._ensure_central_job(
+            role,
+            event,
+            prepared,
+            {},
+            plan=plan,
+            executor_result={"oversized": "x" * _MAX_RESULT_BYTES}
+            if role == "central_reviewer"
+            else None,
+        )
+    assert not jobs.exists() or list(jobs.iterdir()) == []
+    assert not results.exists() or list(results.iterdir()) == []
+
+
+def test_central_three_role_chain_binds_only_digest_dependencies(tmp_path: Path) -> None:
+    jobs = tmp_path / "jobs"
+    results = tmp_path / "results"
+    runner = _S3Runner()
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    event = _event(tmp_path)
+    prepared = _prepared(event, runner)
+    executor = _LabExecutor()
+    plan = {
+        "steps": ["Produce the report."],
+        "acceptanceCriteria": [{"id": "report", "text": "A report exists."}],
+        "expectedArtifacts": ["report.md"],
+    }
+
+    assert broker.step(event, prepared, ExecutionMode.CENTRAL, None, executor).status == "pending"
+    planner_job = next(jobs.iterdir())
+    planner: dict[str, object] = {
+        "kind": "moodle-agent-result-v2",
+        "jobId": planner_job.name,
+        "role": "central_planner",
+        "succeeded": True,
+        "summary": "plan ready",
+        "reportMarkdown": "# Informe\nPlan verified.",
+        "plan": plan,
+        "planDigest": hashlib.sha256(_canonical(plan)).hexdigest(),
+    }
+    planner["plannerResultDigest"] = hashlib.sha256(_canonical(planner)).hexdigest()
+    (results / f"{planner_job.name}.json").write_bytes(_canonical(planner))
+
+    assert broker.step(event, prepared, ExecutionMode.CENTRAL, None, executor).status == "pending"
+    executor_job = next(
+        job
+        for job in jobs.iterdir()
+        if json.loads((job / "job.json").read_text(encoding="utf-8"))["role"] == "central_executor"
+    )
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    artifact = b"verified artifact\n"
+    (outputs / "report.md").write_bytes(artifact)
+    manifest, bundle_digest = _collect_artifact_bundle(outputs, ["report.md"], results / "bundles")
+    executor_result: dict[str, object] = {
+        "kind": "moodle-agent-result-v2",
+        "jobId": executor_job.name,
+        "role": "central_executor",
+        "succeeded": True,
+        "summary": "executed",
+        "reportMarkdown": "# Informe\nArtifact verified.",
+        "evidence": {"report": "outputs/report.md"},
+        "artifactManifest": manifest,
+        "artifactManifestDigest": hashlib.sha256(_canonical(manifest)).hexdigest(),
+        "artifactBundleDigest": bundle_digest,
+        "bundleLocator": f"bundles/{bundle_digest}.zip",
+    }
+    executor_result["executorResultDigest"] = hashlib.sha256(
+        _canonical(executor_result)
+    ).hexdigest()
+    (results / f"{executor_job.name}.json").write_bytes(_canonical(executor_result))
+
+    assert broker.step(event, prepared, ExecutionMode.CENTRAL, None, executor).status == "pending"
+    reviewer_job = next(
+        job
+        for job in jobs.iterdir()
+        if json.loads((job / "job.json").read_text(encoding="utf-8"))["role"] == "central_reviewer"
+    )
+    reviewer_payload = _load_job(reviewer_job)
+    assert set(cast(dict[str, object], reviewer_payload["dependencies"])) == {
+        "plannerJobId",
+        "planDigest",
+        "plannerResultDigest",
+        "executorJobId",
+        "executorResultDigest",
+        "artifactManifestDigest",
+        "artifactBundleDigest",
+    }
+    dependencies = cast(dict[str, str], reviewer_payload["dependencies"])
+    reviewer: dict[str, object] = {
+        "kind": "moodle-agent-result-v2",
+        "jobId": reviewer_job.name,
+        "role": "central_reviewer",
+        "succeeded": True,
+        "summary": "reviewed",
+        "reportMarkdown": "# Informe\nReview verified.",
+        "accepted": True,
+        "decisions": {"report": "accepted"},
+        "findings": [],
+        "dependencyDigests": {
+            key: value for key, value in dependencies.items() if key.endswith("Digest")
+        },
+    }
+    reviewer["reviewerResultDigest"] = hashlib.sha256(_canonical(reviewer)).hexdigest()
+    (results / f"{reviewer_job.name}.json").write_bytes(_canonical(reviewer))
+
+    progress = broker.step(event, prepared, ExecutionMode.CENTRAL, None, executor)
+    assert progress.status == "succeeded"
+    assert progress.provenance is not None
+    assert progress.provenance["artifactManifest"] == manifest
+
+
+def test_runner_retries_bundle_lock_contention_without_publishing_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs, results = tmp_path / "jobs", tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+    broker.step(event, _prepared(event, runner), ExecutionMode.CENTRAL, None, _LabExecutor())
+    agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
+
+    def busy(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise _BundlePublicationBusy("bundle publication is busy")
+
+    monkeypatch.setattr(agent, "_execute", busy)
+    assert agent.process_one() == "idle"
+    assert list(results.glob("*.json")) == []
 
 
 def test_published_job_layout_overrides_a_restrictive_umask(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("POSIX group mode bits are not meaningful on Windows")
     jobs = tmp_path / "jobs"
+    jobs.mkdir(mode=0o2750)
+    os.chmod(jobs, 0o2750)
     results = tmp_path / "results"
     runner = _S3Runner()
     broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
@@ -218,10 +609,121 @@ def test_published_job_layout_overrides_a_restrictive_umask(tmp_path: Path) -> N
         os.umask(previous_umask)
 
     job = next(jobs.iterdir())
-    assert stat.S_IMODE(job.stat().st_mode) == 0o750
-    assert stat.S_IMODE((job / "inputs").stat().st_mode) == 0o750
+    assert stat.S_IMODE(job.stat().st_mode) == 0o2750
+    assert stat.S_IMODE((job / "inputs").stat().st_mode) == 0o2750
     assert stat.S_IMODE((job / "job.json").stat().st_mode) == 0o640
     assert stat.S_IMODE((job / "inputs/0000-input.txt").stat().st_mode) == 0o640
+
+
+def test_lab_job_layout_retains_setgid_shared_group(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX group mode bits are not meaningful on Windows")
+    jobs = tmp_path / "jobs"
+    jobs.mkdir(mode=0o2750)
+    os.chmod(jobs, 0o2750)
+    results = tmp_path / "results"
+    runner = _S3Runner()
+    event = _event(tmp_path, lab=True)
+    broker = FileAgentBroker(jobs, results, "eu-south-2", runner)
+
+    assert (
+        broker.step(
+            event,
+            _prepared(event, runner),
+            ExecutionMode.HYBRID,
+            LabHandle("lab:test"),
+            _LabExecutor(),
+        ).status
+        == "pending"
+    )
+    job = next(path for path in jobs.iterdir() if path.is_dir())
+    assert stat.S_IMODE(job.stat().st_mode) == 0o2750
+    assert stat.S_IMODE((job / "inputs").stat().st_mode) == 0o2750
+    assert stat.S_IMODE((job / "job.json").stat().st_mode) == 0o640
+
+
+def test_setgid_jobs_are_readable_by_distinct_agent_identity(tmp_path: Path) -> None:
+    if os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        pytest.skip("requires a POSIX root test process")
+    posix_os = cast(Any, os)
+    # pytest may create private ancestor directories; make only this test's
+    # path traversable by the two synthetic service identities.
+    os.chmod(tmp_path.parent.parent, 0o755)
+    os.chmod(tmp_path.parent, 0o755)
+    os.chmod(tmp_path, 0o755)
+    worker_uid, worker_gid, shared_gid, agent_uid, agent_gid = 41001, 41002, 41003, 41004, 41005
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    posix_os.chown(jobs, worker_uid, shared_gid)
+    os.chmod(jobs, 0o2750)
+
+    def run_as(uid: int, gid: int, groups: list[int], action: object) -> None:
+        read_end, write_end = posix_os.pipe()
+        pid = posix_os.fork()
+        if pid == 0:
+            posix_os.close(read_end)
+            try:
+                posix_os.setgroups(groups)
+                posix_os.setgid(gid)
+                posix_os.setuid(uid)
+                cast(Callable[[], None], action)()
+            except BaseException as error:
+                del error
+                posix_os.write(write_end, traceback.format_exc().encode("utf-8", "replace"))
+                os._exit(1)
+            os._exit(0)
+        posix_os.close(write_end)
+        _child, status = posix_os.waitpid(pid, 0)
+        trace = posix_os.read(read_end, 4096).decode("utf-8", "replace")
+        posix_os.close(read_end)
+        assert posix_os.WIFEXITED(status) and posix_os.WEXITSTATUS(status) == 0, trace
+
+    runner = _S3Runner()
+    central_event = _event(tmp_path)
+    central_prepared = _prepared(central_event, runner)
+    central_results = tmp_path / "central-results"
+    central_results.mkdir()
+    posix_os.chown(central_results, worker_uid, shared_gid)
+    os.chmod(central_results, 0o2750)
+
+    def publish_central() -> None:
+        progress = FileAgentBroker(jobs, central_results, "eu-south-2", runner).step(
+            central_event, central_prepared, ExecutionMode.CENTRAL, None, _LabExecutor()
+        )
+        if progress.status != "pending":
+            raise RuntimeError("central job was not published")
+
+    run_as(worker_uid, worker_gid, [worker_gid, shared_gid], publish_central)
+    lab_event = _event(tmp_path, lab=True, marker="b")
+    lab_prepared = _prepared(lab_event, runner)
+    lab_results = tmp_path / "lab-results"
+    lab_results.mkdir()
+    posix_os.chown(lab_results, worker_uid, shared_gid)
+    os.chmod(lab_results, 0o2750)
+
+    def publish_lab() -> None:
+        progress = FileAgentBroker(jobs, lab_results, "eu-south-2", runner).step(
+            lab_event, lab_prepared, ExecutionMode.HYBRID, LabHandle("lab:test"), _LabExecutor()
+        )
+        if progress.status != "pending":
+            raise RuntimeError("lab job was not published")
+
+    run_as(worker_uid, worker_gid, [worker_gid, shared_gid], publish_lab)
+    published = [path for path in jobs.iterdir() if path.is_dir()]
+    assert len(published) == 2
+    for job in published:
+        inputs = job / "inputs"
+        assert job.stat().st_gid == inputs.stat().st_gid == shared_gid
+        assert stat.S_IMODE(job.stat().st_mode) == stat.S_IMODE(inputs.stat().st_mode) == 0o2750
+        assert stat.S_IMODE((job / "job.json").stat().st_mode) == 0o640
+
+    def read_as_agent() -> None:
+        for job in published:
+            (job / "job.json").read_bytes()
+            for item in (job / "inputs").iterdir():
+                item.read_bytes()
+
+    run_as(agent_uid, agent_gid, [shared_gid], read_as_agent)
 
 
 def test_lab_plan_executes_once_then_waits_for_final_report(tmp_path: Path) -> None:
@@ -669,13 +1171,14 @@ def test_codex_runner_reports_workspace_poison_and_processes_later_job(
     for job in (schema_job, inputs_job):
         result = json.loads((results / f"{job.name}.json").read_text(encoding="utf-8"))
         assert result["jobId"] == job.name
-        assert result["phase"] == "central"
+        assert result["role"] == "central_planner"
         assert result["succeeded"] is False
         assert result["summary"] == "Agent workspace is unsafe"
     assert schema_target.read_text(encoding="utf-8") == "preserve schema"
     assert list(inputs_target.iterdir()) == []
     valid_job = job_by_task[valid_event.task_key]
-    assert json.loads((results / f"{valid_job.name}.json").read_text(encoding="utf-8"))["succeeded"]
+    valid_result = json.loads((results / f"{valid_job.name}.json").read_text(encoding="utf-8"))
+    assert not valid_result["succeeded"]
 
 
 def test_codex_runner_reports_last_message_directory_and_processes_later_job(
@@ -720,9 +1223,10 @@ def test_codex_runner_reports_last_message_directory_and_processes_later_job(
         (results / f"{poisoned_job.name}.json").read_text(encoding="utf-8")
     )
     assert poisoned_result["succeeded"] is False
-    assert poisoned_output.is_dir()
+    assert poisoned_output.is_file()
     valid_job = job_by_task[valid_event.task_key]
-    assert json.loads((results / f"{valid_job.name}.json").read_text(encoding="utf-8"))["succeeded"]
+    valid_result = json.loads((results / f"{valid_job.name}.json").read_text(encoding="utf-8"))
+    assert not valid_result["succeeded"]
 
 
 def test_broker_rejects_forged_result_keys_and_phase_semantics(tmp_path: Path) -> None:
@@ -806,15 +1310,11 @@ def test_codex_runner_publishes_failure_and_skips_corrupt_preceding_job(
 
     assert agent.process_one() == "processed"
     result = json.loads((results / f"{job.name}.json").read_text(encoding="utf-8"))
-    assert result == {
-        "kind": "moodle-agent-result-v1",
-        "jobId": job.name,
-        "phase": "central",
-        "succeeded": False,
-        "summary": "Codex execution failed",
-        "reportMarkdown": "",
-        "powershellCommands": [],
-    }
+    assert result["kind"] == "moodle-agent-result-v2"
+    assert result["jobId"] == job.name
+    assert result["role"] == "central_planner"
+    assert result["succeeded"] is False
+    assert result["summary"] == "Codex execution failed"
 
 
 def test_concurrent_dispatch_intent_has_one_send_command(

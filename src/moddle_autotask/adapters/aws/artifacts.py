@@ -46,6 +46,9 @@ class PreparedAssignment:
     course_shortname: str = ""
     title: str = ""
     intro: str = ""
+    # Bound by the durable approval record immediately before a central agent job
+    # is created.  Keeping this optional preserves the existing lab preparer API.
+    specification_digest: str = ""
 
 
 class AssignmentLoader(Protocol):

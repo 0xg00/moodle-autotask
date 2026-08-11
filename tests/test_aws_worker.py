@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
+import zipfile
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
 from moddle_autotask.adapters.aws.agent_spool import ExecutionProgress, LabCommandExecutor
 from moddle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
+from moddle_autotask.adapters.aws.completion import TelegramExecutionNotifier
 from moddle_autotask.adapters.aws.image_imports import (
     ImageImportReadiness,
     ImageImportResult,
@@ -23,6 +27,7 @@ from moddle_autotask.adapters.moodle.submission import (
     MoodleSubmissionError,
     PermanentSubmissionOfferError,
 )
+from moddle_autotask.adapters.moodle.telegram import TelegramConfig
 from moddle_autotask.domain.models import ExecutionMode, LabHandle, LabProvisionRequest
 from moddle_autotask.ports.contracts import LabReadiness
 
@@ -110,7 +115,74 @@ class _Broker:
     ) -> ExecutionProgress:
         del event, prepared, lab_handle, lab_executor
         self.calls.append(mode)
+        if mode is ExecutionMode.CENTRAL and self.progress.status == "succeeded":
+            return ExecutionProgress(
+                self.progress.status,
+                self.progress.summary,
+                self.progress.report_markdown,
+                self.progress.provenance or _central_provenance(),
+            )
         return self.progress
+
+
+def _central_provenance() -> dict[str, object]:
+    manifest = {
+        "kind": "artifact-manifest-v1",
+        "files": [{"path": "report.md", "size": 1, "sha256": "0" * 64}],
+        "totals": {"bytes": 1, "files": 1},
+    }
+    manifest_digest = sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    planner, executor, reviewer = ("a" * 64, "b" * 64, "c" * 64)
+    return {
+        "kind": "moodle-central-provenance-v2",
+        "roles": ["central_planner", "central_executor", "central_reviewer"],
+        "jobIds": [planner, executor, reviewer],
+        "plannerJobId": planner,
+        "executorJobId": executor,
+        "reviewerJobId": reviewer,
+        "selectedMode": "central",
+        "specificationDigest": "d" * 64,
+        "preparedInputManifestDigest": "e" * 64,
+        "planDigest": "f" * 64,
+        "plannerResultDigest": "1" * 64,
+        "executorResultDigest": "2" * 64,
+        "artifactManifestDigest": manifest_digest,
+        "artifactBundleDigest": "3" * 64,
+        "reviewerResultDigest": "4" * 64,
+        "reviewerAccepted": True,
+        "bundleLocator": f"bundles/{'3' * 64}.zip",
+        "artifactManifest": manifest,
+    }
+
+
+def _bundled_central_provenance(root: Path) -> dict[str, object]:
+    bundles = root / "bundles"
+    bundles.mkdir(parents=True)
+    artifact = b"verified evidence\n"
+    manifest = {
+        "kind": "artifact-manifest-v1",
+        "files": [
+            {"path": "report.md", "size": len(artifact), "sha256": sha256(artifact).hexdigest()}
+        ],
+        "totals": {"files": 1, "bytes": len(artifact)},
+    }
+    temporary = bundles / "bundle.zip"
+    with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("report.md", artifact)
+    digest = sha256(temporary.read_bytes()).hexdigest()
+    temporary.rename(bundles / f"{digest}.zip")
+    provenance = _central_provenance()
+    provenance["artifactManifest"] = manifest
+    provenance["artifactManifestDigest"] = sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    provenance["artifactBundleDigest"] = digest
+    provenance["bundleLocator"] = f"bundles/{digest}.zip"
+    return provenance
 
 
 @dataclass
@@ -119,6 +191,23 @@ class _Notifier:
 
     def notify(self, event: NotificationEvent, progress: ExecutionProgress) -> None:
         self.calls.append((event, progress))
+
+
+@dataclass
+class _TelegramTransport:
+    fail_zip: bool = False
+    documents: list[str] = field(default_factory=list)
+
+    def send_message(self, chat_id: int, text: str, buttons: object = None) -> int:
+        del chat_id, text, buttons
+        return 1
+
+    def send_document(self, chat_id: int, filename: str, content: bytes, caption: str) -> int:
+        del chat_id, content, caption
+        self.documents.append(filename)
+        if self.fail_zip and filename.endswith(".zip"):
+            raise RuntimeError("zip delivery failed")
+        return 1
 
 
 @dataclass
@@ -388,6 +477,65 @@ def test_central_work_waits_for_agent_then_completes_exact_revision(tmp_path: Pa
     assert item is not None and item.status == "cleaned" and item.error_code is None
     assert broker.calls == [ExecutionMode.CENTRAL, ExecutionMode.CENTRAL]
     assert len(notifier.calls) == 1
+    assert notifier.calls[0][1].provenance == _central_provenance()
+
+
+def test_central_bundle_delivery_retries_after_zip_failure_without_marking_outbox(
+    tmp_path: Path,
+) -> None:
+    state, _, _ = _approved(tmp_path, lab=False)
+    provider = _Provider()
+    broker = _Broker()
+    transport = _TelegramTransport(fail_zip=True)
+    bundles_root = tmp_path / "trusted-results"
+    notifier = TelegramExecutionNotifier(
+        TelegramConfig("123456:abcdefghijklmnopqrstuvwxyzABCDE", 1, 1),
+        transport,
+        bundles_root / "bundles",
+    )
+
+    assert process_one(state, provider, owner="worker", now=10).result == "central_ready"
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            now=11,
+        ).result
+        == "agent_pending"
+    )
+    broker.progress = ExecutionProgress(
+        "succeeded",
+        "done",
+        "# Informe\nEvidence verified.",
+        _bundled_central_provenance(bundles_root),
+    )
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            execution_notifier=notifier,
+            now=26,
+        ).result
+        == "execution_complete"
+    )
+    assert transport.documents[0].endswith(".md")
+    assert transport.documents[1].endswith(".zip")
+    assert state.pending_execution_notification() is not None
+
+    transport.fail_zip = False
+    assert (
+        process_one(state, provider, owner="worker", execution_notifier=notifier, now=27).result
+        == "idle"
+    )
+    assert state.pending_execution_notification() is None
+    assert transport.documents[-1].endswith(".zip")
 
 
 def test_statement_without_drafts_never_offers_second_approval(tmp_path: Path) -> None:

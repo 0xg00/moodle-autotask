@@ -59,5 +59,12 @@ It includes varied deadlines and safe sample attachments including metadata-only
 Optional unrelated E2E courses are outside that managed fixture scope; development does not depend
 on active tasks or credentials from a real school Moodle.
 
+Central execution is a stateless, central-only three-role workflow: planner, executor, then
+reviewer. Each role has a distinct digest-bound job and workspace; planner output cannot grant
+commands, network, AWS, Moodle, or lab access. Successful central reports carry immutable
+provenance and a verified, deterministic evidence ZIP. Delivery is at least once, so a crash
+between Telegram documents can duplicate either document. Lab planning and SSM execution remain
+the existing split workflow.
+
 The connector uses Moodle's official mobile REST API, not scraping. It deliberately provides
 at-least-once candidates: acknowledge only after downstream delivery succeeds.
