@@ -85,6 +85,94 @@ def test_local_moodle_token_validation_executes_under_windows_powershell_5(tmp_p
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_controller_outer_shell_wrapper_is_posix_and_fails_closed(tmp_path: Path) -> None:
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    shell = (
+        shutil.which("dash.exe")
+        or shutil.which("dash")
+        or shutil.which("sh.exe")
+        or shutil.which("sh")
+    )
+    if powershell is None or shell is None:
+        pytest.skip("PowerShell and a POSIX shell are unavailable")
+    source = read(HARNESS)
+    helpers_start = source.index("function ConvertTo-Base64Utf8")
+    helpers_end = source.index("function Invoke-ControllerScript")
+    helpers = source[helpers_start:helpers_end]
+    start = source.index("function Invoke-ControllerScript {")
+    function = source[start : source.index("function Get-ScopeScript {", start)]
+    commands = tmp_path / "outer-commands.json"
+    driver = tmp_path / "capture-outer-command.ps1"
+    driver.write_text(
+        "Set-StrictMode -Version Latest\n$ErrorActionPreference = 'Stop'\n"
+        "$ControllerInstanceId = 'i-0123456789abcdef0'\n$script:commands = @()\n"
+        "function Fail { param([string]$Message) throw $Message }\n"
+        "function ConvertFrom-CanonicalJson { param([string]$Text,[string]$Context) "
+        "return $Text | ConvertFrom-Json }\n"
+        "function Invoke-Aws {\n"
+        "  param([string[]]$Arguments)\n"
+        "  if ($Arguments -contains 'send-command') {\n"
+        "    $index = [Array]::IndexOf($Arguments, '--parameters')\n"
+        "    $path = $Arguments[$index + 1].Substring(7)\n"
+        "    $script:commands += ((Get-Content -LiteralPath $path -Raw | "
+        "ConvertFrom-Json).commands[0])\n"
+        "    return '24d91483-0000-4000-8000-000000000000'\n"
+        "  }\n"
+        "  if ($Arguments -contains 'Status') { return 'Success' }\n"
+        "  return 'AUTOTASK_E2E_JSON=eyJraW5kIjoidGVzdCJ9'\n"
+        "}\n"
+        + helpers
+        + function
+        + (
+            "\n$null = Invoke-ControllerScript -Name 'bash-pipefail' -Script "
+            "\"set -euo pipefail`nfalse | true || true`nprintf 'pipefail-ok'\"\n"
+        )
+        + (
+            "$null = Invoke-ControllerScript -Name 'inner-failure' -Script "
+            "\"set -euo pipefail`nexit 19\"\n"
+        )
+        + f"[IO.File]::WriteAllText('{commands}', "
+        "($script:commands | ConvertTo-Json -Compress), "
+        "(New-Object Text.UTF8Encoding($false)))\n",
+        encoding="utf-8",
+    )
+    captured = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(driver),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert captured.returncode == 0, captured.stderr + captured.stdout
+    outer, inner_failure = json.loads(commands.read_text(encoding="utf-8"))
+    # This contract must reject the former dash-incompatible outer wrapper,
+    # independently of whether Git's local `sh` happens to be Bash-compatible.
+    assert "pipefail" not in outer
+    assert "decoded=$(printf '%s' " in outer
+    assert " | base64 --decode) || exit 1;" in outer
+    assert 'exec /bin/bash -c "$decoded"' in outer
+    assert "mktemp" not in outer
+    valid = subprocess.run([shell, "-c", outer], capture_output=True, text=True, timeout=30)
+    assert valid.returncode == 0, valid.stderr
+    assert valid.stdout == "pipefail-ok"
+    malformed = re.sub(r"'[A-Za-z0-9+/=]+'", "'%%%not-base64%%%'", outer, count=1)
+    malformed_result = subprocess.run(
+        [shell, "-c", malformed], capture_output=True, text=True, timeout=30
+    )
+    inner_result = subprocess.run(
+        [shell, "-c", inner_failure], capture_output=True, text=True, timeout=30
+    )
+    assert malformed_result.returncode != 0
+    assert inner_result.returncode == 19
+
+
 def test_run_id_contract_is_exact_and_shared_with_disposable_fixture() -> None:
     expected = r"^[a-z0-9](?:[a-z0-9-]{6,38}[a-z0-9])$"
     assert expected in read(HARNESS)

@@ -254,7 +254,10 @@ function ConvertTo-Base64Utf8 {
 function Invoke-ControllerScript {
     param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Script)
     $encoded = ConvertTo-Base64Utf8 -Text $Script
-    $command = "set -euo pipefail; printf '%s' '$encoded' | base64 --decode | /bin/bash"
+    # AWS-RunShellScript starts this outer command with /bin/sh (dash on Ubuntu).
+    # Keep the production payload in Bash, but make decode failure observable
+    # before exec so a malformed base64 value cannot become a successful empty script.
+    $command = "decoded=`$(printf '%s' '$encoded' | base64 --decode) || exit 1; exec /bin/bash -c `"`$decoded`""
     $parameterPath = [System.IO.Path]::GetTempFileName()
     try {
         [System.IO.File]::WriteAllText($parameterPath, (@{ commands = @($command) } | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
