@@ -23,19 +23,47 @@ from moddle_autotask.adapters.moodle.state import MoodleState
 
 _Result = TypeVar("_Result")
 
-_RICH_TITLES = {
-    "Pràctica ISO 1 - Desplegament d'una OVA",
-    "Pràctica ISO 2 - Usuaris, grups i permisos Linux",
-    "Pràctica GBD - Còpia i restauració de PostgreSQL",
-    "Pràctica LMSGI - Validació XML amb XSD",
-    "Pràctica IAW - Desplegament web amb contenidors",
-    "Pràctica ASGBD - Pla de replicació",
-    "Pràctica PAX - VLAN, routing i diagnòstic",
-    "Pràctica ASO - Automatització amb Ansible",
-    "Pràctica SXI - DNS autoritatiu i resolució",
-    "Pràctica SAD - Hardening de Windows Server",
-    "Projecte ASIX - Lliurament de la proposta tècnica",
+_MANAGED_TITLES_BY_COURSE = {
+    "ASIX-LAB": frozenset({"AutoTask assignment"}),
+    "ASIX1-0369-ISO": frozenset(
+        {
+            "Pràctica ISO 1 - Desplegament d'una OVA",
+            "Pràctica ISO 2 - Usuaris, grups i permisos Linux",
+        }
+    ),
+    "ASIX1-0371-FM": frozenset(),
+    "ASIX1-0372-GBD": frozenset({"Pràctica GBD - Còpia i restauració de PostgreSQL"}),
+    "ASIX1-0373-LMSGI": frozenset({"Pràctica LMSGI - Validació XML amb XSD"}),
+    "ASIX1-0376-IAW": frozenset({"Pràctica IAW - Desplegament web amb contenidors"}),
+    "ASIX1-0377-ASGBD": frozenset({"Pràctica ASGBD - Pla de replicació"}),
+    "ASIX2-0370-PAX": frozenset({"Pràctica PAX - VLAN, routing i diagnòstic"}),
+    "ASIX2-0374-ASO": frozenset({"Pràctica ASO - Automatització amb Ansible"}),
+    "ASIX2-0375-SXI": frozenset({"Pràctica SXI - DNS autoritatiu i resolució"}),
+    "ASIX2-0378-SAD": frozenset({"Pràctica SAD - Hardening de Windows Server"}),
+    "ASIX2-0379-PROJ": frozenset({"Projecte ASIX - Lliurament de la proposta tècnica"}),
+    "ASIX-CAMPAIGN-01": frozenset(
+        {
+            "Campaign Report",
+            "Práctica Windows Server validation",
+            "Práctica Windows Server command failure",
+            "OVA import validation",
+            "AutoTask draft-only submission fixture",
+            "AutoTask draft statement fixture",
+            "AutoTask statement-only blocked fixture",
+        }
+    ),
 }
+
+_V4_SUBMISSION_POLICIES = {
+    "AutoTask draft-only submission fixture": (True, False),
+    "AutoTask draft statement fixture": (True, True),
+    "AutoTask statement-only blocked fixture": (False, True),
+}
+
+_V4_SUBMISSION_STATEMENT = (
+    b"<p>Declaro que aquesta entrega \xc3\xa9s meva \xe2\x80\x94 \xe4\xbd\xa0\xe5\xa5\xbd.</p>"
+    b"<p>Versi\xc3\xb3 <strong>HTML</strong> distintiva.</p>"
+)
 
 _FIXTURE_BYTES = {
     "autotask-brief.txt": (
@@ -89,6 +117,13 @@ _FIXTURE_BYTES = {
         b"# Proposta t\xc3\xa8cnica\n\n## Arquitectura\n## Riscos\n## Pressupost\n"
         b"## Proves\n## Recuperaci\xc3\xb3\n"
     ),
+    "report.txt": b"Write the deterministic central report.\n",
+    "windows-lab.txt": b"Validate the Windows lab through SSM.\n",
+    "failure.txt": b"Run the deterministic failing Windows command.\n",
+    "negative.ova": (
+        b"AUTOTASK-METADATA-ONLY-OVA\nThis tiny deterministic fixture is metadata-only "
+        b"and is not a real OVA.\n"
+    ),
 }
 
 _ADVANCED_BYTES = (
@@ -108,6 +143,37 @@ def _live_config(token_file: Path) -> MoodleConnectionConfig:
     return replace(MoodleConnectionConfig.from_token_file(token_file), timeout_seconds=120)
 
 
+def _managed_fixture_assignments(
+    assignments: tuple[MoodleAssignmentSnapshot, ...],
+) -> tuple[MoodleAssignmentSnapshot, ...]:
+    return tuple(
+        item for item in assignments if item.course_shortname in _MANAGED_TITLES_BY_COURSE
+    )
+
+
+def test_managed_fixture_filter_includes_assignment_empty_course() -> None:
+    unexpected = MoodleAssignmentSnapshot(
+        task_key="task",
+        revision_digest="revision",
+        site_url="https://example.test",
+        assignment_id=1,
+        course_id=1,
+        course_name="Fonaments de Maquinari",
+        course_shortname="ASIX1-0371-FM",
+        course_module_id=1,
+        title="Unexpected assignment",
+        intro="",
+        allows_submissions_from=0,
+        due_date=0,
+        cutoff_date=0,
+        grading_due_date=0,
+        time_modified=0,
+        attachments=(),
+    )
+
+    assert _managed_fixture_assignments((unexpected,)) == (unexpected,)
+
+
 @pytest.mark.skipif(
     not os.environ.get("MOODLE_LIVE_TOKEN_FILE"),
     reason="MOODLE_LIVE_TOKEN_FILE is required for local Moodle integration verification",
@@ -116,7 +182,9 @@ def test_fixture_attachment_downloads(tmp_path: Path) -> None:
     token_file = Path(os.environ["MOODLE_LIVE_TOKEN_FILE"])
     service = MoodleService(_live_config(token_file))
     assignment = next(
-        item for item in _live_or_fail(service.assignments) if item.title == "AutoTask assignment"
+        item
+        for item in _managed_fixture_assignments(_live_or_fail(service.assignments))
+        if item.course_shortname == "ASIX-LAB" and item.title == "AutoTask assignment"
     )
     attachment = next(
         item for item in assignment.attachments if item.filename == "autotask-brief.txt"
@@ -140,8 +208,8 @@ def test_fixture_scheduler_once_is_idempotent(tmp_path: Path) -> None:
         def assignments(self) -> tuple[MoodleAssignmentSnapshot, ...]:
             return tuple(
                 item
-                for item in _live_or_fail(live.assignments)
-                if item.title == "AutoTask assignment"
+                for item in _managed_fixture_assignments(_live_or_fail(live.assignments))
+                if item.course_shortname == "ASIX-LAB" and item.title == "AutoTask assignment"
             )
 
     stream = StringIO()
@@ -168,24 +236,25 @@ def test_fixture_scheduler_once_is_idempotent(tmp_path: Path) -> None:
 )
 def test_rich_fixture_exposes_exact_assignment_matrix() -> None:
     token_file = Path(os.environ["MOODLE_LIVE_TOKEN_FILE"])
-    assignments = _live_or_fail(MoodleService(_live_config(token_file)).assignments)
-    assert len(assignments) == 12
-    assert {item.title for item in assignments} == _RICH_TITLES | {"AutoTask assignment"}
-    assert {item.course_shortname for item in assignments} == {
-        "ASIX-LAB",
-        "ASIX1-0369-ISO",
-        "ASIX1-0372-GBD",
-        "ASIX1-0373-LMSGI",
-        "ASIX1-0376-IAW",
-        "ASIX1-0377-ASGBD",
-        "ASIX2-0370-PAX",
-        "ASIX2-0374-ASO",
-        "ASIX2-0375-SXI",
-        "ASIX2-0378-SAD",
-        "ASIX2-0379-PROJ",
+    assignments = _managed_fixture_assignments(
+        _live_or_fail(MoodleService(_live_config(token_file)).assignments)
+    )
+    expected_matrix = {
+        (course_shortname, title)
+        for course_shortname, titles in _MANAGED_TITLES_BY_COURSE.items()
+        for title in titles
     }
-    assert len({item.task_key for item in assignments}) == 12
-    assert len({item.revision_digest for item in assignments}) == 12
+    assert len(assignments) == 19
+    assert {
+        (item.course_shortname, item.title) for item in assignments
+    } == expected_matrix
+    assert {item.course_shortname for item in assignments} == {
+        course_shortname
+        for course_shortname, titles in _MANAGED_TITLES_BY_COURSE.items()
+        if titles
+    }
+    assert len({item.task_key for item in assignments}) == 19
+    assert len({item.revision_digest for item in assignments}) == 19
 
 
 @pytest.mark.skipif(
@@ -195,10 +264,11 @@ def test_rich_fixture_exposes_exact_assignment_matrix() -> None:
 def test_rich_fixture_downloads_every_attachment_with_exact_bytes(tmp_path: Path) -> None:
     token_file = Path(os.environ["MOODLE_LIVE_TOKEN_FILE"])
     service = MoodleService(_live_config(token_file))
-    assignments = _live_or_fail(service.assignments)
+    assignments = _managed_fixture_assignments(_live_or_fail(service.assignments))
     seen: dict[str, bytes] = {}
     for assignment in assignments:
         for attachment in assignment.attachments:
+            assert attachment.filename not in seen
             receipt = _live_or_fail(
                 partial(
                     download_attachment,
@@ -211,10 +281,44 @@ def test_rich_fixture_downloads_every_attachment_with_exact_bytes(tmp_path: Path
             seen[attachment.filename] = receipt.path.read_bytes()
             assert receipt.size_bytes == attachment.size_bytes
             assert len(receipt.sha256) == 64
-    expected = dict(_FIXTURE_BYTES)
-    if "revision-2.txt" in seen:
-        expected["revision-2.txt"] = _ADVANCED_BYTES
+    expected = {**_FIXTURE_BYTES, "revision-2.txt": _ADVANCED_BYTES}
     assert seen == expected
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MOODLE_LIVE_TOKEN_FILE"),
+    reason="MOODLE_LIVE_TOKEN_FILE is required for local Moodle integration verification",
+)
+def test_rich_fixture_v4_submission_policies_are_exact() -> None:
+    token_file = Path(os.environ["MOODLE_LIVE_TOKEN_FILE"])
+    assignments = _managed_fixture_assignments(
+        _live_or_fail(MoodleService(_live_config(token_file)).assignments)
+    )
+    policies = {
+        item.title: item
+        for item in assignments
+        if item.course_shortname == "ASIX-CAMPAIGN-01"
+        and item.title in _V4_SUBMISSION_POLICIES
+    }
+    assert set(policies) == set(_V4_SUBMISSION_POLICIES)
+    for title, (submission_drafts, requires_statement) in _V4_SUBMISSION_POLICIES.items():
+        assignment = policies[title]
+        assert (assignment.submission_drafts, assignment.requires_submission_statement) == (
+            submission_drafts,
+            requires_statement,
+        )
+        assert (
+            assignment.file_submission_enabled,
+            assignment.file_submission_max_files,
+            assignment.file_submission_max_bytes,
+            assignment.file_submission_filetypes,
+        ) == (True, 1, 2 * 1024 * 1024, ".md")
+        assert not assignment.team_submission
+        assert not assignment.no_submissions
+        assert not assignment.attachments
+        if requires_statement:
+            assert assignment.submission_statement.encode("utf-8") == _V4_SUBMISSION_STATEMENT
+            assert assignment.submission_statement_format == 1
 
 
 @pytest.mark.skipif(
@@ -224,7 +328,7 @@ def test_rich_fixture_downloads_every_attachment_with_exact_bytes(tmp_path: Path
 def test_rich_fixture_covers_deadline_attachment_and_lab_scenarios(tmp_path: Path) -> None:
     token_file = Path(os.environ["MOODLE_LIVE_TOKEN_FILE"])
     live = MoodleService(_live_config(token_file))
-    assignments = _live_or_fail(live.assignments)
+    assignments = _managed_fixture_assignments(_live_or_fail(live.assignments))
     by_title = {item.title: item for item in assignments}
     now = int(time.time())
     assert by_title["Pràctica ISO 2 - Usuaris, grups i permisos Linux"].due_date < now
@@ -256,7 +360,9 @@ def test_rich_fixture_covers_deadline_attachment_and_lab_scenarios(tmp_path: Pat
 )
 def test_rich_fixture_advanced_revision_is_visible() -> None:
     token_file = Path(os.environ["MOODLE_LIVE_TOKEN_FILE"])
-    assignments = _live_or_fail(MoodleService(_live_config(token_file)).assignments)
+    assignments = _managed_fixture_assignments(
+        _live_or_fail(MoodleService(_live_config(token_file)).assignments)
+    )
     ova = next(
         item
         for item in assignments

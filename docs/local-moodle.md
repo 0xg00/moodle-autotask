@@ -87,9 +87,11 @@ different bytes, size, hash, or intro is partial and requires `Reset -Force`; Bo
 overwrites it.
 
 Bootstrap also creates a deterministic, entirely fictitious ASIX catalog inspired only by public
-course names: 11 modules, 11 rich assignments, and the original base assignment. The matrix covers
-an overdue task, a future-opening task, a task without a deadline, a task without attachments,
-multiple attachments, and common ASIX formats such as `.pdf`, `.ova`, `.sql`, `.xml`, `.xsd`,
+course names: 11 modules, 11 rich assignments, and the original base assignment. `ExpandFixture`
+then adds four campaign assignments and three v4 submission-policy assignments, for exactly 19
+managed fixture assignments in complete-v4. The matrix covers an overdue task, a future-opening
+task, a task without a deadline, a task without attachments, multiple attachments, and common
+ASIX formats such as `.pdf`, `.ova`, `.sql`, `.xml`, `.xsd`,
 `.yml`, `.ps1`, `.txt`, and `.md`. `asix-router-lab.ova` is intentionally a tiny metadata-only
 fixture and is not bootable; it tests lab-artifact routing without distributing a real VM image.
 No private course content, person, password, or submission from either reference school is copied.
@@ -220,14 +222,17 @@ must be running; the script neither changes Docker Desktop settings nor starts i
 
 The Moodle CLI seeds use supported core/course/manual-enrolment APIs to create `student1`, the
 base `ASIX-LAB` course, the public-structure-inspired ASIX category tree, 11 module courses, and 12
-managed assignments in total. Before expansion, Smoke requires those exact 12 managed assignments.
-After `ExpandFixture`, Smoke requires the exact 19 managed assignments, seven campaign assignments, the three
-v4 submission-policy assignments, the global submission statement, and both simulated OVA metadata attachments. It resolves campaign assignment `cmid` values against the one
+pre-expansion managed assignments. Complete-v4 has exactly 19 managed assignments: the base task,
+11 rich ASIX tasks, four v3 campaign tasks, and three v4 submission-policy tasks. Smoke requires
+those exact 19 managed assignments, seven campaign assignments, the three v4 submission-policy
+assignments, the global submission statement, and both simulated OVA metadata attachments. It resolves campaign assignment `cmid` values against the one
 official `core_course_get_contents` response for the campaign course and fails closed on a missing,
 duplicate, or case-mismatched assignment title. Moodle's student REST response intentionally does
 not expose course-module `idnumber`; the fixture PHP verifier checks those exact IDs in Moodle's
 database, while REST Smoke independently checks the campaign `cmid`/title mapping, count, and
-attachments. Assignments in unrelated courses are deliberately outside this managed scope. The script obtains a token from Moodle's official
+attachments. Optional unrelated E2E courses, such as `AUTOTASK-LIVE-E2E`, are deliberately outside
+this managed scope and are not counted by the live fixture matrix. The script obtains a token from
+Moodle's official
 `login/token.php` endpoint for service `moodle_mobile_app`, then verifies REST
 `core_webservice_get_site_info`, `core_enrol_get_users_courses`, and
 `core_course_get_contents`. Moodle exception and error responses fail the command.
