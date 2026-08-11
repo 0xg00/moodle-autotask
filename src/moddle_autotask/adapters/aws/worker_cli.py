@@ -21,6 +21,7 @@ from .agent_spool import FileAgentBroker
 from .artifacts import AwsMoodleArtifactPreparer
 from .completion import TelegramExecutionNotifier
 from .image_imports import AwsImageImportConfig, AwsImageImporter
+from .input_transfer import AwsGuestInputTransfer
 from .labs import AwsCliJsonRunner, AwsEc2LabProvider, AwsLabConfig
 from .worker import process_one
 
@@ -100,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             args.region,
             runner,
         )
+        guest_input_transfer = AwsGuestInputTransfer(runner, args.region)
         telegram_config = TelegramConfig.from_file(args.telegram_config_file)
         execution_notifier = TelegramExecutionNotifier(
             telegram_config, TelegramClient(telegram_config), args.agent_results / "bundles"
@@ -118,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_importer=image_importer,
                 execution_broker=execution_broker,
                 execution_notifier=execution_notifier,
+                guest_input_transfer=guest_input_transfer,
                 submission_service=submission_service,
                 lease_seconds=3600,
             )

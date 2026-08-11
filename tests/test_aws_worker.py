@@ -15,7 +15,9 @@ from moddle_autotask.adapters.aws.image_imports import (
     ImageImportReadiness,
     ImageImportResult,
 )
+from moddle_autotask.adapters.aws.input_transfer import GuestInputReady
 from moddle_autotask.adapters.aws.worker import process_one
+from moddle_autotask.adapters.moodle import approval_state
 from moddle_autotask.adapters.moodle.approval_state import ApprovalState, SubmissionManifest
 from moddle_autotask.adapters.moodle.state import (
     MoodleState,
@@ -123,6 +125,24 @@ class _Broker:
                 self.progress.provenance or _central_provenance(),
             )
         return self.progress
+
+
+@dataclass
+class _Transfer:
+    calls: list[ExecutionMode] = field(default_factory=list)
+
+    def ensure(
+        self,
+        event: NotificationEvent,
+        prepared: PreparedAssignment,
+        handle: LabHandle,
+        executor: object,
+        *,
+        excluded_attachment_keys: frozenset[str] = frozenset(),
+    ) -> GuestInputReady:
+        del event, handle, executor, excluded_attachment_keys
+        self.calls.append(ExecutionMode.HYBRID)
+        return GuestInputReady("e" * 64, None, ())
 
 
 def _central_provenance() -> dict[str, object]:
@@ -725,11 +745,20 @@ def test_completion_delivery_retries_runtime_error_but_propagates_value_error(
 def test_lab_work_provisions_once_then_waits_for_ssm(tmp_path: Path) -> None:
     state, task_key, revision = _approved(tmp_path, lab=True)
     provider = _Provider()
+    preparer = _Preparer()
+    transfer = _Transfer()
 
     first = process_one(state, provider, owner="worker", now=10)
     second = process_one(state, provider, owner="worker", now=11)
     provider.readiness_value = LabReadiness.READY
-    third = process_one(state, provider, owner="worker", now=42)
+    third = process_one(
+        state,
+        provider,
+        owner="worker",
+        artifact_preparer=preparer,
+        guest_input_transfer=transfer,
+        now=42,
+    )
     before_ttl = process_one(state, provider, owner="worker", now=7241)
     cleanup = process_one(state, provider, owner="worker", now=7242)
 
@@ -745,12 +774,75 @@ def test_lab_work_provisions_once_then_waits_for_ssm(tmp_path: Path) -> None:
     assert provider.teardowns == [(LabHandle("lab:test"), "cleanup-" + item.provision_key)]
 
 
+@pytest.mark.parametrize("mode", (ExecutionMode.HYBRID, ExecutionMode.IN_GUEST))
+def test_noncentral_ready_without_transfer_retries_before_broker_dispatch(
+    tmp_path: Path, mode: ExecutionMode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(approval_state, "_select_mode", lambda event: mode)
+    state, _task_key, _revision = _approved(tmp_path, lab=True)
+    provider = _Provider(readiness_value=LabReadiness.READY)
+    broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
+    preparer = _Preparer()
+    assert process_one(state, provider, owner="worker", now=10).result == "lab_provisioned"
+
+    cycle = process_one(
+        state,
+        provider,
+        owner="worker",
+        artifact_preparer=preparer,
+        execution_broker=broker,
+        now=11,
+    )
+
+    assert cycle.result == "retry" and broker.calls == []
+
+
+@pytest.mark.parametrize("mode", (ExecutionMode.HYBRID, ExecutionMode.IN_GUEST))
+def test_noncentral_empty_transfer_is_bound_before_dispatch(
+    tmp_path: Path, mode: ExecutionMode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(approval_state, "_select_mode", lambda event: mode)
+    state, _task_key, _revision = _approved(tmp_path, lab=True)
+    provider = _Provider(readiness_value=LabReadiness.READY)
+    broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
+    transfer = _Transfer()
+
+    assert process_one(state, provider, owner="worker", now=10).result == "lab_provisioned"
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            guest_input_transfer=transfer,
+            now=11,
+        ).result
+        == "lab_ready"
+    )
+    assert (
+        process_one(
+            state,
+            provider,
+            owner="worker",
+            artifact_preparer=_Preparer(),
+            execution_broker=broker,
+            guest_input_transfer=transfer,
+            now=12,
+        ).result
+        == "execution_complete"
+    )
+    assert transfer.calls == [ExecutionMode.HYBRID, ExecutionMode.HYBRID]
+    assert broker.calls == [mode]
+
+
 def test_lab_cleanup_deadline_survives_notification_outage_and_restart(tmp_path: Path) -> None:
     state, task_key, revision = _approved(tmp_path, lab=True)
     provider = _Provider(readiness_value=LabReadiness.READY)
     broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
     failing = _FailingNotifier()
     preparer = _Preparer()
+    transfer = _Transfer()
 
     assert (
         process_one(
@@ -760,6 +852,7 @@ def test_lab_cleanup_deadline_survives_notification_outage_and_restart(tmp_path:
             artifact_preparer=preparer,
             execution_broker=broker,
             execution_notifier=failing,
+            guest_input_transfer=transfer,
             now=10,
         ).result
         == "lab_provisioned"
@@ -772,6 +865,7 @@ def test_lab_cleanup_deadline_survives_notification_outage_and_restart(tmp_path:
             artifact_preparer=preparer,
             execution_broker=broker,
             execution_notifier=failing,
+            guest_input_transfer=transfer,
             now=11,
         ).result
         == "lab_ready"
@@ -784,6 +878,7 @@ def test_lab_cleanup_deadline_survives_notification_outage_and_restart(tmp_path:
             artifact_preparer=preparer,
             execution_broker=broker,
             execution_notifier=failing,
+            guest_input_transfer=transfer,
             now=12,
         ).result
         == "execution_complete"
@@ -829,6 +924,7 @@ def test_cleanup_retry_preserves_execution_phase_and_deadline_without_reexecutio
     provider = _Provider(readiness_value=LabReadiness.READY, fail_teardown_once=True)
     broker = _Broker(ExecutionProgress("succeeded", "done", "# Informe"))
     preparer = _Preparer()
+    transfer = _Transfer()
 
     assert (
         process_one(
@@ -837,6 +933,7 @@ def test_cleanup_retry_preserves_execution_phase_and_deadline_without_reexecutio
             owner="worker",
             artifact_preparer=preparer,
             execution_broker=broker,
+            guest_input_transfer=transfer,
             now=10,
         ).result
         == "lab_provisioned"
@@ -848,6 +945,7 @@ def test_cleanup_retry_preserves_execution_phase_and_deadline_without_reexecutio
             owner="worker",
             artifact_preparer=preparer,
             execution_broker=broker,
+            guest_input_transfer=transfer,
             now=11,
         ).result
         == "lab_ready"
@@ -859,6 +957,7 @@ def test_cleanup_retry_preserves_execution_phase_and_deadline_without_reexecutio
             owner="worker",
             artifact_preparer=preparer,
             execution_broker=broker,
+            guest_input_transfer=transfer,
             now=12,
         ).result
         == "execution_complete"

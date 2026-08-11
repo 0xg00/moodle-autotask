@@ -97,6 +97,28 @@ class AwsCliJsonRunner:
         except json.JSONDecodeError as error:
             raise AwsLabError("AWS CLI returned invalid JSON") from error
 
+    def run_text(self, arguments: tuple[str, ...]) -> str:
+        """Run the one AWS CLI command whose safe result is a presigned URL.
+
+        Callers must keep this value transient; unlike ``run_json`` it is not
+        suitable for any durable payload.
+        """
+        try:
+            completed = subprocess.run(
+                [self.executable, *arguments, "--no-cli-pager"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=self.timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AwsLabError("AWS CLI operation timed out") from error
+        if completed.returncode != 0:
+            raise AwsLabError(f"AWS CLI operation failed with exit code {completed.returncode}")
+        return completed.stdout
+
 
 @dataclass(frozen=True, slots=True)
 class AwsLabConfig:
@@ -281,6 +303,85 @@ class AwsEc2LabProvider:
     ) -> LabTranscript:
         command_id = self.dispatch_powershell(handle, commands, execution_key=execution_key)
         return self.wait_powershell(handle, command_id, execution_key=execution_key)
+
+    def run_ephemeral_powershell(
+        self, handle: LabHandle, commands: tuple[str, ...], *, execution_key: str
+    ) -> LabTranscript:
+        """Run a one-shot command without writing its source into the guest filesystem.
+
+        This is reserved for short-lived bearer URLs.  It intentionally returns
+        no SSM command output because HTTP/AWS errors may reflect the URL.
+        """
+        if _DIGEST_PATTERN.fullmatch(execution_key) is None:
+            raise ValueError("lab execution key is invalid")
+        if (
+            not isinstance(commands, tuple)
+            or not commands
+            or len(commands) > 32
+            or not all(isinstance(command, str) and command.strip() for command in commands)
+        ):
+            raise ValueError("lab PowerShell commands are invalid")
+        source = "\n".join(commands)
+        if len(source.encode("utf-8")) > 24 * 1024:
+            raise ValueError("lab PowerShell commands are too large")
+        instance_id, provision_key = self._parse_handle(handle)
+        if self._owned_instance(instance_id, provision_key) is None:
+            raise AwsLabError("lab instance is unavailable")
+        session = self._assume_role(provision_key)
+        response = self._aws(
+            session,
+            "ssm",
+            "send-command",
+            "--region",
+            self._config.region,
+            "--instance-ids",
+            instance_id,
+            "--document-name",
+            "AWS-RunPowerShellScript",
+            "--parameters",
+            json.dumps({"commands": [source], "executionTimeout": ["1800"]}, separators=(",", ":")),
+            "--timeout-seconds",
+            "1800",
+        )
+        command_id = self._required_string(self._mapping_field(response, "Command"), "CommandId")
+        if _COMMAND_ID_PATTERN.fullmatch(command_id) is None:
+            raise AwsLabError("AWS returned an invalid SSM command ID")
+        deadline = time.monotonic() + _COMMAND_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            invocations = self._list_field(
+                self._aws(
+                    session,
+                    "ssm",
+                    "list-command-invocations",
+                    "--region",
+                    self._config.region,
+                    "--command-id",
+                    command_id,
+                    "--instance-id",
+                    instance_id,
+                    deadline=deadline,
+                ),
+                "CommandInvocations",
+            )
+            if not invocations:
+                self._sleep_until_command_deadline(deadline)
+                continue
+            if len(invocations) != 1:
+                raise AwsLabError("AWS returned an ambiguous lab command invocation")
+            invocation = invocations[0]
+            if (
+                self._required_string(invocation, "CommandId") != command_id
+                or self._required_string(invocation, "InstanceId") != instance_id
+            ):
+                raise AwsLabError("AWS returned an invalid lab command invocation")
+            status = self._required_string(invocation, "Status")
+            if status in _PENDING_COMMAND_STATUSES:
+                self._sleep_until_command_deadline(deadline)
+                continue
+            if status not in _TERMINAL_COMMAND_STATUSES:
+                raise AwsLabError("AWS returned an unknown lab command status")
+            return LabTranscript(status == "Success", "")
+        raise AwsLabError("lab command did not finish")
 
     def dispatch_powershell(
         self, handle: LabHandle, commands: tuple[str, ...], *, execution_key: str
@@ -679,6 +780,7 @@ def _idempotent_powershell(execution_key: str, encoded_source: str) -> str:
             "$temporary = $done + '.tmp'",
             "[IO.File]::WriteAllText($temporary, $payload, (New-Object Text.UTF8Encoding($false)))",
             "Move-Item -LiteralPath $temporary -Destination $done -Force",
+            "Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue",
             "Remove-Item -LiteralPath $running -Force",
             "[Console]::Out.Write($payload)",
             "exit 0",

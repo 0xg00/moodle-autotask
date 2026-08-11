@@ -10,7 +10,7 @@ import subprocess
 import threading
 import traceback
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -134,6 +134,10 @@ def _prepared(event: NotificationEvent, runner: _S3Runner) -> PreparedAssignment
         "Práctica controlada",
         "Genera un informe verificable.",
         "d" * 64,
+        "e" * 64,
+        ("C:\\ProgramData\\MoodleAutotask\\inputs\\" + "e" * 64 + "\\input.txt",)
+        if artifacts
+        else (),
     )
 
 
@@ -185,7 +189,11 @@ def _ready_lab_dispatch(
     _write_result(results, plan, commands=list(commands))
     plan_result = json.loads((results / f"{plan.name}.json").read_text(encoding="utf-8"))
     plan_digest = hashlib.sha256(_canonical(plan_result)).hexdigest()
-    return broker._job_id("lab_report", event, plan_digest), plan_digest, commands
+    return (
+        broker._job_id("lab_report", event, broker._lab_context_digest("e" * 64, plan_digest)),
+        plan_digest,
+        commands,
+    )
 
 
 def _central_plan() -> dict[str, object]:
@@ -194,6 +202,35 @@ def _central_plan() -> dict[str, object]:
         "acceptanceCriteria": [{"id": "report", "text": "A report exists."}],
         "expectedArtifacts": ["report.md"],
     }
+
+
+def test_noncentral_spool_requires_transfer_and_binds_digest_to_plan_identity(
+    tmp_path: Path,
+) -> None:
+    runner = _S3Runner()
+    event = _event(tmp_path)
+    missing = replace(_prepared(event, runner), guest_input_transfer_digest="")
+    broker = FileAgentBroker(tmp_path / "jobs", tmp_path / "results", "eu-south-2", runner)
+    with pytest.raises(AgentSpoolError, match="transfer digest"):
+        broker.step(event, missing, ExecutionMode.HYBRID, LabHandle("lab:test"), _LabExecutor())
+    assert not (tmp_path / "jobs").exists()
+
+    first = _prepared(event, runner)
+    second = replace(
+        first,
+        guest_input_transfer_digest="f" * 64,
+        guest_input_paths=("C:\\ProgramData\\MoodleAutotask\\inputs\\" + "f" * 64 + "\\input.txt",),
+    )
+    first_id = broker._job_id("lab_plan", event, broker._guest_transfer_digest(first))
+    second_id = broker._job_id("lab_plan", event, broker._guest_transfer_digest(second))
+    assert first_id != second_id
+    with pytest.raises(AgentSpoolError, match="transfer context"):
+        broker._ensure_job(
+            "lab_report",
+            event,
+            second,
+            {"planDigest": "a" * 64, "transferDigest": "e" * 64},
+        )
 
 
 def _seed_executor_job(

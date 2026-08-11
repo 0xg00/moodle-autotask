@@ -109,6 +109,7 @@ class FileAgentBroker:
             return self._step_central(event, prepared)
         if lab_handle is None:
             raise AgentSpoolError("lab execution requires a lab handle")
+        transfer_digest = self._guest_transfer_digest(prepared)
         plan_id = self._ensure_job("lab_plan", event, prepared, None)
         plan = self._result(plan_id, "lab_plan")
         if plan is None:
@@ -117,7 +118,11 @@ class FileAgentBroker:
             return ExecutionProgress("failed", _result_summary(plan))
         commands = _commands(plan)
         plan_digest = hashlib.sha256(_canonical(plan)).hexdigest()
-        report_id = self._job_id("lab_report", event, plan_digest)
+        report_id = self._job_id(
+            "lab_report",
+            event,
+            self._lab_context_digest(transfer_digest, plan_digest),
+        )
         report_job = self.jobs_root / report_id
         if not report_job.exists() and not report_job.is_symlink():
             transcript = self._dispatch_or_resume(
@@ -125,15 +130,18 @@ class FileAgentBroker:
             )
             if transcript is None:
                 return ExecutionProgress("failed", "Lab dispatch state is unsafe")
+            context: dict[str, object] = {
+                "planDigest": plan_digest,
+                "labSucceeded": transcript.succeeded,
+                "transcript": transcript.output,
+            }
+            if transfer_digest:
+                context["transferDigest"] = transfer_digest
             self._ensure_job(
                 "lab_report",
                 event,
                 prepared,
-                {
-                    "planDigest": plan_digest,
-                    "labSucceeded": transcript.succeeded,
-                    "transcript": transcript.output,
-                },
+                context,
             )
         report = self._result(report_id, "lab_report")
         if report is None:
@@ -546,12 +554,16 @@ class FileAgentBroker:
         prepared: PreparedAssignment,
         context: dict[str, object] | None,
     ) -> str:
-        context_digest = None
+        transfer_digest = self._guest_transfer_digest(prepared)
+        context_digest = transfer_digest or None
         if context is not None:
             plan_digest = context.get("planDigest")
             if not isinstance(plan_digest, str) or _DIGEST.fullmatch(plan_digest) is None:
                 raise AgentSpoolError("agent report context is invalid")
-            context_digest = plan_digest
+            supplied_transfer = context.get("transferDigest")
+            if transfer_digest and supplied_transfer != transfer_digest:
+                raise AgentSpoolError("agent report transfer context is invalid")
+            context_digest = self._lab_context_digest(transfer_digest, plan_digest)
         job_id = self._job_id(phase, event, context_digest)
         target = self.jobs_root / job_id
         payload = {
@@ -575,6 +587,11 @@ class FileAgentBroker:
             ],
             "context": context,
         }
+        if transfer_digest:
+            payload["guestInputTransfer"] = {
+                "guestPaths": list(prepared.guest_input_paths),
+                "transferDigest": transfer_digest,
+            }
         encoded = _canonical(payload)
         if len(encoded) > _MAX_RESULT_BYTES:
             raise AgentSpoolError("agent job is too large")
@@ -704,6 +721,30 @@ class FileAgentBroker:
             if not advertised.is_lab_artifact:
                 selected.append(artifact)
         return tuple(selected)
+
+    @staticmethod
+    def _guest_transfer_digest(prepared: PreparedAssignment) -> str:
+        digest = prepared.guest_input_transfer_digest
+        if _DIGEST.fullmatch(digest) is None:
+            raise AgentSpoolError("guest input transfer digest is invalid")
+        root = f"C:\\ProgramData\\MoodleAutotask\\inputs\\{digest}\\"
+        if any(
+            not isinstance(path, str)
+            or not path.startswith(root)
+            or "\x00" in path
+            or len(path.encode("utf-8")) > 512
+            for path in prepared.guest_input_paths
+        ):
+            raise AgentSpoolError("guest input paths are invalid")
+        return digest
+
+    @staticmethod
+    def _lab_context_digest(transfer_digest: str, plan_digest: str) -> str:
+        if not transfer_digest:
+            return plan_digest
+        return hashlib.sha256(
+            _canonical({"planDigest": plan_digest, "transferDigest": transfer_digest})
+        ).hexdigest()
 
     @staticmethod
     def _job_id(phase: str, event: NotificationEvent, context_digest: str | None) -> str:

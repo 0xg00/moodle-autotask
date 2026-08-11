@@ -108,6 +108,8 @@ class _FakeRunner:
         if operation == ("ssm", "send-command"):
             parameters = json.loads(arguments[arguments.index("--parameters") + 1])
             wrapper = parameters["commands"][0]
+            if "$key = '" not in wrapper:
+                return {"Command": {"CommandId": "12345678-1234-1234-1234-123456789abc"}}
             execution_key = wrapper.split("$key = '", 1)[1].split("'", 1)[0]
             if self.command_output_override is None:
                 self.command_output = json.dumps(
@@ -337,6 +339,40 @@ def test_powershell_uses_owned_instance_official_document_and_guest_marker() -> 
     assert "C:\\ProgramData\\MoodleAutotask\\executions" in wrapper
     assert "Previous execution has an ambiguous state" in wrapper
     assert "f" * 64 in wrapper
+
+
+@pytest.mark.parametrize(("status", "succeeded"), [("Success", True), ("Failed", False)])
+def test_ephemeral_powershell_sends_raw_bounded_command_without_transcript(
+    status: str, succeeded: bool
+) -> None:
+    runner = _FakeRunner(command_statuses=[status])
+    provider = AwsEc2LabProvider(_config(), runner)
+    handle = provider.provision(_request(), idempotency_key="ephemeral")
+    transcript = provider.run_ephemeral_powershell(
+        handle,
+        ("$url = 'https://bucket.s3.eu-south-2.amazonaws.com/x?secret'",),
+        execution_key="a" * 64,
+    )
+
+    assert transcript.succeeded is succeeded and transcript.output == ""
+    command = next(call[0] for call in runner.calls if call[0][:2] == ("ssm", "send-command"))
+    assert command[command.index("--document-name") + 1] == "AWS-RunPowerShellScript"
+    parameters = json.loads(command[command.index("--parameters") + 1])
+    assert parameters["commands"] == ["$url = 'https://bucket.s3.eu-south-2.amazonaws.com/x?secret'"]
+    assert "$scriptPath" not in parameters["commands"][0]
+    assert "$running" not in parameters["commands"][0]
+    assert not any(call[0][:2] == ("ssm", "get-command-invocation") for call in runner.calls)
+
+
+def test_ephemeral_powershell_rejects_invalid_key_and_size_before_ssm() -> None:
+    runner = _FakeRunner()
+    provider = AwsEc2LabProvider(_config(), runner)
+    handle = LabHandle("aws-ec2:v1:eu-south-2:i-0123456789abcdef0:" + "a" * 64)
+    with pytest.raises(ValueError):
+        provider.run_ephemeral_powershell(handle, ("Write-Output x",), execution_key="bad")
+    with pytest.raises(ValueError):
+        provider.run_ephemeral_powershell(handle, ("x" * (24 * 1024 + 1),), execution_key="a" * 64)
+    assert not any(call[0][:2] == ("ssm", "send-command") for call in runner.calls)
 
 
 def test_powershell_rejects_unknown_listed_command_status() -> None:

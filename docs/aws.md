@@ -19,8 +19,16 @@ Terraform does not own Moodle token values, student files, or individual lab ins
   bounds, and project tags. Termination requires the project, environment, and lab ownership tags.
 - A lab receives a different instance profile with Systems Manager runtime permissions only. It
   cannot read the shared artifact bucket, Moodle token, assume the provisioner, create another lab,
-  or change IAM. Digest-bound transfer of per-task inputs into a lab is deferred; OVA work reaches
-  a lab only through its imported AMI.
+  or change IAM. Before hybrid or in-guest dispatch, the controller transfers exact approved
+  inputs selected by the execution topology with short-lived exact-object S3 GET presigns in bounded
+  SSM commands. The direct-AMI path excludes only its exact imported OVA object; a future nested
+  Hyper-V topology can transfer OVA bytes by supplying no imported-object exclusion. The
+  guest verifies size and SHA-256 and writes `manifest.json` last under
+  `C:\ProgramData\MoodleAutotask\inputs\<transferDigest>`; it has no S3 permission. URLs are
+  absent from SQLite, spool jobs/results, reports, Telegram, and command output. The URL necessarily
+  reaches AWS/SSM control-plane history and may be handled transiently by the SSM Agent; this
+  application writes no URL-bearing guest script or marker. OVA work still reaches a lab
+  only through its imported AMI; a future compatible appliance gate must define changed handling.
 - S3 state and artifacts have public access blocked, versioning, default encryption, and an
   explicit deny for non-TLS requests.
 - Terraform creates separate Moodle and Telegram Secrets Manager containers but never secret

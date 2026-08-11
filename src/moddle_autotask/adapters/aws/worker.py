@@ -29,6 +29,7 @@ from moddle_autotask.ports.contracts import LabProvider, LabReadiness
 from .agent_spool import ExecutionBroker, ExecutionProgress, LabCommandExecutor
 from .artifacts import PreparedAssignment
 from .image_imports import ImageImportReadiness, ImageImportResult
+from .input_transfer import GuestCommandExecutor, GuestInputReady
 
 
 class ArtifactPreparer(Protocol):
@@ -45,6 +46,18 @@ class ImageImporter(Protocol):
 
 class ExecutionNotifier(Protocol):
     def notify(self, event: NotificationEvent, progress: ExecutionProgress) -> None: ...
+
+
+class GuestInputTransferer(Protocol):
+    def ensure(
+        self,
+        event: NotificationEvent,
+        prepared: PreparedAssignment,
+        handle: LabHandle,
+        executor: GuestCommandExecutor,
+        *,
+        excluded_attachment_keys: frozenset[str] = frozenset(),
+    ) -> GuestInputReady: ...
 
 
 @runtime_checkable
@@ -85,6 +98,7 @@ def process_one(
     image_importer: ImageImporter | None = None,
     execution_broker: ExecutionBroker | None = None,
     execution_notifier: ExecutionNotifier | None = None,
+    guest_input_transfer: GuestInputTransferer | None = None,
     submission_service: SubmissionService | None = None,
     lease_seconds: int = 300,
     now: int | None = None,
@@ -106,6 +120,7 @@ def process_one(
             image_importer=image_importer,
             execution_broker=execution_broker,
             execution_notifier=execution_notifier,
+            guest_input_transfer=guest_input_transfer,
             now=now,
         )
         _deliver_pending_notification(state, execution_notifier, submission_service, now)
@@ -144,6 +159,7 @@ def _process_claim(
     image_importer: ImageImporter | None,
     execution_broker: ExecutionBroker | None,
     execution_notifier: ExecutionNotifier | None,
+    guest_input_transfer: GuestInputTransferer | None,
     now: int | None,
 ) -> WorkerCycle:
     item = claim.item
@@ -211,6 +227,14 @@ def _process_claim(
             artifact_preparer.prepare(item.event),
             specification_digest=item.specification_digest.value,
         )
+        if item.selected_mode is not ExecutionMode.CENTRAL:
+            prepared = _with_guest_inputs(
+                item.event,
+                prepared,
+                cast(LabHandle, item.lab_handle),
+                cast(GuestCommandExecutor, provider),
+                guest_input_transfer,
+            )
         progress = execution_broker.step(
             item.event,
             prepared,
@@ -248,6 +272,20 @@ def _process_claim(
         raise ApprovalStateError("claimed work has an invalid state")
     readiness = provider.readiness(item.lab_handle)
     if readiness is LabReadiness.READY:
+        if item.selected_mode is not ExecutionMode.CENTRAL:
+            if artifact_preparer is None:
+                raise RuntimeError("artifact preparer is unavailable during guest input transfer")
+            prepared = replace(
+                artifact_preparer.prepare(item.event),
+                specification_digest=item.specification_digest.value,
+            )
+            _with_guest_inputs(
+                item.event,
+                prepared,
+                item.lab_handle,
+                cast(GuestCommandExecutor, provider),
+                guest_input_transfer,
+            )
         if not state.mark_ready(claim, now=now, for_execution=execution_broker is not None):
             return WorkerCycle("ownership_lost", item.selected_mode)
         return WorkerCycle("lab_ready", item.selected_mode)
@@ -258,6 +296,29 @@ def _process_claim(
     if not state.retry_work(claim, "lab_pending", 30, now=now):
         return WorkerCycle("ownership_lost", item.selected_mode)
     return WorkerCycle("lab_pending", item.selected_mode)
+
+
+def _with_guest_inputs(
+    event: NotificationEvent,
+    prepared: PreparedAssignment,
+    handle: LabHandle,
+    executor: GuestCommandExecutor,
+    transferer: GuestInputTransferer | None,
+) -> PreparedAssignment:
+    if transferer is None:
+        raise RuntimeError("guest input transfer is unavailable")
+    ready = transferer.ensure(
+        event,
+        prepared,
+        handle,
+        executor,
+        excluded_attachment_keys=_direct_import_attachment_keys(event, prepared),
+    )
+    return replace(
+        prepared,
+        guest_input_transfer_digest=ready.transfer_digest,
+        guest_input_paths=ready.guest_paths,
+    )
 
 
 def _is_cleanup_claim(claim: WorkClaim, execution_broker: ExecutionBroker | None) -> bool:
@@ -488,3 +549,15 @@ def _requires_image_import(event: NotificationEvent) -> bool:
         attachment.filename.lower().endswith((".ova", ".ovf", ".vdi", ".vmdk", ".vhd", ".vhdx"))
         for attachment in event.attachments
     )
+
+
+def _direct_import_attachment_keys(
+    event: NotificationEvent, prepared: PreparedAssignment
+) -> frozenset[str]:
+    """Select the exact direct-AMI source; transfer policy is topology, not suffix, based."""
+    if not _requires_image_import(event):
+        return frozenset()
+    selected = tuple(item for item in prepared.artifacts if item.filename.lower().endswith(".ova"))
+    if len(selected) != 1:
+        raise RuntimeError("direct image import has no exact OVA input")
+    return frozenset({selected[0].attachment_key})

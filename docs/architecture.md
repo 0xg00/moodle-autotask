@@ -117,8 +117,18 @@ tagged VM imports and can pass only the dedicated VM Import/Export service role.
 launch only the operator-fixed Windows image or a project-owned imported image, plus the fixed
 instance type, subnet, security group, volume bounds, and lab instance profile; it can terminate only
 project-tagged labs. The guest profile has Systems Manager runtime permissions only; it cannot read
-the shared artifact bucket, Moodle token, or provision another lab. Per-task digest-bound transfer
-into a lab is deferred; appliance work reaches the lab through the imported AMI.
+the shared artifact bucket, Moodle token, or provision another lab. Before a hybrid or in-guest
+agent plan is created, a canonical manifest of the approved task, revision, specification digest,
+and each object selected by the execution topology derives a transfer digest. The current direct-
+AMI route excludes only its exact imported OVA; nested Hyper-V can deliberately include OVA bytes.
+It binds guest paths and
+non-central job/report identities. One short-lived exact-object S3 GET presign is delivered per
+bounded SSM command; the guest rejects redirects and unsafe files, checks size and SHA-256, and
+writes `manifest.json` last. Empty input is deterministically ready without an SSM transfer. URLs
+never enter SQLite, the spool, jobs/results, reports, Telegram, or command output. AWS/SSM control-
+plane history necessarily retains the short-lived command body and the SSM Agent may handle it
+transiently; this application writes no URL-bearing guest script or marker. Appliance work still
+reaches the lab through the imported AMI pending a compatible OVA gate.
 
 `AwsEc2LabProvider` hashes task and workflow identities before tagging, binds EC2's client token to
 the complete immutable request plus caller idempotency key, reconciles by that key, validates every

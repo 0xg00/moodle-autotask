@@ -49,6 +49,10 @@ class PreparedAssignment:
     # Bound by the durable approval record immediately before a central agent job
     # is created.  Keeping this optional preserves the existing lab preparer API.
     specification_digest: str = ""
+    # Non-central execution receives only these non-secret, digest-bound guest
+    # locations.  Presigned URLs intentionally never cross this boundary.
+    guest_input_transfer_digest: str = ""
+    guest_input_paths: tuple[str, ...] = ()
 
 
 class AssignmentLoader(Protocol):
