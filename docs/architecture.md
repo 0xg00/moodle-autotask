@@ -72,6 +72,14 @@ blind second save. Telegram uses long polling over outbound HTTPS;
 the controller exposes no webhook or inbound port. Bot credentials are read only from a protected
 file and never accepted as a command-line value or placed in callback data.
 
+The controller's normal lab cleanup deadline is a soft operational target two hours after
+execution. A separate Terraform-owned EventBridge Lambda provides a controller- and SQLite-
+independent hard cost guard: every five minutes it paginates EC2, defensively rechecks the exact
+ownership tags and server-side launch time, and terminates only eligible labs at least the
+configured four-hour TTL old. Its dedicated role has no controller or IAM authority and limits
+each run to 20 deterministic terminations; delayed EventBridge delivery can make the bound
+eventual but cannot expand its scope beyond exact tagged labs.
+
 AWS infrastructure is a separate adapter boundary. The Terraform baseline creates a Linux
 controller whose instance role can read the exact Moodle secret, use bounded artifact prefixes, and
 connect to Systems Manager. It cannot call EC2 directly or mutate IAM. For an approved provision

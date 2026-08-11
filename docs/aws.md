@@ -104,6 +104,19 @@ size. Obtain the exact adapter configuration after apply:
 terraform -chdir=infra/aws/controller output -json
 ```
 
+Lab cleanup has two independent bounds. The controller schedules normal teardown two hours after
+execution. Terraform additionally deploys an EventBridge-triggered Lambda every five minutes that
+uses the EC2 server-side `LaunchTime` and terminates only instances at least
+`lab_hard_ttl_seconds` old (default 14,400 seconds / four hours; allowed range three through
+24 hours). It accepts at most `lab_reaper_max_terminations_per_run` instances per invocation
+(default and maximum 20), in deterministic instance-ID order. The reaper requires exact
+`Project`, `Environment`, `ManagedBy=moodle-autotask`, and `Role=lab` tags in both IAM and code.
+IAM requires that `ProvisionKey` is present; Python additionally requires it to be non-empty. It
+does not trust an expiry tag. The five-minute schedule is eventual,
+not an exact termination deadline. This independent Lambda has a dedicated role and cannot be
+modified by the controller role; its CloudWatch log group retains bounded JSON operational records
+for 30 days and its error metric has an alarm without an implicit notification destination.
+
 `AwsEc2LabProvider` uses the fixed launch values installed with the service and the AWS CLI already
 on the controller. Deployment reads the exact AMI authorized by the inline provisioner policy, so a
 moving public `latest` parameter cannot diverge from IAM. The provider assumes the lab provisioner

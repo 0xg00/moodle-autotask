@@ -85,6 +85,28 @@ variable "lab_root_volume_size_gib" {
   }
 }
 
+variable "lab_hard_ttl_seconds" {
+  description = "Independent maximum lab lifetime enforced by the EventBridge Lambda reaper."
+  type        = number
+  default     = 14400
+
+  validation {
+    condition     = var.lab_hard_ttl_seconds >= 10800 && var.lab_hard_ttl_seconds <= 86400 && floor(var.lab_hard_ttl_seconds) == var.lab_hard_ttl_seconds
+    error_message = "lab_hard_ttl_seconds must be an integer from 10800 (3 hours) through 86400 (24 hours)."
+  }
+}
+
+variable "lab_reaper_max_terminations_per_run" {
+  description = "Maximum stale labs the independent reaper can terminate during one five-minute invocation."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.lab_reaper_max_terminations_per_run >= 1 && var.lab_reaper_max_terminations_per_run <= 20 && floor(var.lab_reaper_max_terminations_per_run) == var.lab_reaper_max_terminations_per_run
+    error_message = "lab_reaper_max_terminations_per_run must be an integer from 1 through 20."
+  }
+}
+
 variable "additional_tags" {
   description = "Additional non-sensitive resource tags."
   type        = map(string)

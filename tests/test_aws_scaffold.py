@@ -79,6 +79,33 @@ def test_controller_tfvars_example_is_rejected_until_scope_is_selected() -> None
     assert "scheduler_all_courses             = false" in example
 
 
+def test_independent_lab_reaper_has_bounded_tag_scoped_hard_ttl() -> None:
+    reaper = (AWS_ROOT / "controller" / "lab_reaper.tf").read_text(encoding="utf-8")
+    source = (AWS_ROOT / "controller" / "lab_reaper.py").read_text(encoding="utf-8")
+    variables = (AWS_ROOT / "controller" / "variables.tf").read_text(encoding="utf-8")
+    versions = (AWS_ROOT / "controller" / "versions.tf").read_text(encoding="utf-8")
+    controller_iam = (AWS_ROOT / "controller" / "iam.tf").read_text(encoding="utf-8")
+    labs = (AWS_ROOT / "controller" / "labs.tf").read_text(encoding="utf-8")
+
+    assert 'source  = "hashicorp/archive"' in versions and 'version = "= 2.7.1"' in versions
+    assert 'schedule_expression = "rate(5 minutes)"' in reaper
+    assert 'output_file_mode = "0664"' in reaper
+    assert "reserved_concurrent_executions = 1" in reaper
+    assert "timeout                        = 30" in reaper
+    assert 'logging_config {' in reaper and 'log_format = "JSON"' in reaper
+    assert "aws_cloudwatch_event_target" in reaper and "aws_lambda_permission" in reaper
+    assert "aws_cloudwatch_metric_alarm" in reaper and "retention_in_days = 30" in reaper
+    assert "ec2:DescribeInstances" in reaper and "ec2:TerminateInstances" in reaper
+    for tag in ("Project", "Environment", "ManagedBy", "Role", "ProvisionKey"):
+        assert f"ec2:ResourceTag/{tag}" in reaper
+    assert "moodle-autotask" in reaper and "tag-key" in source
+    assert "sorted(set(candidates))[:max_terminations]" in source
+    assert "lab_hard_ttl_seconds" in variables and "10800" in variables and "86400" in variables
+    assert "lab_reaper_max_terminations_per_run" in variables and "<= 20" in variables
+    assert "lab_reaper" not in controller_iam
+    assert "lab_reaper" not in labs
+
+
 def test_deploy_scope_renderer_preserves_exact_unicode_and_rejects_limits() -> None:
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
