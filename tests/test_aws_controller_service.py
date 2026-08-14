@@ -102,8 +102,26 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "dd if=/dev/zero" in workspace_setup_text
     assert "count=256 conv=fsync" in workspace_setup_text
     assert "mkfs.ext4 -F -E nodiscard -N 100000 -m 6" in workspace_setup_text
+    assert 'tune2fs -r $(((formatted_blocks * 6 + 99) / 100))' in workspace_setup_text
     assert "loop,nodev,nosuid" in workspace_setup_text
-    assert "test -z \"$(find \"$workspace\" -mindepth 1" in workspace_setup_text
+    assert 'staging=/run/moodle-autotask-workspace-migration' in workspace_setup_text
+    assert 'state="$image_root/agent-workspaces.state"' in workspace_setup_text
+    assert 'backup="$image_root/legacy-workspaces.pending"' in workspace_setup_text
+    assert "write_state copying" in workspace_setup_text
+    assert "write_state copied" in workspace_setup_text
+    assert "write_state active" in workspace_setup_text
+    assert 'cp -a -- "$workspace/." "$staging/"' in workspace_setup_text
+    assert 'mv -T "$workspace" "$backup"' in workspace_setup_text
+    assert workspace_setup_text.index("write_state copied") < (
+        workspace_setup_text.index('mv -T "$workspace" "$backup"')
+    )
+    assert workspace_setup_text.index("write_state active") < (
+        workspace_setup_text.index(
+            "cleanup_backup", workspace_setup_text.index("write_state active")
+        )
+    )
+    assert 'if [ "$migration_phase" = active ]; then' in workspace_setup_text
+    assert 'remove_lost_found "$workspace"' in workspace_setup_text
     assert '"root:root:600:$size:$expected_links"' in workspace_setup_text
     assert "stat -c '%U:%G:%a:%h' \"$fstab\")\" = root:root:644:1" in workspace_setup_text
     assert 'safe_image "$image" 1' in workspace_setup_text
@@ -188,6 +206,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "RequiresMountsFor=/var/lib/moodle-agent/workspaces" in agent_text
     assert "After=network-online.target local-fs.target" in agent_text
     assert "ExecStartPre=+/usr/local/sbin/moodle-autotask-workspace-setup" in agent_text
+    assert "TimeoutStartSec=30min" in agent_text
     assert "IPAddressDeny=169.254.169.254/32" in agent_text
     for unit in (scheduler_text, telegram_text):
         assert "NoNewPrivileges=true" in unit
@@ -531,3 +550,60 @@ def test_root_protocol_installers_are_safe_idempotent_and_preserve_contents(
         timeout=120,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is required")
+def test_workspace_installer_migrates_and_recovers_real_ext4_loop_image(
+    tmp_path: Path,
+) -> None:
+    install_controller_services(tmp_path, "eu-south-2", "development")
+    source = (tmp_path / "usr/local/sbin/moodle-autotask-workspace-setup").read_text(
+        encoding="utf-8"
+    )
+    assert "os.O_NOFOLLOW" in source
+    assert "fcntl.flock(descriptor, fcntl.LOCK_EX)" in source
+    assert "MOODLE_AUTOTASK_WORKSPACE_LOCK_FD" in source
+    source = (
+        source.replace(
+            "image_root=/var/lib/moodle-autotask-root", "image_root=/data/root"
+        )
+        .replace(
+            "workspace=/var/lib/moodle-agent/workspaces",
+            "workspace=/data/agent/workspaces",
+        )
+        .replace(
+            "staging=/run/moodle-autotask-workspace-migration",
+            "staging=/data/staging",
+        )
+        .replace("size=17179869184", "size=67108864")
+        .replace("count=256 conv=fsync", "count=1 conv=fsync")
+        .replace("size + 12884901888", "size + 0")
+        .replace("/var/lib/moodle-agent", "/data/agent")
+    )
+    (tmp_path / "setup.sh").write_text(
+        source,
+        encoding="utf-8",
+        newline="\n",
+    )
+    repository = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--privileged",
+            "-v",
+            f"{tmp_path.resolve().as_posix()}:/harness:ro",
+            "-v",
+            f"{repository.as_posix()}:/repo:ro",
+            "ubuntu:24.04",
+            "bash",
+            "/repo/tests/fixtures/workspace_migration_harness.sh",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=240,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "workspace-migration-fault-matrix-ok" in completed.stdout

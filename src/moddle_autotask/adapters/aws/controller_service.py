@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=600,
+            timeout=1800,
         )
         return 0
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
@@ -766,10 +766,84 @@ def _workspace_setup_script() -> str:
 set -euo pipefail
 umask 077
 
+lock_path=/run/moodle-autotask-workspace-setup.lock
+if [ -z "${MOODLE_AUTOTASK_WORKSPACE_LOCK_FD:-}" ]; then
+  exec python3 - "$0" "$@" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+lock_path = "/run/moodle-autotask-workspace-setup.lock"
+parent = os.lstat(os.path.dirname(lock_path))
+if (
+    not stat.S_ISDIR(parent.st_mode)
+    or parent.st_uid != 0
+    or parent.st_gid != 0
+    or stat.S_IMODE(parent.st_mode) != 0o755
+):
+    raise SystemExit("workspace lock parent is unsafe")
+flags = os.O_RDWR | os.O_NOFOLLOW
+try:
+    descriptor = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+except FileExistsError:
+    descriptor = os.open(lock_path, flags)
+metadata = os.fstat(descriptor)
+current = os.lstat(lock_path)
+identity = lambda item: (item.st_dev, item.st_ino)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != 0
+    or metadata.st_gid != 0
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or metadata.st_nlink != 1
+    or identity(metadata) != identity(current)
+):
+    raise SystemExit("workspace lock is unsafe")
+fcntl.flock(descriptor, fcntl.LOCK_EX)
+current = os.lstat(lock_path)
+if identity(metadata) != identity(current):
+    raise SystemExit("workspace lock changed while acquiring it")
+os.set_inheritable(descriptor, True)
+environment = os.environ.copy()
+environment["MOODLE_AUTOTASK_WORKSPACE_LOCK_FD"] = str(descriptor)
+os.execve("/bin/bash", ["bash", sys.argv[1], *sys.argv[2:]], environment)
+PY
+fi
+python3 - "$lock_path" "$MOODLE_AUTOTASK_WORKSPACE_LOCK_FD" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+lock_path = sys.argv[1]
+try:
+    descriptor = int(sys.argv[2])
+except ValueError as error:
+    raise SystemExit("workspace lock descriptor is invalid") from error
+metadata = os.fstat(descriptor)
+current = os.lstat(lock_path)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != 0
+    or metadata.st_gid != 0
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or metadata.st_nlink != 1
+    or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
+):
+    raise SystemExit("workspace lock is unsafe")
+fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+PY
+unset MOODLE_AUTOTASK_WORKSPACE_LOCK_FD
+
 image_root=/var/lib/moodle-autotask-root
 image="$image_root/agent-workspaces.img"
 candidate="$image_root/.agent-workspaces.img.pending"
+state="$image_root/agent-workspaces.state"
+state_candidate="$image_root/.agent-workspaces.state.pending"
+backup="$image_root/legacy-workspaces.pending"
 workspace=/var/lib/moodle-agent/workspaces
+staging=/run/moodle-autotask-workspace-migration
 fstab=/etc/fstab
 size=17179869184
 
@@ -808,9 +882,8 @@ safe_fstab() {
   test -f "$fstab" && test ! -L "$fstab"
   test "$(stat -c '%U:%G:%a:%h' "$fstab")" = root:root:644:1
 }
-validate_mount() {
+validate_mount_base() {
   safe_image "$image" 1
-  safe_directory "$workspace" moodle-agent:moodle-agent:700
   test "$(findmnt -rn -o TARGET --target "$workspace" 2>/dev/null || true)" = "$workspace"
   source="$(findmnt -rn -o SOURCE --target "$workspace" 2>/dev/null || true)"
   [[ "$source" =~ ^/dev/loop[0-9]+$ ]]
@@ -819,7 +892,167 @@ validate_mount() {
   options="$(findmnt -rn -o OPTIONS --target "$workspace")"
   [[ ",$options," == *,nodev,* && ",$options," == *,nosuid,* ]]
   test "$(findmnt -rn -o UUID --target "$workspace")" = "$(blkid -s UUID -o value "$image")"
+}
+validate_mount() {
+  validate_mount_base
+  safe_directory "$workspace" moodle-agent:moodle-agent:700
+  test ! -e "$workspace/lost+found" && test ! -L "$workspace/lost+found"
   validate_fstab
+}
+validate_staging_mount() {
+  test "$(findmnt -rn -o TARGET --target "$staging" 2>/dev/null || true)" = "$staging"
+  source="$(findmnt -rn -o SOURCE --target "$staging")"
+  [[ "$source" =~ ^/dev/loop[0-9]+$ ]]
+  test "$(losetup --noheadings --output BACK-FILE "$source" | tr -d ' ')" = "$image"
+  test "$(findmnt -rn -o FSTYPE --target "$staging")" = ext4
+  options="$(findmnt -rn -o OPTIONS --target "$staging")"
+  [[ ",$options," == *,nodev,* && ",$options," == *,nosuid,* ]]
+}
+tree_digest() {
+  python3 - "$1" "$2" <<'PY'
+import hashlib
+import os
+import pwd
+import stat
+import sys
+
+root = os.fsencode(sys.argv[1])
+excluded = os.fsencode(sys.argv[2]) if sys.argv[2] else None
+agent = pwd.getpwnam("moodle-agent")
+digest = hashlib.sha256()
+
+
+def add(value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def walk(directory: bytes, relative: bytes) -> None:
+    with os.scandir(directory) as entries:
+        ordered = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+    for entry in ordered:
+        name = os.fsencode(entry.name)
+        if not relative and excluded is not None and name == excluded:
+            continue
+        path = os.path.join(directory, name)
+        child = name if not relative else relative + b"/" + name
+        metadata = os.lstat(path)
+        if metadata.st_uid != agent.pw_uid or metadata.st_gid != agent.pw_gid:
+            raise SystemExit("workspace tree ownership is unsafe")
+        if stat.S_ISDIR(metadata.st_mode):
+            kind = b"d"
+        elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            kind = b"f"
+        else:
+            raise SystemExit("workspace tree type is unsafe")
+        add(child)
+        add(kind)
+        add(str(stat.S_IMODE(metadata.st_mode)).encode("ascii"))
+        add(str(metadata.st_uid).encode("ascii"))
+        add(str(metadata.st_gid).encode("ascii"))
+        if kind == b"d":
+            walk(path, child)
+        else:
+            add(str(metadata.st_size).encode("ascii"))
+            content = hashlib.sha256()
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                before = os.fstat(descriptor)
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    content.update(chunk)
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            current = os.lstat(path)
+            identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+            if identity(before) != identity(after) or identity(after) != identity(current):
+                raise SystemExit("workspace tree changed during validation")
+            add(content.digest())
+
+
+walk(root, b"")
+print(digest.hexdigest())
+PY
+}
+safe_state_node() {
+  target="$1"
+  test -f "$target" && test ! -L "$target"
+  test "$(stat -c '%U:%G:%a:%h' "$target")" = root:root:600:1
+}
+load_state() {
+  migration_phase=none
+  migration_digest=
+  migration_uuid=
+  if [ -e "$state" ] || [ -L "$state" ]; then
+    safe_state_node "$state"
+    mapfile -t state_lines <"$state"
+    [ "${#state_lines[@]}" -eq 4 ]
+    [ "${state_lines[0]}" = version=1 ]
+    uuid_pattern='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    [[ "${state_lines[1]}" =~ ^uuid=($uuid_pattern)$ ]]
+    migration_uuid="${BASH_REMATCH[1]}"
+    [[ "${state_lines[2]}" =~ ^phase=(copying|copied|active)$ ]]
+    migration_phase="${BASH_REMATCH[1]}"
+    [[ "${state_lines[3]}" =~ ^digest=([0-9a-f]{64})$ ]]
+    migration_digest="${BASH_REMATCH[1]}"
+    test "$migration_uuid" = "$(blkid -s UUID -o value "$image")"
+  fi
+}
+write_state() {
+  next_phase="$1"
+  next_digest="$2"
+  [[ "$next_phase" =~ ^(copying|copied|active)$ ]]
+  [[ "$next_digest" =~ ^[0-9a-f]{64}$ ]]
+  image_uuid="$(blkid -s UUID -o value "$image")"
+  [[ "$image_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+  if [ -e "$state_candidate" ] || [ -L "$state_candidate" ]; then
+    safe_state_node "$state_candidate"
+  else
+    (umask 077; : >"$state_candidate")
+    chown root:root "$state_candidate"; chmod 0600 "$state_candidate"
+  fi
+  printf 'version=1\nuuid=%s\nphase=%s\ndigest=%s\n' \
+    "$image_uuid" "$next_phase" "$next_digest" >"$state_candidate"
+  sync -f "$state_candidate"
+  mv -f "$state_candidate" "$state"
+  sync -f "$image_root"
+  load_state
+  [ "$migration_phase" = "$next_phase" ]
+  [ "$migration_digest" = "$next_digest" ]
+}
+remove_lost_found() {
+  root="$1"
+  if [ -e "$root/lost+found" ] || [ -L "$root/lost+found" ]; then
+    test -d "$root/lost+found" && test ! -L "$root/lost+found"
+    test "$(stat -c '%U:%G:%a:%h' "$root/lost+found")" = root:root:700:2
+    test -z "$(find "$root/lost+found" -mindepth 1 -maxdepth 1 -print -quit)"
+    rmdir "$root/lost+found"
+    sync -f "$root"
+  fi
+}
+cleanup_backup() {
+  if [ -e "$backup" ] || [ -L "$backup" ]; then
+    safe_directory "$backup" moodle-agent:moodle-agent:700
+    tree_digest "$backup" '' >/dev/null
+    find "$backup" -xdev -mindepth 1 -depth -delete
+    rmdir "$backup"
+    sync -f "$image_root"
+  fi
+}
+ensure_fstab() {
+  safe_fstab
+  if awk -v target="$workspace" '$1 !~ /^#/ && $2 == target {found=1} END {exit !found}' \
+    "$fstab"; then
+    validate_fstab
+  else
+    temporary="$(mktemp /etc/.fstab.moodle-autotask.XXXXXX)"
+    trap 'rm -f "$temporary"' EXIT
+    cat "$fstab" >"$temporary"
+    printf '%s %s ext4 loop,nodev,nosuid 0 2\n' "$image" "$workspace" >>"$temporary"
+    chown root:root "$temporary"; chmod 0644 "$temporary"; mv -f "$temporary" "$fstab"
+    trap - EXIT
+    validate_fstab
+  fi
 }
 
 if [ -e "$image_root" ] || [ -L "$image_root" ]; then
@@ -832,15 +1065,9 @@ test "$(stat -c '%U:%G' /var/lib/moodle-agent)" = moodle-agent:moodle-agent
 agent_home_mode="$(stat -c '%a' /var/lib/moodle-agent)"
 [[ "$agent_home_mode" = 700 || "$agent_home_mode" = 755 ]]
 chmod 0700 /var/lib/moodle-agent
+workspace_mounted=false
 if findmnt -rn -o TARGET --target "$workspace" 2>/dev/null | grep -Fxq "$workspace"; then
-  validate_mount
-  exit 0
-fi
-if [ -e "$workspace" ] || [ -L "$workspace" ]; then
-  safe_directory "$workspace" moodle-agent:moodle-agent:700
-  test -z "$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit)"
-else
-  install -d -o moodle-agent -g moodle-agent -m 0700 "$workspace"
+  workspace_mounted=true
 fi
 if [ -e "$image" ] || [ -L "$image" ]; then
   if [ -e "$candidate" ] || [ -L "$candidate" ]; then
@@ -859,6 +1086,10 @@ else
     dd if=/dev/zero of="$candidate" bs=64M count=256 conv=fsync status=none
     chown root:root "$candidate"; chmod 0600 "$candidate"
     mkfs.ext4 -F -E nodiscard -N 100000 -m 6 "$candidate" >/dev/null
+    formatted_blocks="$(tune2fs -l "$candidate" 2>/dev/null | \
+      awk -F: '/^Block count:/ {gsub(/ /, "", $2); print $2}')"
+    [[ "$formatted_blocks" =~ ^[1-9][0-9]*$ ]]
+    tune2fs -r $(((formatted_blocks * 6 + 99) / 100)) "$candidate" >/dev/null
     sync -f "$candidate"; sync -f "$(dirname "$candidate")"
     safe_image "$candidate" 1
   fi
@@ -870,21 +1101,130 @@ else
   sync -f "$(dirname "$image")"
   safe_image "$image" 1
 fi
-safe_fstab
-if awk -v target="$workspace" '$1 !~ /^#/ && $2 == target {found=1} END {exit !found}' \
-  "$fstab"; then
-  validate_fstab
-else
-  temporary="$(mktemp /etc/.fstab.moodle-autotask.XXXXXX)"
-  trap 'rm -f "$temporary"' EXIT
-  cat "$fstab" >"$temporary"
-  printf '%s %s ext4 loop,nodev,nosuid 0 2\n' "$image" "$workspace" >>"$temporary"
-  chown root:root "$temporary"; chmod 0644 "$temporary"; mv -f "$temporary" "$fstab"
-  trap - EXIT
+load_state
+if [ "$workspace_mounted" = true ]; then
+  validate_mount_base
+  remove_lost_found "$workspace"
+  chown moodle-agent:moodle-agent "$workspace"; chmod 0700 "$workspace"
+  mounted_digest="$(tree_digest "$workspace" '')"
+  if [ "$migration_phase" = none ]; then
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+      safe_directory "$backup" moodle-agent:moodle-agent:700
+      [ "$(tree_digest "$backup" '')" = "$mounted_digest" ]
+    fi
+    ensure_fstab
+    validate_mount
+    write_state active "$mounted_digest"
+  elif [ "$migration_phase" = copied ]; then
+    [ "$mounted_digest" = "$migration_digest" ]
+    ensure_fstab
+    validate_mount
+    write_state active "$migration_digest"
+  else
+    [ "$migration_phase" = active ]
+    validate_mount
+  fi
+  cleanup_backup
+  exit 0
 fi
+
+if [ "$migration_phase" = active ]; then
+  if [ -e "$workspace" ] || [ -L "$workspace" ]; then
+    safe_directory "$workspace" moodle-agent:moodle-agent:700
+    test -z "$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit)"
+  else
+    install -d -o moodle-agent -g moodle-agent -m 0700 "$workspace"
+  fi
+  ensure_fstab
+  mount "$workspace"
+  validate_mount_base
+  remove_lost_found "$workspace"
+  chown moodle-agent:moodle-agent "$workspace"; chmod 0700 "$workspace"
+  validate_mount
+  cleanup_backup
+  exit 0
+fi
+
+if [ "$migration_phase" = none ] || [ "$migration_phase" = copying ]; then
+  test ! -e "$backup" && test ! -L "$backup"
+  if [ -e "$workspace" ] || [ -L "$workspace" ]; then
+    safe_directory "$workspace" moodle-agent:moodle-agent:700
+  else
+    install -d -o moodle-agent -g moodle-agent -m 0700 "$workspace"
+  fi
+fi
+if [ -e "$staging" ] || [ -L "$staging" ]; then
+  safe_directory "$staging" root:root:700
+else
+  install -d -o root -g root -m 0700 "$staging"
+fi
+if findmnt -rn -o TARGET --target "$staging" 2>/dev/null | grep -Fxq "$staging"; then
+  validate_staging_mount
+else
+  mount -o loop,nodev,nosuid "$image" "$staging"
+  validate_staging_mount
+fi
+chown root:root "$staging"; chmod 0700 "$staging"
+safe_directory "$staging" root:root:700
+cleanup_staging() {
+  result=$?
+  trap - EXIT
+  if findmnt -rn -o TARGET --target "$staging" 2>/dev/null | grep -Fxq "$staging"; then
+    umount "$staging" || true
+  fi
+  exit "$result"
+}
+trap cleanup_staging EXIT
+
+if [ "$migration_phase" = none ]; then
+  remove_lost_found "$staging"
+  test -z "$(find "$staging" -xdev -mindepth 1 -maxdepth 1 -print -quit)"
+  migration_digest="$(tree_digest "$workspace" '')"
+  write_state copying "$migration_digest"
+fi
+if [ "$migration_phase" = copying ]; then
+  [ "$(tree_digest "$workspace" '')" = "$migration_digest" ]
+  remove_lost_found "$staging"
+  find "$staging" -xdev -mindepth 1 -depth -delete
+  test -z "$(find "$staging" -xdev -mindepth 1 -maxdepth 1 -print -quit)"
+  cp -a -- "$workspace/." "$staging/"
+  chown root:root "$staging"; chmod 0700 "$staging"
+  test "$(tree_digest "$staging" '')" = "$migration_digest"
+  sync -f "$staging"
+  write_state copied "$migration_digest"
+fi
+[ "$migration_phase" = copied ]
+[ "$(tree_digest "$staging" '')" = "$migration_digest" ]
+if [ -e "$backup" ] || [ -L "$backup" ]; then
+  safe_directory "$backup" moodle-agent:moodle-agent:700
+  [ "$(tree_digest "$backup" '')" = "$migration_digest" ]
+  if [ -e "$workspace" ] || [ -L "$workspace" ]; then
+    safe_directory "$workspace" moodle-agent:moodle-agent:700
+    test -z "$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit)"
+  else
+    install -d -o moodle-agent -g moodle-agent -m 0700 "$workspace"
+  fi
+else
+  safe_directory "$workspace" moodle-agent:moodle-agent:700
+  [ "$(tree_digest "$workspace" '')" = "$migration_digest" ]
+  test "$(stat -c '%d' "$workspace")" = "$(stat -c '%d' "$image_root")"
+  mv -T "$workspace" "$backup"
+  sync -f /var/lib/moodle-agent; sync -f "$image_root"
+  safe_directory "$backup" moodle-agent:moodle-agent:700
+  [ "$(tree_digest "$backup" '')" = "$migration_digest" ]
+  install -d -o moodle-agent -g moodle-agent -m 0700 "$workspace"
+fi
+umount "$staging"
+trap - EXIT
+rmdir "$staging"
+ensure_fstab
 mount "$workspace"
+validate_mount_base
+remove_lost_found "$workspace"
 chown moodle-agent:moodle-agent "$workspace"; chmod 0700 "$workspace"
 validate_mount
+write_state active "$migration_digest"
+cleanup_backup
 """
 
 
@@ -1026,6 +1366,7 @@ def _agent_unit() -> str:
             "Environment=CODEX_HOME=/var/lib/moodle-agent/.codex",
             "WorkingDirectory=/var/lib/moodle-agent",
             "ExecStartPre=+/usr/local/sbin/moodle-autotask-workspace-setup",
+            "TimeoutStartSec=30min",
             f"ExecStart={command}",
             "Restart=on-failure",
             "RestartSec=30",

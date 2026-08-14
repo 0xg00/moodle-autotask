@@ -116,6 +116,15 @@ def test_controller_storage_profile_reserves_workspace_headroom() -> None:
     assert "root_volume_size_gib     = 80" in example
 
 
+def test_deploy_timeout_contains_workspace_migration_and_guarded_rollback() -> None:
+    deploy = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
+
+    assert "for ($attempt = 0; $attempt -lt 1200; $attempt++)" in deploy
+    assert "executionTimeout = @('2100')" in deploy
+    assert "'--timeout-seconds', '300'" in deploy
+    assert "SSM command did not finish within 2400 seconds" in deploy
+
+
 def test_controller_scheduler_scope_is_explicit_and_has_no_fixture_hardcode() -> None:
     cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(encoding="utf-8")
     compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")

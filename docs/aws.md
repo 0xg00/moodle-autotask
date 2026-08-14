@@ -255,9 +255,17 @@ The supported controller root profile is 80 GiB or larger. First application dep
 upgrade use `moodle-autotask-controller install` to create or exactly validate the separate 16 GiB
 agent-workspace image at `/var/lib/moodle-autotask-root/agent-workspaces.img`. Its dedicated parent
 is `root:root` mode `0700`, outside the controller-writable state tree. It is ext4 with at least
-100,000 inodes, ext4-rounded six-percent reserved blocks, and an exact `loop,nodev,nosuid` persistent mount at
-`/var/lib/moodle-agent/workspaces`. The installer fails closed on unsafe paths, non-empty bare
-workspaces, or any image/filesystem/mount mismatch; it does not migrate or delete workspace content.
+100,000 inodes, six percent of total blocks reserved, and an exact `loop,nodev,nosuid` persistent mount at
+`/var/lib/moodle-agent/workspaces`. On upgrade, the installer copies a non-empty legacy workspace
+tree into a private staging mount and verifies every regular file and directory byte, owner, group,
+and mode. A root-owned state file advances through `copying`, `copied`, and `active`; after `copied`,
+the bare workspace is atomically renamed to a protected backup before mounting the verified image.
+Only an `active` image permits idempotent backup cleanup. The installer removes only an exact empty
+ext4 `lost+found` and resumes safely after a partial copy, rename, mount, or cleanup. Unsafe paths,
+links, special files, hard-linked files, changed content, or any image/filesystem/mount mismatch fail
+closed without advancing the state. A root-owned, no-follow kernel lock serializes the entire helper.
+The deploy transport allows five minutes for SSM delivery, 35 minutes for remote execution, and 40
+minutes for local polling around the 30-minute installer budget before rollback.
 
 For an operational check, run `-Action Status` and inspect both services and their bounded-cycle
 records on the controller:

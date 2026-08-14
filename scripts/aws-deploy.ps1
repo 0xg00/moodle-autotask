@@ -363,7 +363,7 @@ function Wait-SsmCommand {
     )
 
     $terminalStatuses = @('Success', 'Cancelled', 'TimedOut', 'Failed', 'Cancelling')
-    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+    for ($attempt = 0; $attempt -lt 1200; $attempt++) {
         Start-Sleep -Seconds 2
         try {
             $response = Invoke-Aws -Arguments @(
@@ -393,7 +393,7 @@ function Wait-SsmCommand {
         return
     }
 
-    throw 'SSM command did not finish within 180 seconds.'
+    throw 'SSM command did not finish within 2400 seconds.'
 }
 
 function Send-ControllerCommand {
@@ -419,7 +419,10 @@ function Send-ControllerCommand {
             $command.Replace("`r`n", "`n").Replace("`r", "`n")
         }
     )
-    $parameters = @{ commands = @($bashTransport) + $normalizedCommands } | ConvertTo-Json -Compress
+    $parameters = @{
+        commands = @($bashTransport) + $normalizedCommands
+        executionTimeout = @('2100')
+    } | ConvertTo-Json -Compress
     $parametersPath = Join-Path $runtimeRoot "ssm-$([Guid]::NewGuid().ToString('N')).json"
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($parametersPath, $parameters, $utf8NoBom)
@@ -432,7 +435,7 @@ function Send-ControllerCommand {
                 '--document-name', 'AWS-RunShellScript',
                 '--comment', $Comment,
                 '--parameters', $parametersUri,
-                '--timeout-seconds', '180',
+                '--timeout-seconds', '300',
                 '--query', 'Command.CommandId',
                 '--output', 'text'
             )
