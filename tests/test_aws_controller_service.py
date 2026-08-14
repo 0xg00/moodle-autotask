@@ -101,7 +101,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "/var/lib/moodle-autotask/agent-workspaces.img" not in health_text
     assert "dd if=/dev/zero" in workspace_setup_text
     assert "count=256 conv=fsync" in workspace_setup_text
-    assert "mkfs.ext4 -F -N 100000 -m 6" in workspace_setup_text
+    assert "mkfs.ext4 -F -E nodiscard -N 100000 -m 6" in workspace_setup_text
     assert "loop,nodev,nosuid" in workspace_setup_text
     assert "test -z \"$(find \"$workspace\" -mindepth 1" in workspace_setup_text
     assert '"root:root:600:$size:$expected_links"' in workspace_setup_text

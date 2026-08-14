@@ -858,7 +858,7 @@ else
     [[ "$available" =~ ^[0-9]+$ ]] && [ "$available" -ge $((size + 12884901888)) ]
     dd if=/dev/zero of="$candidate" bs=64M count=256 conv=fsync status=none
     chown root:root "$candidate"; chmod 0600 "$candidate"
-    mkfs.ext4 -F -N 100000 -m 6 "$candidate" >/dev/null
+    mkfs.ext4 -F -E nodiscard -N 100000 -m 6 "$candidate" >/dev/null
     sync -f "$candidate"; sync -f "$(dirname "$candidate")"
     safe_image "$candidate" 1
   fi
