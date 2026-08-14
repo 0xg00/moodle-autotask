@@ -308,6 +308,48 @@ def test_exact_generated_and_bootstrap_sources_pass_bash_syntax_check(tmp_path: 
         assert result.returncode == 0, result.stderr
 
 
+def test_generated_mount_reader_accepts_identical_layers_and_rejects_divergence(
+    tmp_path: Path,
+) -> None:
+    source = _health_publisher_script("eu-south-2")
+    start = source.index("mount_value() {")
+    function = source[start : source.index('\nsafe_dir "$root"', start)]
+    fake = tmp_path / "findmnt"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [ \"${FAKE_DIVERGENT:-0}\" = 1 ]; then\n"
+        "  printf 'rw,nosuid,nodev\\nrw,relatime\\n'\n"
+        "else\n"
+        "  printf 'rw,nosuid,nodev\\nrw,nosuid,nodev\\n'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    script = function + '\nmount_value OPTIONS /workspace\n'
+    environment = os.environ | {"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+
+    identical = subprocess.run(
+        ["bash", "-c", script],
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+    divergent = subprocess.run(
+        ["bash", "-c", script],
+        text=True,
+        capture_output=True,
+        env=environment | {"FAKE_DIVERGENT": "1"},
+        check=False,
+    )
+
+    assert identical.returncode == 0
+    assert identical.stdout == "rw,nosuid,nodev"
+    assert divergent.returncode != 0
+    assert divergent.stdout == ""
+
+
 @pytest.mark.parametrize("publisher", ("generated_source", "bootstrap_source"))
 def test_inactive_services_publish_a_healthy_metric_batch(
     tmp_path: Path, publisher: str

@@ -625,6 +625,15 @@ state=/var/lib/moodle-autotask/health-state
 services=(scheduler telegram worker agent)
 thresholds=(180 180 3900 2100)
 safe_dir() {{ test -d "$1" && test ! -L "$1" && test "$(stat -c '%u:%a' "$1")" = "$2"; }}
+mount_value() {{
+  column="$1"
+  target="$2"
+  case "$column" in TARGET|SOURCE|FSTYPE|OPTIONS|UUID) ;; *) return 1 ;; esac
+  values="$(findmnt -rn -o "$column" --target "$target" 2>/dev/null | sort -u)" || return 1
+  test -n "$values" || return 1
+  test "$(printf '%s\\n' "$values" | wc -l)" -eq 1 || return 1
+  printf '%s' "$values"
+}}
 safe_dir "$root" '0:711'
 if [ -e "$state" ] || [ -L "$state" ]; then
   safe_dir "$state" '0:700'
@@ -726,11 +735,11 @@ for item in \
   test -d "$path" && test ! -L "$path" && [ "$metadata" = "$expected_metadata" ] || storage=0
 done
 workspace=/var/lib/moodle-agent/workspaces; image=/var/lib/moodle-autotask-root/agent-workspaces.img
-mount_target="$(findmnt -rn -o TARGET --target "$workspace" 2>/dev/null || true)"
-mount_source="$(findmnt -rn -o SOURCE --target "$workspace" 2>/dev/null || true)"
-mount_type="$(findmnt -rn -o FSTYPE --target "$workspace" 2>/dev/null || true)"
-mount_options="$(findmnt -rn -o OPTIONS --target "$workspace" 2>/dev/null || true)"
-mount_uuid="$(findmnt -rn -o UUID --target "$workspace" 2>/dev/null || true)"
+mount_target="$(mount_value TARGET "$workspace" 2>/dev/null || true)"
+mount_source="$(mount_value SOURCE "$workspace" 2>/dev/null || true)"
+mount_type="$(mount_value FSTYPE "$workspace" 2>/dev/null || true)"
+mount_options="$(mount_value OPTIONS "$workspace" 2>/dev/null || true)"
+mount_uuid="$(mount_value UUID "$workspace" 2>/dev/null || true)"
 image_uuid="$(blkid -s UUID -o value "$image" 2>/dev/null || true)"
 loop_backing="$(losetup --noheadings --output BACK-FILE "$mount_source" 2>/dev/null || true)"
 loop_backing="$(tr -d ' ' <<<"$loop_backing")"
@@ -855,9 +864,9 @@ mount_value() {
   column="$1"
   target="$2"
   case "$column" in TARGET|SOURCE|FSTYPE|OPTIONS|UUID) ;; *) return 1 ;; esac
-  values="$(findmnt -rn -o "$column" --target "$target" 2>/dev/null | sort -u)"
-  test -n "$values"
-  test "$(printf '%s\\n' "$values" | wc -l)" -eq 1
+  values="$(findmnt -rn -o "$column" --target "$target" 2>/dev/null | sort -u)" || return 1
+  test -n "$values" || return 1
+  test "$(printf '%s\\n' "$values" | wc -l)" -eq 1 || return 1
   printf '%s' "$values"
 }
 safe_image() {

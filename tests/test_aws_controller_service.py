@@ -83,6 +83,10 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert '"Value\\\":\\\"storage' in health_text
     assert "12884901888" in health_text and "2147483648" in health_text
     assert "100000" in health_text and "20000" in health_text
+    assert 'values="$(findmnt -rn -o "$column" --target "$target"' in health_text
+    assert "| sort -u)" in health_text
+    assert 'mount_target="$(mount_value TARGET "$workspace"' in health_text
+    assert 'mount_source="$(mount_value SOURCE "$workspace"' in health_text
     assert "image_root=/var/lib/moodle-autotask-root" in workspace_setup_text
     assert 'image="$image_root/agent-workspaces.img"' in workspace_setup_text
     assert 'candidate="$image_root/.agent-workspaces.img.pending"' in workspace_setup_text

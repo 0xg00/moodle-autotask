@@ -10,7 +10,11 @@ cat >/fakebin/findmnt <<'EOF'
 set -euo pipefail
 output="$(/usr/bin/findmnt "$@")"
 if [ -n "$output" ]; then
-  printf '%s\n%s\n' "$output" "$output"
+  if [ "${FAKE_FINDMNT_DIVERGENT_OPTIONS:-0}" = 1 ] && [ "$3" = OPTIONS ]; then
+    printf '%s\nrw,relatime\n' "$output"
+  else
+    printf '%s\n%s\n' "$output" "$output"
+  fi
 fi
 EOF
 chmod 0755 /fakebin/findmnt
@@ -104,6 +108,15 @@ run_case during-cleanup \
   '/^    find "$backup" /c\    find "$backup" -xdev -type f -delete; touch /tmp/fault-hit; exit 97'
 
 run_concurrent_case
+
+export FAKE_FINDMNT_DIVERGENT_OPTIONS=1
+set +e
+bash /harness/setup.sh
+status=$?
+set -e
+test "$status" -ne 0
+unset FAKE_FINDMNT_DIVERGENT_OPTIONS
+bash /harness/setup.sh
 
 umount /data/agent/workspaces
 bash /harness/setup.sh
