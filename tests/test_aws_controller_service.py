@@ -92,7 +92,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
         'if [ -e "$image_root" ] || [ -L "$image_root" ]; then'
     )
     assert parent_guard < workspace_setup_text.index(
-        'if findmnt -rn -o TARGET --target "$workspace"'
+        'if [ "$(mount_value TARGET "$workspace" 2>/dev/null || true)" = "$workspace" ]'
     )
     assert parent_guard < workspace_setup_text.index('dd if=/dev/zero of="$candidate"')
     assert "/var/lib/moodle-autotask/agent-workspaces.img" not in workspace_setup_text
@@ -101,10 +101,15 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "/var/lib/moodle-autotask/agent-workspaces.img" not in health_text
     assert "dd if=/dev/zero" in workspace_setup_text
     assert "count=256 conv=fsync" in workspace_setup_text
+    assert "allocation_slack=67108864" in workspace_setup_text
+    assert '$((blocks * 512)) -ge $((size - allocation_slack))' in workspace_setup_text
     assert "mkfs.ext4 -F -E nodiscard -N 100000 -m 6" in workspace_setup_text
     assert 'tune2fs -r $(((formatted_blocks * 6 + 99) / 100))' in workspace_setup_text
     assert "loop,nodev,nosuid" in workspace_setup_text
     assert 'staging=/run/moodle-autotask-workspace-migration' in workspace_setup_text
+    assert 'values="$(findmnt -rn -o "$column" --target "$target"' in workspace_setup_text
+    assert "| sort -u)" in workspace_setup_text
+    assert 'test "$(printf \'%s\\n\' "$values" | wc -l)" -eq 1' in workspace_setup_text
     assert 'state="$image_root/agent-workspaces.state"' in workspace_setup_text
     assert 'backup="$image_root/legacy-workspaces.pending"' in workspace_setup_text
     assert "write_state copying" in workspace_setup_text

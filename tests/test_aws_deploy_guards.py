@@ -73,7 +73,10 @@ def _transported_commands(commands: list[str]) -> list[str]:
     ) in source
     assert "SSM commands must not contain NUL bytes." in source
     assert '$command.Replace("`r`n", "`n").Replace("`r", "`n")' in source
-    assert "$parameters = @{ commands = @($bashTransport) + $normalizedCommands }" in source
+    assert "$parameters = @{" in source
+    assert "commands = @($bashTransport) + $normalizedCommands" in source
+    assert "executionTimeout = @('2100')" in source
+    assert "'--timeout-seconds', '300'" in source
     normalized = [command.replace("\r\n", "\n").replace("\r", "\n") for command in commands]
     return [_BASH_TRANSPORT, *normalized]
 
@@ -166,9 +169,7 @@ def test_ssm_normalized_heredoc_runs_from_bin_sh(tmp_path: Path) -> None:
 def test_every_controller_ssm_action_uses_the_bash_first_command_contract() -> None:
     source = _DEPLOY.read_text(encoding="utf-8")
     transport = source.index("$bashTransport =")
-    parameters = source.index(
-        "$parameters = @{ commands = @($bashTransport) + $normalizedCommands }"
-    )
+    parameters = source.index("$parameters = @{")
 
     assert transport < parameters
     assert source.count("exec /bin/bash") == 1

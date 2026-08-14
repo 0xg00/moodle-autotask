@@ -256,7 +256,9 @@ upgrade use `moodle-autotask-controller install` to create or exactly validate t
 agent-workspace image at `/var/lib/moodle-autotask-root/agent-workspaces.img`. Its dedicated parent
 is `root:root` mode `0700`, outside the controller-writable state tree. It is ext4 with at least
 100,000 inodes, six percent of total blocks reserved, and an exact `loop,nodev,nosuid` persistent mount at
-`/var/lib/moodle-agent/workspaces`. On upgrade, the installer copies a non-empty legacy workspace
+`/var/lib/moodle-agent/workspaces`. Validation permits at most 64 MiB of backing-file allocation slack
+for ext4/loop metadata while the separate root-filesystem admission reserve remains 12 GiB. On upgrade,
+the installer copies a non-empty legacy workspace
 tree into a private staging mount and verifies every regular file and directory byte, owner, group,
 and mode. A root-owned state file advances through `copying`, `copied`, and `active`; after `copied`,
 the bare workspace is atomically renamed to a protected backup before mounting the verified image.

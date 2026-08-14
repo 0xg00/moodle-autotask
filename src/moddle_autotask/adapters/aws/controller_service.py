@@ -846,9 +846,19 @@ workspace=/var/lib/moodle-agent/workspaces
 staging=/run/moodle-autotask-workspace-migration
 fstab=/etc/fstab
 size=17179869184
+allocation_slack=67108864
 
 safe_directory() {
   test -d "$1" && test ! -L "$1" && test "$(stat -c '%U:%G:%a' "$1")" = "$2"
+}
+mount_value() {
+  column="$1"
+  target="$2"
+  case "$column" in TARGET|SOURCE|FSTYPE|OPTIONS|UUID) ;; *) return 1 ;; esac
+  values="$(findmnt -rn -o "$column" --target "$target" 2>/dev/null | sort -u)"
+  test -n "$values"
+  test "$(printf '%s\\n' "$values" | wc -l)" -eq 1
+  printf '%s' "$values"
 }
 safe_image() {
   target="$1"
@@ -857,7 +867,8 @@ safe_image() {
   test "$(stat -c '%U:%G:%a:%s:%h' "$target")" = \
     "root:root:600:$size:$expected_links"
   blocks="$(stat -c '%b' "$target")"
-  [[ "$blocks" =~ ^[0-9]+$ ]] && [ $((blocks * 512)) -ge "$size" ]
+  [[ "$blocks" =~ ^[0-9]+$ ]] \
+    && [ $((blocks * 512)) -ge $((size - allocation_slack)) ]
   test "$(blkid -s TYPE -o value "$target" 2>/dev/null || true)" = ext4
   uuid="$(blkid -s UUID -o value "$target" 2>/dev/null || true)"
   [[ "$uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
@@ -884,14 +895,14 @@ safe_fstab() {
 }
 validate_mount_base() {
   safe_image "$image" 1
-  test "$(findmnt -rn -o TARGET --target "$workspace" 2>/dev/null || true)" = "$workspace"
-  source="$(findmnt -rn -o SOURCE --target "$workspace" 2>/dev/null || true)"
+  test "$(mount_value TARGET "$workspace" 2>/dev/null || true)" = "$workspace"
+  source="$(mount_value SOURCE "$workspace" 2>/dev/null || true)"
   [[ "$source" =~ ^/dev/loop[0-9]+$ ]]
   test "$(losetup --noheadings --output BACK-FILE "$source" | tr -d ' ')" = "$image"
-  test "$(findmnt -rn -o FSTYPE --target "$workspace")" = ext4
-  options="$(findmnt -rn -o OPTIONS --target "$workspace")"
+  test "$(mount_value FSTYPE "$workspace")" = ext4
+  options="$(mount_value OPTIONS "$workspace")"
   [[ ",$options," == *,nodev,* && ",$options," == *,nosuid,* ]]
-  test "$(findmnt -rn -o UUID --target "$workspace")" = "$(blkid -s UUID -o value "$image")"
+  test "$(mount_value UUID "$workspace")" = "$(blkid -s UUID -o value "$image")"
 }
 validate_mount() {
   validate_mount_base
@@ -900,12 +911,12 @@ validate_mount() {
   validate_fstab
 }
 validate_staging_mount() {
-  test "$(findmnt -rn -o TARGET --target "$staging" 2>/dev/null || true)" = "$staging"
-  source="$(findmnt -rn -o SOURCE --target "$staging")"
+  test "$(mount_value TARGET "$staging" 2>/dev/null || true)" = "$staging"
+  source="$(mount_value SOURCE "$staging")"
   [[ "$source" =~ ^/dev/loop[0-9]+$ ]]
   test "$(losetup --noheadings --output BACK-FILE "$source" | tr -d ' ')" = "$image"
-  test "$(findmnt -rn -o FSTYPE --target "$staging")" = ext4
-  options="$(findmnt -rn -o OPTIONS --target "$staging")"
+  test "$(mount_value FSTYPE "$staging")" = ext4
+  options="$(mount_value OPTIONS "$staging")"
   [[ ",$options," == *,nodev,* && ",$options," == *,nosuid,* ]]
 }
 tree_digest() {
@@ -1066,7 +1077,7 @@ agent_home_mode="$(stat -c '%a' /var/lib/moodle-agent)"
 [[ "$agent_home_mode" = 700 || "$agent_home_mode" = 755 ]]
 chmod 0700 /var/lib/moodle-agent
 workspace_mounted=false
-if findmnt -rn -o TARGET --target "$workspace" 2>/dev/null | grep -Fxq "$workspace"; then
+if [ "$(mount_value TARGET "$workspace" 2>/dev/null || true)" = "$workspace" ]; then
   workspace_mounted=true
 fi
 if [ -e "$image" ] || [ -L "$image" ]; then
@@ -1158,7 +1169,7 @@ if [ -e "$staging" ] || [ -L "$staging" ]; then
 else
   install -d -o root -g root -m 0700 "$staging"
 fi
-if findmnt -rn -o TARGET --target "$staging" 2>/dev/null | grep -Fxq "$staging"; then
+if [ "$(mount_value TARGET "$staging" 2>/dev/null || true)" = "$staging" ]; then
   validate_staging_mount
 else
   mount -o loop,nodev,nosuid "$image" "$staging"
@@ -1169,7 +1180,7 @@ safe_directory "$staging" root:root:700
 cleanup_staging() {
   result=$?
   trap - EXIT
-  if findmnt -rn -o TARGET --target "$staging" 2>/dev/null | grep -Fxq "$staging"; then
+  if [ "$(mount_value TARGET "$staging" 2>/dev/null || true)" = "$staging" ]; then
     umount "$staging" || true
   fi
   exit "$result"

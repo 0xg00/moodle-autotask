@@ -4,6 +4,17 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq e2fsprogs util-linux python3 coreutils >/dev/null
+install -d -o root -g root -m 0755 /fakebin
+cat >/fakebin/findmnt <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output="$(/usr/bin/findmnt "$@")"
+if [ -n "$output" ]; then
+  printf '%s\n%s\n' "$output" "$output"
+fi
+EOF
+chmod 0755 /fakebin/findmnt
+export PATH=/fakebin:$PATH
 groupadd moodle-agent
 useradd -g moodle-agent -d /data/agent moodle-agent
 install -d -o root -g root -m 0755 /data
