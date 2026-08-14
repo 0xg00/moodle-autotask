@@ -6,14 +6,20 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from moddle_autotask.adapters.aws.retention import PreparedTombstone
 from moddle_autotask.adapters.moodle.approval_state import (
     _CALLBACKS_SQL,
     _CURSOR_SQL,
     _METADATA_SQL,
     _REQUESTS_SQL,
+    _RETENTION_COMPLETIONS_INDEX_SQL,
+    _RETENTION_COMPLETIONS_SQL,
+    _RETENTION_RECONCILIATION_CURSOR_SQL,
+    _SCHEMA_VERSION,
     _WORK_CLAIMABLE_INDEX_SQL,
     _WORK_SQL_V2,
     ApprovalState,
@@ -344,7 +350,7 @@ def test_completion_outbox_survives_restart_without_reclaiming_central_work(tmp_
         json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
     planner, executor, reviewer = ("a" * 64, "b" * 64, "c" * 64)
-    provenance = {
+    provenance: dict[str, object] = {
         "kind": "moodle-central-provenance-v2",
         "roles": ["central_planner", "central_executor", "central_reviewer"],
         "jobIds": [planner, executor, reviewer],
@@ -352,7 +358,7 @@ def test_completion_outbox_survives_restart_without_reclaiming_central_work(tmp_
         "executorJobId": executor,
         "reviewerJobId": reviewer,
         "selectedMode": "central",
-        "specificationDigest": "d" * 64,
+        "specificationDigest": ready.item.specification_digest.value,
         "preparedInputManifestDigest": "e" * 64,
         "planDigest": "f" * 64,
         "plannerResultDigest": "1" * 64,
@@ -396,8 +402,27 @@ def test_failed_lab_cleanup_blocks_second_lab_until_cleaned(tmp_path: Path) -> N
     assert lab_pending is not None and state.mark_ready(lab_pending, now=4, for_execution=True)
     ready = state.claim_work("worker", 300, now=5)
     assert ready is not None
+    plan_id = "a" * 64
+    provenance: dict[str, object] = {
+        "kind": "moodle-lab-provenance-v1",
+        "selectedMode": ready.item.selected_mode.value,
+        "taskKey": ready.item.event.task_key,
+        "revisionDigest": ready.item.event.revision_digest,
+        "specificationDigest": ready.item.specification_digest.value,
+        "phases": ["lab_plan"],
+        "jobIds": [plan_id],
+        "barrierIds": [plan_id],
+        "resultDigests": ["b" * 64],
+        "terminalStatus": "failed",
+        "dispatch": None,
+    }
     assert state.complete_execution(
-        ready, succeeded=False, summary="failed", report_markdown="", now=5
+        ready,
+        succeeded=False,
+        summary="failed",
+        report_markdown="",
+        provenance=provenance,
+        now=5,
     )
     cleanup = state.claim_work("worker", 300, now=6)
     assert cleanup is not None
@@ -409,6 +434,98 @@ def test_failed_lab_cleanup_blocks_second_lab_until_cleaned(tmp_path: Path) -> N
     assert state.mark_cleaned(retried_cleanup, now=66)
     next_item = state.claim_work("worker", 300, now=67)
     assert next_item is not None and next_item.item.event == second
+
+
+def test_complete_execution_rejects_success_with_failed_lab_provenance(
+    tmp_path: Path,
+) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = _event(tmp_path, "c")
+    buttons = state.prepare(event, now=1)
+    state.resolve(buttons.approve, 42, 42, now=2)
+    pending = state.claim_work("worker", 300, now=3)
+    assert pending is not None
+    assert state.record_lab(pending, LabHandle("lab:first"), now=3)
+    lab_pending = state.claim_work("worker", 300, now=4)
+    assert lab_pending is not None and state.mark_ready(
+        lab_pending, now=4, for_execution=True
+    )
+    ready = state.claim_work("worker", 300, now=5)
+    assert ready is not None
+    plan_id = "a" * 64
+    provenance: dict[str, object] = {
+        "kind": "moodle-lab-provenance-v1",
+        "selectedMode": ready.item.selected_mode.value,
+        "taskKey": ready.item.event.task_key,
+        "revisionDigest": ready.item.event.revision_digest,
+        "specificationDigest": ready.item.specification_digest.value,
+        "phases": ["lab_plan"],
+        "jobIds": [plan_id],
+        "barrierIds": [plan_id],
+        "resultDigests": ["b" * 64],
+        "terminalStatus": "failed",
+        "dispatch": None,
+    }
+    with pytest.raises(ApprovalStateError, match="provenance"):
+        state.complete_execution(
+            ready,
+            succeeded=True,
+            summary="failed",
+            report_markdown="",
+            provenance=provenance,
+            now=5,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("selectedMode", "hybrid"),
+        ("taskKey", "moodle-task-v1:" + "9" * 64),
+        ("revisionDigest", "moodle-assignment-v1:" + "9" * 64),
+        ("specificationDigest", "9" * 64),
+    ],
+)
+def test_lab_completion_rejects_cross_claim_provenance(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    event = _event(tmp_path, "d")
+    buttons = state.prepare(event, now=1)
+    state.resolve(buttons.approve, 42, 42, now=2)
+    pending = state.claim_work("worker", 300, now=3)
+    assert pending is not None
+    assert state.record_lab(pending, LabHandle("lab:first"), now=3)
+    lab_pending = state.claim_work("worker", 300, now=4)
+    assert lab_pending is not None and state.mark_ready(
+        lab_pending, now=4, for_execution=True
+    )
+    ready = state.claim_work("worker", 300, now=5)
+    assert ready is not None
+    plan_id = "a" * 64
+    provenance: dict[str, object] = {
+        "kind": "moodle-lab-provenance-v1",
+        "selectedMode": ready.item.selected_mode.value,
+        "taskKey": ready.item.event.task_key,
+        "revisionDigest": ready.item.event.revision_digest,
+        "specificationDigest": ready.item.specification_digest.value,
+        "phases": ["lab_plan"],
+        "jobIds": [plan_id],
+        "barrierIds": [plan_id],
+        "resultDigests": ["b" * 64],
+        "terminalStatus": "failed",
+        "dispatch": None,
+    }
+    provenance[field] = value
+    with pytest.raises(ApprovalStateError, match="provenance"):
+        state.complete_execution(
+            ready,
+            succeeded=False,
+            summary="failed",
+            report_markdown="",
+            provenance=provenance,
+            now=5,
+        )
 
 
 def test_v2_ready_central_work_migrates_and_is_claimable(tmp_path: Path) -> None:
@@ -454,6 +571,247 @@ def test_schema_corruption_is_rejected_without_repair(tmp_path: Path) -> None:
         connection.execute("CREATE TABLE injected(value TEXT)")
     with pytest.raises(ApprovalStateError, match="schema is corrupt"):
         ApprovalState(path)
+
+
+def test_v7_fresh_schema_reopens_with_exact_reconciliation_cursor(tmp_path: Path) -> None:
+    path = tmp_path / "approval.sqlite3"
+    ApprovalState(path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT value FROM metadata").fetchall() == [(_SCHEMA_VERSION,)]
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'retention_completions'"
+        ).fetchone() == (_RETENTION_COMPLETIONS_SQL,)
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'retention_completions_completed_idx'"
+        ).fetchone() == (_RETENTION_COMPLETIONS_INDEX_SQL,)
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'retention_reconciliation_cursor'"
+        ).fetchone() == (_RETENTION_RECONCILIATION_CURSOR_SQL,)
+        assert connection.execute(
+            "SELECT singleton, completed_at, event_id, target_phase "
+            "FROM retention_reconciliation_cursor"
+        ).fetchall() == [(1, -1, "", "")]
+    ApprovalState(path)
+
+
+def test_v5_exact_schema_migrates_to_v6_completion_ledger(tmp_path: Path) -> None:
+    path = tmp_path / "approval.sqlite3"
+    ApprovalState(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE retention_reconciliation_cursor")
+        connection.execute("DROP INDEX retention_completions_completed_idx")
+        connection.execute("DROP TABLE retention_completions")
+        connection.execute("UPDATE metadata SET value = '5'")
+    migrated = ApprovalState(path)
+    assert migrated.path == path
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT value FROM metadata").fetchone() == (_SCHEMA_VERSION,)
+        assert connection.execute("SELECT COUNT(*) FROM retention_completions").fetchone() == (0,)
+
+
+def test_v6_exact_schema_migrates_to_v7_reconciliation_cursor(tmp_path: Path) -> None:
+    path = tmp_path / "approval.sqlite3"
+    ApprovalState(path)
+    with sqlite3.connect(path) as connection:
+        event_id = "moodle-notification-event-v1:" + "a" * 64
+        connection.execute(
+            "INSERT INTO requests(event_id, task_key, revision_digest, payload, delivery_state, "
+            "decision, decided_by, decided_at, chat_id, message_id, created_at) "
+            "VALUES (?, ?, ?, '{}', 'prepared', 'approved', 1, 1, NULL, NULL, 1)",
+            (event_id, "moodle-task-v1:" + "b" * 64, "moodle-assignment-v1:" + "c" * 64),
+        )
+        connection.execute(
+            "INSERT INTO work_items(event_id, selected_mode, specification_digest, provision_key, "
+            "status, lab_handle, attempts, available_at, lease_owner, lease_token, "
+            "lease_expires_at, "
+            "error_code, created_at, updated_at, cleanup_due_at) "
+            "VALUES (?, 'central', ?, ?, 'cleaned', NULL, 1, 1, NULL, NULL, NULL, "
+            "'execution_complete', 1, 1, NULL)",
+            (event_id, "d" * 64, "provision"),
+        )
+        connection.execute(
+            "INSERT INTO execution_outbox(event_id, payload, delivered_at, created_at) "
+            "VALUES (?, '{}', NULL, 1)",
+            (event_id,),
+        )
+        connection.execute(
+            "INSERT INTO retention_completions(event_id, target_phase, tombstone_id, completed_at) "
+            "VALUES (?, 'scratch', ?, 1)",
+            (event_id, "e" * 64),
+        )
+        connection.execute("DROP TABLE retention_reconciliation_cursor")
+        connection.execute("UPDATE metadata SET value = '6'")
+
+    ApprovalState(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT value FROM metadata").fetchone() == (_SCHEMA_VERSION,)
+        assert connection.execute("SELECT COUNT(*) FROM retention_completions").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM execution_outbox").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT singleton, completed_at, event_id, target_phase "
+            "FROM retention_reconciliation_cursor"
+        ).fetchall() == [(1, -1, "", "")]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "partial", "extra"])
+def test_v7_reconciliation_cursor_disagreement_fails_closed(tmp_path: Path, mutation: str) -> None:
+    path = tmp_path / "approval.sqlite3"
+    ApprovalState(path)
+    with sqlite3.connect(path) as connection:
+        if mutation != "extra":
+            connection.execute("DROP TABLE retention_reconciliation_cursor")
+        if mutation == "partial":
+            connection.execute("CREATE TABLE retention_reconciliation_cursor(singleton INTEGER)")
+        elif mutation == "extra":
+            connection.execute("CREATE TABLE reconciliation_extra(value TEXT)")
+    with pytest.raises(ApprovalStateError, match="schema is corrupt"):
+        ApprovalState(path)
+
+
+@pytest.mark.parametrize("mutation", ["partial", "extra", "wrong-index"])
+def test_v5_completion_ledger_disagreement_fails_closed(tmp_path: Path, mutation: str) -> None:
+    path = tmp_path / "approval.sqlite3"
+    ApprovalState(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE retention_reconciliation_cursor")
+        if mutation != "extra":
+            connection.execute("DROP INDEX retention_completions_completed_idx")
+            connection.execute("DROP TABLE retention_completions")
+        if mutation == "partial":
+            connection.execute("CREATE TABLE retention_completions(event_id TEXT)")
+        elif mutation == "extra":
+            connection.execute("CREATE TABLE completion_extra(value TEXT)")
+        else:
+            connection.execute(_RETENTION_COMPLETIONS_SQL)
+            connection.execute(
+                "CREATE INDEX retention_completions_completed_idx "
+                "ON retention_completions(event_id)"
+            )
+        connection.execute("UPDATE metadata SET value = '5'")
+    with pytest.raises(ApprovalStateError, match="schema is corrupt"):
+        ApprovalState(path)
+
+
+@pytest.mark.parametrize(
+    "completed, completed_at",
+    [
+        ((), 1),
+        ((object(),), 1),
+        ([], 1),
+        (
+            (
+                PreparedTombstone(
+                    "a" * 64,
+                    "moodle-notification-event-v1:" + "a" * 64,
+                    "moodle-task-v1:" + "b" * 64,
+                    "moodle-assignment-v1:" + "c" * 64,
+                    "other",
+                    1,
+                    ("d" * 64,),
+                    None,
+                ),
+            ),
+            1,
+        ),
+        (
+            (
+                PreparedTombstone(
+                    "not-a-digest",
+                    "moodle-notification-event-v1:" + "a" * 64,
+                    "moodle-task-v1:" + "b" * 64,
+                    "moodle-assignment-v1:" + "c" * 64,
+                    "scratch",
+                    1,
+                    ("d" * 64,),
+                    None,
+                ),
+            ),
+            1,
+        ),
+        ((), -1),
+        ((), True),
+        ((), "1"),
+    ],
+)
+def test_retention_completion_public_api_rejects_invalid_input_without_rows(
+    tmp_path: Path, completed: object, completed_at: object
+) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    with pytest.raises(ApprovalStateError, match="retention completion is invalid"):
+        state.record_retention_completions(
+            cast(tuple[PreparedTombstone, ...], completed),
+            completed_at=cast(int, completed_at),
+        )
+    with state._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM retention_completions").fetchone() == (0,)
+
+
+def test_reconciliation_cursor_pages_1025_rows_persists_and_wraps(tmp_path: Path) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    with state._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for index in range(1_024):
+            event_id = "moodle-notification-event-v1:" + f"{index:064x}"
+            task_key = "moodle-task-v1:" + f"{index:064x}"
+            revision = "moodle-assignment-v1:" + f"{index + 2_000:064x}"
+            connection.execute(
+                "INSERT INTO requests(event_id, task_key, revision_digest, payload, "
+                "delivery_state, decision, decided_by, decided_at, chat_id, message_id, "
+                "created_at) "
+                "VALUES (?, ?, ?, '{}', 'prepared', 'approved', 1, 1, NULL, NULL, 1)",
+                (event_id, task_key, revision),
+            )
+            phases = ("evidence", "scratch") if index == 0 else ("scratch",)
+            for phase in phases:
+                connection.execute(
+                    "INSERT INTO retention_completions(event_id, target_phase, tombstone_id, "
+                    "completed_at) VALUES (?, ?, ?, 10)",
+                    (event_id, phase, sha256(f"{index}:{phase}".encode()).hexdigest()),
+                )
+        connection.execute("COMMIT")
+
+    first_result = state.retention_reconciliation_page(limit=1_024)
+    assert first_result.state == "page"
+    first = first_result.page
+    assert first is not None
+    assert len(first.receipts) == 1_024
+    assert [item.target_phase for item in first.receipts[:2]] == ["evidence", "scratch"]
+    restarted = ApprovalState(state.path)
+    assert restarted.retention_reconciliation_page(limit=1_024) == first_result
+    restarted.advance_retention_reconciliation(first)
+    second_result = restarted.retention_reconciliation_page(limit=1_024)
+    assert second_result.state == "page"
+    second = second_result.page
+    assert second is not None
+    assert len(second.receipts) == 1
+    assert second.receipts[0].event_id.endswith(f"{1_023:064x}")
+    restarted.advance_retention_reconciliation(second)
+    assert restarted.retention_reconciliation_page(limit=1_024).state == "wrapped"
+    after_wrap_restart = ApprovalState(state.path)
+    assert after_wrap_restart.retention_reconciliation_page(limit=1_024) == first_result
+
+
+def test_retention_records_does_not_issue_unbounded_completion_ledger_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    seen: list[str] = []
+    original = state._connect
+
+    def traced_connect() -> sqlite3.Connection:
+        connection = original()
+        connection.set_trace_callback(seen.append)
+        return connection
+
+    monkeypatch.setattr(state, "_connect", traced_connect)
+    assert state.retention_records(10, 1, 1, 1) == ()
+    assert not any(
+        "SELECT event_id, target_phase FROM retention_completions" in statement
+        for statement in seen
+    )
 
 
 def test_schema_trigger_injection_is_rejected(tmp_path: Path) -> None:

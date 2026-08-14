@@ -25,6 +25,7 @@ _CONTROLLER_FILES = (
     ("usr/local/sbin/moodle-autotask-install-codex", 0o750),
     ("usr/local/sbin/moodle-autotask-health-publish", 0o750),
     ("usr/local/sbin/moodle-autotask-health-prepare", 0o750),
+    ("usr/local/sbin/moodle-autotask-workspace-setup", 0o750),
     ("etc/codex/requirements.toml", 0o644),
     ("etc/systemd/system/moodle-autotask-codex-login.service", 0o644),
     ("etc/systemd/system/moodle-autotask-agent.service", 0o644),
@@ -732,6 +733,7 @@ def test_literal_guard_contracts_remain_tied_to_the_deploy_payload() -> None:
         "restore_activation()",
         "restore_scheduler_config()",
         "restore_controller_install()",
+        "/usr/local/sbin/moodle-autotask-workspace-setup",
         'touch -d @0 -- "$path"',
         "systemctl enable --now moodle-autotask-health.timer",
         "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
@@ -798,7 +800,7 @@ def test_deploy_guard_backup_failures_are_nonzero_and_leave_no_candidates(
     assert not tuple(parent.glob(".health-marker.*"))
 
 
-def test_controller_guard_copies_and_restores_all_twelve_owned_files(tmp_path: Path) -> None:
+def test_controller_guard_copies_and_restores_all_thirteen_owned_files(tmp_path: Path) -> None:
     harness = _RemoteHarness(tmp_path)
     harness.set_states({"scheduler"}, {"scheduler"}, timer=(True, True))
     shutil.rmtree(harness.root / "opt/moodle-autotask/current")
@@ -823,7 +825,45 @@ def test_controller_guard_copies_and_restores_all_twelve_owned_files(tmp_path: P
     assert result.returncode != 0
     for target, (contents, mode) in expected.items():
         assert target.read_bytes() == contents
+        assert (target.stat().st_uid, target.stat().st_gid) == (0, 0)
         assert target.stat().st_mode & 0o777 == mode
+
+
+@pytest.mark.parametrize("tamper", ("symlink", "hardlink"))
+def test_controller_guard_rejects_workspace_helper_indirection_or_hardlink(
+    tmp_path: Path, tamper: str
+) -> None:
+    harness = _RemoteHarness(tmp_path)
+    harness.set_states({"scheduler"}, {"scheduler"}, timer=(True, True))
+    helper = harness.root / "usr/local/sbin/moodle-autotask-workspace-setup"
+    helper.write_bytes(b"previous-workspace-helper")
+    helper.chmod(0o750)
+    outside = harness.temporary / "outside-workspace-helper"
+    outside.write_bytes(b"outside")
+    helper.unlink()
+    if tamper == "symlink":
+        helper.symlink_to(outside)
+    else:
+        os.link(outside, helper)
+    prior = harness.snapshot()
+    payload = "\n".join(
+        (
+            "set -eu",
+            _function_payload("New-ControllerInstallGuardCommand"),
+            "false",
+        )
+    )
+
+    result = harness.run(payload)
+
+    assert result.returncode != 0
+    assert harness.snapshot() == prior
+    assert outside.read_bytes() == b"outside"
+    if tamper == "symlink":
+        assert helper.is_symlink()
+    else:
+        assert helper.stat().st_nlink == 2
+    _assert_no_deploy_backups(harness)
 
 
 def test_deploy_guard_rejects_malformed_config_and_marker_before_state_change(
@@ -889,6 +929,7 @@ def test_post_guard_deploy_failures_restore_the_complete_prior_machine(
     assert harness.snapshot() == prior
     for target, (contents, mode) in expected.items():
         assert target.read_bytes() == contents
+        assert (target.stat().st_uid, target.stat().st_gid) == (0, 0)
         assert target.stat().st_mode & 0o777 == mode
     _assert_no_deploy_backups(harness)
 
@@ -908,6 +949,7 @@ def test_post_guard_canonical_timer_enable_failure_restores_an_inactive_deployme
     assert harness.snapshot() == prior
     for target, (contents, mode) in expected.items():
         assert target.read_bytes() == contents
+        assert (target.stat().st_uid, target.stat().st_gid) == (0, 0)
         assert target.stat().st_mode & 0o777 == mode
     assert not (harness.root / "var/lib/moodle-autotask/health-enabled").exists()
     _assert_no_deploy_backups(harness)

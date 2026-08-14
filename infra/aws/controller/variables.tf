@@ -55,11 +55,11 @@ variable "controller_instance_type" {
 variable "root_volume_size_gib" {
   description = "Encrypted gp3 root volume size."
   type        = number
-  default     = 30
+  default     = 80
 
   validation {
-    condition     = var.root_volume_size_gib >= 20 && var.root_volume_size_gib <= 100
-    error_message = "root_volume_size_gib must be between 20 and 100 GiB."
+    condition     = var.root_volume_size_gib >= 80 && var.root_volume_size_gib <= 100
+    error_message = "root_volume_size_gib must be between 80 and 100 GiB."
   }
 }
 

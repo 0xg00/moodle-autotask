@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -56,6 +57,27 @@ def test_controller_scheduler_pins_a_campaign_safe_moodle_timeout() -> None:
     assert "--request-timeout-seconds 60" in cloud_init
 
 
+def test_controller_bootstrap_defers_retention_layout_to_canonical_installer() -> None:
+    cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(encoding="utf-8")
+    controller = (
+        ROOT / "src" / "moddle_autotask" / "adapters" / "aws" / "controller_service.py"
+    ).read_text(encoding="utf-8")
+    deploy = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
+
+    assert "python3 - ${project_name} moodle-agent <<'PY'" not in cloud_init
+    assert "useradd --system --home-dir /var/lib/moodle-agent" in cloud_init
+    assert "install_protocol_layout()" in controller
+    assert 'for name in ("committed", "barriers", "locks")' in controller
+    assert 'results_retention_fd, "acks"' in controller
+    deploy_install = deploy.split('$releaseRoot = "/opt/moodle-autotask/releases/', 1)[1]
+    assert deploy_install.index("moodle-autotask-controller' install") < deploy_install.index(
+        "'/usr/local/sbin/moodle-autotask-install-codex'"
+    )
+    assert deploy_install.index(
+        "'/usr/local/sbin/moodle-autotask-install-codex'"
+    ) < deploy_install.index("systemctl daemon-reload")
+
+
 def test_controller_health_is_root_published_and_missing_metric_is_breaching() -> None:
     cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(encoding="utf-8")
     iam = (AWS_ROOT / "controller" / "iam.tf").read_text(encoding="utf-8")
@@ -73,6 +95,25 @@ def test_controller_health_is_root_published_and_missing_metric_is_breaching() -
     assert "evaluation_periods  = 5" in health and "datapoints_to_alarm = 3" in health
     assert 'treat_missing_data  = "breaching"' in health
     assert 'Service    = "aggregate"' in health
+    storage_alarm = _terraform_block(
+        health, "resource", "aws_cloudwatch_metric_alarm", "controller_storage_admission"
+    )
+    assert 'metric_name         = "StorageAdmissionOpen"' in storage_alarm
+    assert "period              = 60" in storage_alarm
+    assert "evaluation_periods  = 3" in storage_alarm
+    assert "datapoints_to_alarm = 3" in storage_alarm
+    assert 'treat_missing_data  = "breaching"' in storage_alarm
+    assert 'Service    = "storage"' in storage_alarm
+
+
+def test_controller_storage_profile_reserves_workspace_headroom() -> None:
+    variables = (AWS_ROOT / "controller" / "variables.tf").read_text(encoding="utf-8")
+    example = (AWS_ROOT / "controller" / "terraform.tfvars.example").read_text(encoding="utf-8")
+
+    assert 'variable "root_volume_size_gib"' in variables
+    assert "default     = 80" in variables
+    assert "var.root_volume_size_gib >= 80" in variables
+    assert "root_volume_size_gib     = 80" in example
 
 
 def test_controller_scheduler_scope_is_explicit_and_has_no_fixture_hardcode() -> None:
@@ -84,12 +125,20 @@ def test_controller_scheduler_scope_is_explicit_and_has_no_fixture_hardcode() ->
     for source in (cloud_init, compute, variables, deploy):
         assert "ASIX-CAMPAIGN-01" not in source
     assert "--scheduler-config-file /etc/${project_name}/scheduler.json" in cloud_init
-    assert "scheduler_config_base64 = base64encode(" in compute
-    assert "var.scheduler_all_courses ? jsonencode({" in compute
+    assert 'scheduler_config_transport = join(".", concat(' in compute
+    assert 'var.scheduler_all_courses ? "A" : "C"' in compute
+    assert "base64encode(shortname)" in compute
     assert "scheduler_course_shortnames" in variables and "scheduler_all_courses" in variables
     assert "scheduler_max_new_events_per_cycle" in variables
     assert "length(base64encode(shortname))" in variables
-    assert "length(base64encode(local.controller_user_data)) <= 21848" in compute
+    assert "controller_user_data_base64 = base64encode(local.controller_user_data)" in compute
+    assert (
+        "controller_user_data_bytes = 3 * floor(length(local.controller_user_data_base64) / 4)"
+        in compute
+    )
+    assert 'endswith(local.controller_user_data_base64, "==") ? 2' in compute
+    assert 'endswith(local.controller_user_data_base64, "=") ? 1 : 0' in compute
+    assert "local.controller_user_data_bytes <= 16384" in compute
     assert "New-SchedulerConfigJson" in deploy
     assert "Deploy requires exactly one scheduler scope" in deploy
     assert "os.replace(temporary, target)" in cloud_init
@@ -108,6 +157,143 @@ def test_controller_scheduler_scope_is_explicit_and_has_no_fixture_hardcode() ->
     assert deploy_block.index("$schedulerConfigGuardCommand,") < deploy_block.index(
         'if [ "$scheduler_was_active" = true ]; then systemctl stop'
     )
+
+
+def test_controller_cloud_init_fits_ec2_limit_at_valid_scope_maximum() -> None:
+    template = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(
+        encoding="utf-8"
+    )
+    project = "p" * 31
+    environment = "e" * 20
+    escaped_json_chars = ("<>&" * 10)[:28]
+    courses = [f"{index:03d}-{escaped_json_chars}" for index in range(64)]
+    assert sum(len(course.encode("utf-8")) for course in courses) == 2048
+    scheduler = ".".join(
+        [
+            "C",
+            "100",
+            *(base64.b64encode(course.encode("utf-8")).decode("ascii") for course in courses),
+        ]
+    )
+    values = {
+        "project_name": project,
+        "region": "ap-southeast-2",
+        "scheduler_config_transport": scheduler,
+        "scheduler_interval": "86400",
+        "secret_arn": (
+            "arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:"
+            f"{project}/{environment}/moodle-token-abcdef"
+        ),
+        "telegram_secret_arn": (
+            "arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:"
+            f"{project}/{environment}/telegram-config-abcdef"
+        ),
+    }
+    escaped = "__TERRAFORM_LITERAL_INTERPOLATION__"
+    rendered = template.replace("$${", escaped)
+    for name, value in values.items():
+        rendered = rendered.replace(f"${{{name}}}", value)
+    rendered = rendered.replace(escaped, "${")
+    assert re.findall(r"\$\{[A-Za-z0-9_]+\}", rendered) == []
+    assert len(rendered.encode("utf-8")) <= 16384
+
+
+def test_controller_user_data_precondition_uses_exact_raw_byte_boundary() -> None:
+    compute = (AWS_ROOT / "controller" / "compute.tf").read_text(encoding="utf-8")
+
+    def decoded_size(raw: bytes) -> int:
+        encoded = base64.b64encode(raw)
+        padding = 2 if encoded.endswith(b"==") else 1 if encoded.endswith(b"=") else 0
+        return 3 * (len(encoded) // 4) - padding
+
+    assert "local.controller_user_data_bytes <= 16384" in compute
+    assert decoded_size(b"a" * 16384) == 16384
+    assert decoded_size(b"a" * 16385) == 16385
+    assert decoded_size(b"a" * 16386) == 16386
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is required")
+def test_terraform_raw_user_data_size_formula_preserves_exact_boundary() -> None:
+    def terraform_size(size: int) -> int:
+        chunks, remainder = divmod(size, 1024)
+        raw = (
+            f'join("", concat([for _ in range({chunks}) : "{"a" * 1024}"], '
+            f'["{"a" * remainder}"]))'
+        )
+        encoded = f"base64encode({raw})"
+        expression = (
+            f"3 * floor(length({encoded}) / 4) - "
+            f'(endswith({encoded}, "==") ? 2 : '
+            f'(endswith({encoded}, "=") ? 1 : 0))\n'
+        )
+        completed = subprocess.run(
+            ["docker", "run", "--rm", "-i", "hashicorp/terraform:1.15.8", "console"],
+            input=expression,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        assert completed.stdout.strip(), completed.stderr
+        return int(completed.stdout.strip())
+
+    assert terraform_size(16384) == 16384
+    assert terraform_size(16385) == 16385
+    assert terraform_size(16386) == 16386
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is required")
+def test_controller_cloud_init_scheduler_transport_round_trips_exact_unicode(
+    tmp_path: Path,
+) -> None:
+    template = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(
+        encoding="utf-8"
+    )
+    marker = (
+        "python3 - '${scheduler_config_transport}' "
+        "/etc/${project_name}/scheduler.json ${project_name} <<'PY'\n"
+    )
+    script = template.split(marker, 1)[1].split("\nPY\n", 1)[0]
+    script_path = tmp_path / "scheduler-config.py"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    courses = ["Straße", "STRASSE", "<>& Práctica"]
+    transport = ".".join(
+        [
+            "C",
+            "100",
+            *(base64.b64encode(course.encode("utf-8")).decode("ascii") for course in courses),
+        ]
+    )
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "-e",
+        f"TRANSPORT={transport}",
+        "-v",
+        f"{tmp_path}:/work:ro",
+        "python:3.13-slim",
+        "sh",
+        "-c",
+        (
+            "install -d -o root -g root -m 0755 /safe && "
+            'python /work/scheduler-config.py "$TRANSPORT" /safe/scheduler.json root && '
+            "cat /safe/scheduler.json"
+        ),
+    ]
+    completed = subprocess.run(
+        command, check=True, capture_output=True, encoding="utf-8", timeout=30
+    )
+    assert json.loads(completed.stdout) == {
+        "courseShortnames": courses,
+        "maxNewEventsPerCycle": 100,
+    }
+
+    command[4] = "TRANSPORT=C.4.%%%"
+    rejected = subprocess.run(
+        command, check=False, capture_output=True, encoding="utf-8", timeout=30
+    )
+    assert rejected.returncode != 0
 
 
 def test_controller_tfvars_example_is_rejected_until_scope_is_selected() -> None:

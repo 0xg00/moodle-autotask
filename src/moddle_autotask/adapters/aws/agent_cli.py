@@ -24,6 +24,7 @@ from typing import Any, Never, cast
 from moddle_autotask.adapters.moodle.path_safety import assert_no_indirection
 from moddle_autotask.health import pulse
 
+from . import central_protocol
 from .agent_spool import (
     _MAX_CENTRAL_RESULT_BYTES,
     AgentSpoolError,
@@ -31,8 +32,25 @@ from .agent_spool import (
     _central_plan,
     _read_regular,
     _safe_filename,
-    _validate_central_result,
     _write_exclusive,
+)
+from .retention_fs import (
+    RetentionBarrierError,
+    RetentionFilesystem,
+    RetentionRoots,
+    agent_job_barred,
+    retention_job_lock,
+)
+from .retention_runtime import AgentRetentionCoordinator, production_ownership
+from .storage_quota import (
+    StorageCapacityError,
+    StorageDemand,
+    StorageEnvelopeError,
+    StorageLimit,
+    StoragePolicy,
+    admit_owner_write,
+    storage_admission_lock,
+    storage_demand_for_files,
 )
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -60,10 +78,17 @@ _RESULT_SCHEMA = {
 }
 _CENTRAL_ROLES = {"central_planner", "central_executor", "central_reviewer"}
 _MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
-_MAX_ARTIFACT_TOTAL = 1_900_000
+_MAX_ARTIFACT_TOTAL = central_protocol.MAX_CENTRAL_ARTIFACT_TOTAL_BYTES
 _MAX_BUNDLE_TOTAL = 512 * 1024 * 1024
 _BUNDLE_TEMP = re.compile(r"^\.bundle-[0-9a-f]{32}\.zip$")
 _RESULT_TEMP = re.compile(r"^\.([0-9a-f]{64})\.json\.[0-9a-f]{32}\.tmp$")
+_STORAGE_POLICY = StoragePolicy()
+_TERMINAL_RESULT_RESERVE_BYTES = 4 * 1024 * 1024
+_TERMINAL_RESULT_RESERVE_NODES = 2048
+_NORMAL_RESULTS_LIMIT = StorageLimit(
+    _STORAGE_POLICY.results.max_allocated_bytes - _TERMINAL_RESULT_RESERVE_BYTES,
+    _STORAGE_POLICY.results.max_nodes - _TERMINAL_RESULT_RESERVE_NODES,
+)
 
 
 class _BundlePublicationBusy(AgentSpoolError):
@@ -82,7 +107,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--workspaces", type=Path, required=True)
-    parser.add_argument("--bundles", type=Path)
+    parser.add_argument("--bundles", type=Path, required=True)
+    parser.add_argument("--retention-root", type=Path, required=True)
+    parser.add_argument(
+        "--retention-controller-private", type=Path, default=Path("/var/lib/moodle-autotask")
+    )
+    parser.add_argument("--retention-scan-limit", type=int, default=1_024)
     parser.add_argument("--codex", type=Path, required=True)
     parser.add_argument("--interval-seconds", type=int, default=15)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
@@ -92,9 +122,22 @@ def main(argv: list[str] | None = None) -> int:
         args.run != "run"
         or not 5 <= args.interval_seconds <= 3600
         or not 60 <= args.timeout_seconds <= 7200
+        or not 1 <= args.retention_scan_limit <= 10_000
     ):
         parser.error("run command and valid intervals are required")
     try:
+        retention_roots = RetentionRoots(
+            controller_private=args.retention_controller_private,
+            shared_jobs=args.jobs,
+            agent_private=args.retention_root,
+            agent_results=args.results,
+            agent_workspaces=args.workspaces,
+            agent_bundles=args.bundles,
+        )
+        retention = AgentRetentionCoordinator(
+            RetentionFilesystem(retention_roots, production_ownership()),
+            scan_limit=args.retention_scan_limit,
+        )
         runner = CodexSpoolRunner(
             args.jobs,
             args.results,
@@ -102,13 +145,19 @@ def main(argv: list[str] | None = None) -> int:
             args.codex,
             args.timeout_seconds,
             args.bundles,
+            args.retention_root,
         )
         while True:
             pulse("agent")
-            result = runner.process_one()
+            retention_result = retention.cycle()
+            result = retention_result if retention_result != "idle" else runner.process_one()
             print(
                 json.dumps(
-                    {"kind": "agent-cycle-v1", "result": result},
+                    {
+                        "kind": "agent-cycle-v1",
+                        "result": result,
+                        "retention": retention_result,
+                    },
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
@@ -133,6 +182,7 @@ class CodexSpoolRunner:
         codex: Path,
         timeout_seconds: int,
         bundles_root: Path | None = None,
+        retention_root: Path | None = None,
     ) -> None:
         bundles_root = bundles_root or results_root / "bundles"
         for root in (jobs_root, results_root, workspaces_root, bundles_root):
@@ -140,12 +190,15 @@ class CodexSpoolRunner:
                 raise ValueError("agent runner roots must be absolute")
         if not codex.is_absolute():
             raise ValueError("Codex executable path must be absolute")
+        if retention_root is not None and not retention_root.is_absolute():
+            raise ValueError("agent retention root must be absolute")
         self._jobs_root = jobs_root
         self._results_root = results_root
         self._workspaces_root = workspaces_root
         self._codex = codex
         self._timeout_seconds = timeout_seconds
         self._bundles_root = bundles_root
+        self._retention_root = retention_root
 
     def process_one(self) -> str:
         self._safe_directory(self._jobs_root, create=False)
@@ -179,18 +232,71 @@ class CodexSpoolRunner:
                 continue
             try:
                 self._execute(directory, result_path, job)
+            except RetentionBarrierError:
+                return "retention-refused"
             except _BundlePublicationBusy:
                 # No execution result is durable: the next runner cycle can
                 # safely recover the immutable job after the holder exits.
                 return "idle"
-            except AgentSpoolError:
+            except StorageCapacityError:
+                job_id = job.get("jobId")
+                phase = job.get("phase") or job.get("role")
+                if not isinstance(job_id, str) or not isinstance(phase, str):
+                    continue
                 try:
-                    self._publish_operational_failure(
-                        result_path,
-                        cast(str, job["jobId"]),
-                        cast(str, job.get("phase") or job["role"]),
-                        "Agent workspace is unsafe",
-                    )
+                    with retention_job_lock(self._retention_root, job_id):
+                        if agent_job_barred(self._retention_root, job_id):
+                            return "retention-refused"
+                        self._publish_operational_failure(
+                            result_path,
+                            job_id,
+                            phase,
+                            "Agent storage capacity is exhausted",
+                            terminal=True,
+                        )
+                except (AgentSpoolError, StorageCapacityError):
+                    return "storage-capacity"
+            except OSError as error:
+                if error.errno not in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+                    raise
+                job_id = job.get("jobId")
+                phase = job.get("phase") or job.get("role")
+                if not isinstance(job_id, str) or not isinstance(phase, str):
+                    continue
+                try:
+                    with retention_job_lock(self._retention_root, job_id):
+                        if agent_job_barred(self._retention_root, job_id):
+                            return "retention-refused"
+                        self._publish_operational_failure(
+                            result_path,
+                            job_id,
+                            phase,
+                            "Agent storage capacity is exhausted",
+                            terminal=True,
+                        )
+                except (AgentSpoolError, StorageCapacityError, OSError):
+                    return "storage-capacity"
+            except AgentSpoolError:
+                job_id = job.get("jobId")
+                phase = job.get("phase") or job.get("role")
+                if (
+                    not isinstance(job_id, str)
+                    or _DIGEST.fullmatch(job_id) is None
+                    or job_id != directory.name
+                    or not isinstance(phase, str)
+                ):
+                    continue
+                try:
+                    with retention_job_lock(self._retention_root, job_id):
+                        if agent_job_barred(self._retention_root, job_id):
+                            return "retention-refused"
+                        self._publish_operational_failure(
+                            result_path,
+                            job_id,
+                            phase,
+                            "Agent workspace is unsafe",
+                            terminal=True,
+                        )
                 except AgentSpoolError:
                     continue
             return "processed"
@@ -199,78 +305,109 @@ class CodexSpoolRunner:
     def _execute(self, job_directory: Path, result_path: Path, job: dict[str, object]) -> None:
         job_id = cast(str, job["jobId"])
         phase = cast(str, job.get("phase") or job["role"])
-        workspace = self._workspaces_root / job_id
-        if job["kind"] == "moodle-agent-job-v2":
-            self._reset_central_workspace(workspace)
-        self._safe_directory(workspace, create=True)
-        _materialize_inputs(job_directory, workspace, job)
-        schema_path = workspace / "result-schema.json"
-        output_path = workspace / "last-message.json"
-        _replace_private_file(schema_path, _canonical(_schema_for_job(job)))
-        try:
-            _remove_private_file(output_path)
-            completed = subprocess.run(
-                [
-                    str(self._codex),
-                    "exec",
-                    "--ephemeral",
-                    "--skip-git-repo-check",
-                    "--color",
-                    "never",
-                    "--output-schema",
-                    str(schema_path),
-                    "--output-last-message",
-                    str(output_path),
-                    "-C",
-                    str(workspace),
-                    _prompt(job),
-                ],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=self._timeout_seconds,
-                env=_codex_environment(),
-            )
-        except subprocess.TimeoutExpired:
-            self._publish_operational_failure(
-                result_path, job_id, phase, "Codex execution timed out"
-            )
-            return
-        if completed.returncode != 0:
-            self._publish_operational_failure(result_path, job_id, phase, "Codex execution failed")
-            return
-        if job["kind"] == "moodle-agent-job-v2":
-            result = _load_central_model_result(output_path, phase)
-            _validate_central_model_context(job, result)
-            result = _wrap_central_result(job, result, workspace, self._bundles_root)
-            _validate_central_result_context(job, result)
-            encoded = _canonical(result)
-            if len(encoded) > _MAX_CENTRAL_RESULT_BYTES:
-                raise AgentSpoolError("central result exceeds serialized size budget")
-            _publish_result(result_path, encoded)
-            return
-        result = _load_model_result(output_path, phase)
-        if phase == "lab_report":
-            context = job.get("context")
-            if not isinstance(context, dict) or not isinstance(context.get("labSucceeded"), bool):
-                raise AgentSpoolError("agent report context is invalid")
-            if not context["labSucceeded"] and result["succeeded"]:
-                result["succeeded"] = False
-                result["summary"] = "Lab execution failed"
-                result["reportMarkdown"] = ""
-        result.update(
-            {
-                "kind": "moodle-agent-result-v1",
-                "jobId": job_id,
-                "phase": phase,
-            }
-        )
-        _publish_result(result_path, _canonical(result))
+        with retention_job_lock(self._retention_root, job_id):
+            if agent_job_barred(self._retention_root, job_id):
+                raise RetentionBarrierError("retention barrier refuses agent execution")
+            with storage_admission_lock(self._workspaces_root):
+                workspace = self._workspaces_root / job_id
+                try:
+                    _admit_workspace_materialization(self._workspaces_root, workspace, job)
+                except StorageEnvelopeError as error:
+                    raise AgentSpoolError("agent workspace is unsafe") from error
+                if job["kind"] == "moodle-agent-job-v2":
+                    self._reset_central_workspace(workspace)
+                    self._safe_central_workspace(workspace)
+                else:
+                    self._safe_directory(workspace, create=True)
+                _materialize_inputs(job_directory, workspace, job)
+                schema_path = workspace / "result-schema.json"
+                output_path = workspace / "last-message.json"
+                _replace_private_file(schema_path, _canonical(_schema_for_job(job)))
+                try:
+                    _remove_private_file(output_path)
+                    completed = subprocess.run(
+                        [
+                            str(self._codex),
+                            "exec",
+                            "--ephemeral",
+                            "--skip-git-repo-check",
+                            "--color",
+                            "never",
+                            "--output-schema",
+                            str(schema_path),
+                            "--output-last-message",
+                            str(output_path),
+                            "-C",
+                            str(workspace),
+                            _prompt(job),
+                        ],
+                        check=False,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=self._timeout_seconds,
+                        env=_codex_environment(),
+                    )
+                except subprocess.TimeoutExpired:
+                    self._publish_operational_failure(
+                        result_path,
+                        job_id,
+                        phase,
+                        "Codex execution timed out",
+                        terminal=True,
+                    )
+                    return
+                if completed.returncode != 0:
+                    self._publish_operational_failure(
+                        result_path,
+                        job_id,
+                        phase,
+                        "Codex execution failed",
+                        terminal=True,
+                    )
+                    return
+                if agent_job_barred(self._retention_root, job_id):
+                    raise RetentionBarrierError(
+                        "retention barrier refuses agent result publication"
+                    )
+                if job["kind"] == "moodle-agent-job-v2":
+                    model = _load_central_model_result(output_path, phase)
+                    _validate_central_model_context(job, model)
+                    result = _wrap_central_result(job, model, workspace, self._bundles_root)
+                    _validate_central_model_result_binding(job, model, result)
+                    encoded = _canonical(result)
+                    if len(encoded) > _MAX_CENTRAL_RESULT_BYTES:
+                        raise AgentSpoolError("central result exceeds serialized size budget")
+                    _publish_result(result_path, encoded)
+                    return
+                result = _load_model_result(output_path, phase)
+                if phase == "lab_report":
+                    context = job.get("context")
+                    if not isinstance(context, dict) or not isinstance(
+                        context.get("labSucceeded"), bool
+                    ):
+                        raise AgentSpoolError("agent report context is invalid")
+                    if not context["labSucceeded"] and result["succeeded"]:
+                        result["succeeded"] = False
+                        result["summary"] = "Lab execution failed"
+                        result["reportMarkdown"] = ""
+                result.update(
+                    {
+                        "kind": "moodle-agent-result-v1",
+                        "jobId": job_id,
+                        "phase": phase,
+                    }
+                )
+                _publish_result(result_path, _canonical(result))
 
     @staticmethod
     def _publish_operational_failure(
-        result_path: Path, job_id: str, phase: str, summary: str
+        result_path: Path,
+        job_id: str,
+        phase: str,
+        summary: str,
+        *,
+        terminal: bool = False,
     ) -> None:
         if result_path.exists() or result_path.is_symlink():
             raise AgentSpoolError("agent result path is unsafe")
@@ -289,7 +426,7 @@ class CodexSpoolRunner:
                 "reportMarkdown": "",
             }
             result[digest_key] = hashlib.sha256(_canonical(result)).hexdigest()
-            _publish_result(result_path, _canonical(result))
+            _publish_result(result_path, _canonical(result), terminal=terminal)
             return
         try:
             _publish_result(
@@ -305,6 +442,7 @@ class CodexSpoolRunner:
                         "powershellCommands": [],
                     }
                 ),
+                terminal=terminal,
             )
         except FileExistsError as error:
             raise AgentSpoolError("agent result path is unsafe") from error
@@ -319,20 +457,93 @@ class CodexSpoolRunner:
             raise AgentSpoolError("agent runner directory is unsafe")
 
     @staticmethod
+    def _safe_central_workspace(path: Path) -> None:
+        try:
+            assert_no_indirection(path)
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            else:
+                assert_no_indirection(path)
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                    raise AgentSpoolError("central workspace is unsafe")
+                path.chmod(0o700)
+            assert_no_indirection(path)
+            metadata = path.lstat()
+            if (
+                path.is_symlink()
+                or not stat.S_ISDIR(metadata.st_mode)
+                or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700)
+            ):
+                raise AgentSpoolError("central workspace is unsafe")
+        except (OSError, ValueError) as error:
+            raise AgentSpoolError("central workspace is unsafe") from error
+
+    @staticmethod
     def _reset_central_workspace(path: Path) -> None:
         if not path.exists() and not path.is_symlink():
             return
         try:
             assert_no_indirection(path)
             metadata = path.lstat()
-            if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            if (
+                path.is_symlink()
+                or not stat.S_ISDIR(metadata.st_mode)
+                or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700)
+            ):
                 raise AgentSpoolError("central workspace is unsafe")
             _assert_no_indirection_tree(path)
             # This directory is named by the immutable job ID and contains no
             # durable result; recovery therefore starts from verified inputs.
             shutil.rmtree(path)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             raise AgentSpoolError("could not reset central workspace") from error
+
+
+def _admit_workspace_materialization(
+    workspaces_root: Path, workspace: Path, job: dict[str, object]
+) -> None:
+    """Check the bounded workspace envelope before reset or input writes."""
+    # The production admission primitive is descriptor-relative POSIX code.
+    # Existing Windows unit tests exercise the independent no-follow workspace
+    # checks below; they cannot provide an equivalent directory descriptor.
+    if os.name == "nt":
+        return
+    try:
+        for entry in workspaces_root.iterdir():
+            metadata = entry.lstat()
+            if (
+                entry.is_symlink()
+                or not stat.S_ISDIR(metadata.st_mode)
+                or _DIGEST.fullmatch(entry.name) is None
+            ):
+                raise StorageEnvelopeError("workspace storage layout is unsafe")
+        attachments = _attachments(job)
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise StorageEnvelopeError("workspace storage layout is unsafe") from error
+    # A materialized input set plus schema and model-result paths are the only
+    # pre-Codex writes.  Existing workspace state remains charged until the
+    # verified reset has actually removed it.
+    pending = storage_demand_for_files(
+        workspaces_root,
+        tuple(cast(int, item["sizeBytes"]) for item in attachments)
+        + (_MAX_JOB_BYTES, _MAX_JOB_BYTES),
+        len(attachments) + 4,
+    )
+    admit_owner_write(
+        workspaces_root,
+        StorageDemand(0, 0),
+        _STORAGE_POLICY.workspace_hard,
+        root_headroom=False,
+    )
+    admit_owner_write(
+        workspaces_root,
+        pending,
+        _STORAGE_POLICY.workspace_admission,
+        root_headroom=False,
+    )
 
 
 def _load_job(directory: Path) -> dict[str, object]:
@@ -378,105 +589,19 @@ def _load_job(directory: Path) -> dict[str, object]:
 
 
 def _load_central_job(directory: Path, job: dict[str, object]) -> dict[str, object]:
-    role = job.get("role")
-    required = {
-        "kind",
-        "jobId",
-        "role",
-        "eventId",
-        "taskKey",
-        "revisionDigest",
-        "selectedMode",
-        "specificationDigest",
-        "preparedInputManifestDigest",
-        "assignmentSnapshot",
-        "preparedInputs",
-        "dependencies",
-    }
-    optional = {"plan", "executorResult"}
-    if not set(job).issubset(required | optional) or not required.issubset(job):
-        raise AgentSpoolError("central job shape is invalid")
-    if (
-        job.get("jobId") != directory.name
-        or role not in _CENTRAL_ROLES
-        or not _identity(job.get("eventId"), "moodle-notification-event-v1:")
-        or not _identity(job.get("taskKey"), "moodle-task-v1:")
-        or not _identity(job.get("revisionDigest"), "moodle-assignment-v1:")
-        or job.get("selectedMode") != "central"
-    ):
-        raise AgentSpoolError("central job identity is invalid")
-    for field in ("specificationDigest", "preparedInputManifestDigest"):
-        if not isinstance(job.get(field), str) or _DIGEST.fullmatch(cast(str, job[field])) is None:
-            raise AgentSpoolError("central job digest is invalid")
-    snapshot = job.get("assignmentSnapshot")
-    if (
-        not isinstance(snapshot, dict)
-        or set(snapshot) != {"courseName", "courseShortname", "title", "intro"}
-        or not all(isinstance(v, str) for v in snapshot.values())
-    ):
-        raise AgentSpoolError("central snapshot is invalid")
-    _attachments(job)
-    prepared_inputs = cast(list[dict[str, object]], job["preparedInputs"])
-    prepared_manifest = [
-        {
-            "attachmentKey": item["attachmentKey"],
-            "filename": item["filename"],
-            "sizeBytes": item["sizeBytes"],
-            "sha256": item["sha256"],
-            "path": item["path"],
-        }
-        for item in prepared_inputs
-    ]
-    if (
-        hashlib.sha256(_canonical(prepared_manifest)).hexdigest()
-        != job["preparedInputManifestDigest"]
-    ):
-        raise AgentSpoolError("central prepared input manifest is invalid")
-    dependencies = job.get("dependencies")
-    if not isinstance(dependencies, dict) or any(
-        not isinstance(k, str)
-        or not isinstance(v, str)
-        or (k.endswith("Digest") and _DIGEST.fullmatch(v) is None)
-        for k, v in dependencies.items()
-    ):
-        raise AgentSpoolError("central dependencies are invalid")
-    body = {key: value for key, value in job.items() if key != "jobId"}
-    if hashlib.sha256(_canonical(body)).hexdigest() != job["jobId"]:
-        raise AgentSpoolError("central job digest is invalid")
-    expected_dependencies = {
-        "central_planner": set(),
-        "central_executor": {"plannerJobId", "planDigest", "plannerResultDigest"},
-        "central_reviewer": {
-            "plannerJobId",
-            "planDigest",
-            "plannerResultDigest",
-            "executorJobId",
-            "executorResultDigest",
-            "artifactManifestDigest",
-            "artifactBundleDigest",
-        },
-    }
-    if set(dependencies) != expected_dependencies[role]:
-        raise AgentSpoolError("central dependency chain is invalid")
-    if role == "central_planner" and ("plan" in job or "executorResult" in job):
-        raise AgentSpoolError("planner has dependencies")
-    if role == "central_executor" and (
-        not isinstance(job.get("plan"), dict) or "executorResult" in job
-    ):
-        raise AgentSpoolError("executor plan is invalid")
-    if role == "central_reviewer" and (
-        not isinstance(job.get("plan"), dict) or not isinstance(job.get("executorResult"), dict)
-    ):
-        raise AgentSpoolError("reviewer dependencies are invalid")
-    return job
+    try:
+        return central_protocol.validate_central_job(job, directory.name)
+    except central_protocol.CentralProtocolError as error:
+        raise AgentSpoolError(str(error)) from None
 
 
 def _attachments(job: dict[str, object]) -> tuple[dict[str, object], ...]:
-    value = (
-        job.get("preparedInputs")
-        if job.get("kind") == "moodle-agent-job-v2"
-        else job.get("attachments")
-    )
+    if job.get("kind") == "moodle-agent-job-v2":
+        try:
+            return central_protocol.validate_prepared_inputs(job.get("preparedInputs"))
+        except central_protocol.CentralProtocolError as error:
+            raise AgentSpoolError(str(error)) from None
+    value = job.get("attachments")
     if not isinstance(value, list) or len(value) > 1000:
         raise AgentSpoolError("agent job attachments are invalid")
     result: list[dict[str, object]] = []
@@ -484,15 +609,6 @@ def _attachments(job: dict[str, object]) -> tuple[dict[str, object], ...]:
         if not isinstance(item, dict) or any(not isinstance(key, str) for key in item):
             raise AgentSpoolError("agent job attachment is invalid")
         attachment = cast(dict[str, object], item)
-        if job.get("kind") == "moodle-agent-job-v2":
-            if set(attachment) != {
-                "attachmentKey",
-                "filename",
-                "sizeBytes",
-                "sha256",
-                "path",
-            } or not _identity(attachment.get("attachmentKey"), "moodle-attachment-v1:"):
-                raise AgentSpoolError("central prepared input is invalid")
         filename = attachment.get("filename")
         size = attachment.get("sizeBytes")
         digest = attachment.get("sha256")
@@ -611,31 +727,7 @@ def _load_model_result(path: Path, phase: str) -> dict[str, object]:
 def _schema_for_job(job: dict[str, object]) -> dict[str, object]:
     if job.get("kind") != "moodle-agent-job-v2":
         return _RESULT_SCHEMA
-    role = cast(str, job["role"])
-    common = {
-        "succeeded": {"type": "boolean"},
-        "summary": {"type": "string", "minLength": 1, "maxLength": 16384},
-        "reportMarkdown": {"type": "string", "minLength": 1, "maxLength": 2000000},
-    }
-    if role == "central_planner":
-        properties = common | {"plan": {"type": "object"}}
-    elif role == "central_executor":
-        properties = common | {"evidence": {"type": "object"}}
-    else:
-        properties = common | {
-            "accepted": {"type": "boolean"},
-            "decisions": {"type": "object"},
-            "findings": {"type": "array", "items": {"type": "string"}},
-        }
-    # The wrapper, not the model schema, distinguishes bounded failures from
-    # complete successes.  That permits an operational failure to be durable.
-    return {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "additionalProperties": False,
-        "required": list(common),
-        "properties": properties,
-    }
+    return central_protocol.central_model_schema(job)
 
 
 def _load_central_model_result(path: Path, role: str) -> dict[str, object]:
@@ -644,27 +736,10 @@ def _load_central_model_result(path: Path, role: str) -> dict[str, object]:
         value = json.loads(raw)
     except json.JSONDecodeError as error:
         raise AgentSpoolError("Codex returned invalid central JSON") from error
-    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
-        raise AgentSpoolError("Codex returned invalid central result")
-    if (
-        not isinstance(value.get("succeeded"), bool)
-        or not isinstance(value.get("summary"), str)
-        or not isinstance(value.get("reportMarkdown"), str)
-    ):
-        raise AgentSpoolError("Codex returned invalid central result")
-    if not value["succeeded"]:
-        if set(value) != {"succeeded", "summary", "reportMarkdown"}:
-            raise AgentSpoolError("Codex returned invalid central failure")
-        return cast(dict[str, object], value)
-    if role == "central_planner":
-        required = {"succeeded", "summary", "reportMarkdown", "plan"}
-    elif role == "central_executor":
-        required = {"succeeded", "summary", "reportMarkdown", "evidence"}
-    else:
-        required = {"succeeded", "summary", "reportMarkdown", "accepted", "decisions", "findings"}
-    if set(value) != required:
-        raise AgentSpoolError("Codex returned invalid central result")
-    return cast(dict[str, object], value)
+    try:
+        return central_protocol.validate_central_model_result(value, role)
+    except central_protocol.CentralProtocolError as error:
+        raise AgentSpoolError(str(error)) from None
 
 
 def _wrap_central_result(
@@ -721,118 +796,28 @@ def _wrap_central_result(
 
 def _validate_central_model_context(job: dict[str, object], model: dict[str, object]) -> None:
     """Reject model data before it can create an artifact-bundle side effect."""
-    role = job.get("role")
-    succeeded = model.get("succeeded")
-    summary = model.get("summary")
-    report = model.get("reportMarkdown")
-    if (
-        role not in _CENTRAL_ROLES
-        or not isinstance(succeeded, bool)
-        or not isinstance(summary, str)
-        or not summary.strip()
-        or len(summary.encode("utf-8")) > 16_384
-        or not isinstance(report, str)
-        or len(report.encode("utf-8")) > _MAX_CENTRAL_RESULT_BYTES
-        or (succeeded and (not report.strip() or report.strip() == "# Informe"))
-    ):
-        raise AgentSpoolError("central model result is invalid")
-    if not succeeded:
-        return
-    if role == "central_planner":
-        _central_plan(model.get("plan"))
-        return
-    plan = job.get("plan")
-    if not isinstance(plan, dict):
-        raise AgentSpoolError("central model job context is invalid")
-    _central_plan(plan)
-    criteria = {
-        criterion["id"]
-        for criterion in cast(list[dict[str, object]], plan["acceptanceCriteria"])
-    }
-    if role == "central_executor":
-        evidence = model.get("evidence")
-        if (
-            not isinstance(evidence, dict)
-            or set(evidence) != criteria
-            or not all(
-                isinstance(key, str) and isinstance(value, str) and value.strip()
-                for key, value in evidence.items()
-            )
-        ):
-            raise AgentSpoolError("executor model evidence is invalid")
-        return
-    decisions = model.get("decisions")
-    findings = model.get("findings")
-    accepted = model.get("accepted")
-    if (
-        not isinstance(accepted, bool)
-        or not isinstance(decisions, dict)
-        or set(decisions) != criteria
-        or not all(
-            isinstance(key, str) and value in {"accepted", "rejected"}
-            for key, value in decisions.items()
-        )
-        or bool(accepted) != all(value == "accepted" for value in decisions.values())
-        or not isinstance(findings, list)
-        or len(findings) > 64
-        or not all(isinstance(item, str) and len(item.encode("utf-8")) <= 4096 for item in findings)
-    ):
-        raise AgentSpoolError("reviewer model result is invalid")
+    try:
+        central_protocol.validate_central_model_context(job, model)
+    except central_protocol.CentralProtocolError as error:
+        raise AgentSpoolError(str(error)) from None
 
 
 def _validate_central_result_context(job: dict[str, object], result: dict[str, object]) -> None:
     """Require a wrapped v2 result to remain bound to its immutable job."""
-    role = job.get("role")
-    if (
-        role not in _CENTRAL_ROLES
-        or result.get("kind") != "moodle-agent-result-v2"
-        or result.get("jobId") != job.get("jobId")
-        or result.get("role") != role
-    ):
-        raise AgentSpoolError("central result identity does not match job")
-    _validate_central_result(result, role)
-    if not result["succeeded"]:
-        return
-    if role == "central_planner":
-        return
-    plan = job.get("plan")
-    dependencies = job.get("dependencies")
-    if not isinstance(plan, dict) or not isinstance(dependencies, dict):
-        raise AgentSpoolError("central result job context is invalid")
-    _central_plan(plan)
-    plan_digest = hashlib.sha256(_canonical(plan)).hexdigest()
-    if dependencies.get("planDigest") != plan_digest:
-        raise AgentSpoolError("central result plan dependency is invalid")
-    criteria = {
-        criterion["id"]
-        for criterion in cast(list[dict[str, object]], plan["acceptanceCriteria"])
-    }
-    if role == "central_executor":
-        evidence = result.get("evidence")
-        if not isinstance(evidence, dict) or set(evidence) != criteria:
-            raise AgentSpoolError("executor criterion coverage is invalid")
-        return
-    decisions = result.get("decisions")
-    expected_digests = {
-        key: value for key, value in dependencies.items() if key.endswith("Digest")
-    }
-    if not isinstance(decisions, dict) or set(decisions) != criteria:
-        raise AgentSpoolError("reviewer criterion coverage is invalid")
-    if result.get("dependencyDigests") != expected_digests:
-        raise AgentSpoolError("reviewer dependency binding is invalid")
-    executor_result = job.get("executorResult")
-    if not isinstance(executor_result, dict):
-        raise AgentSpoolError("reviewer executor context is invalid")
-    _validate_central_result(executor_result, "central_executor")
-    if (
-        executor_result.get("jobId") != dependencies.get("executorJobId")
-        or executor_result.get("executorResultDigest") != dependencies.get("executorResultDigest")
-        or executor_result.get("artifactManifestDigest")
-        != dependencies.get("artifactManifestDigest")
-        or executor_result.get("artifactBundleDigest")
-        != dependencies.get("artifactBundleDigest")
-    ):
-        raise AgentSpoolError("reviewer executor dependency is invalid")
+    try:
+        central_protocol.validate_central_result_context(job, result)
+    except central_protocol.CentralProtocolError as error:
+        raise AgentSpoolError(str(error)) from None
+
+
+def _validate_central_model_result_binding(
+    job: dict[str, object], model: dict[str, object], wrapped_result: dict[str, object]
+) -> None:
+    try:
+        central_protocol.validate_central_model_result_binding(job, model, wrapped_result)
+    except central_protocol.CentralProtocolError as error:
+        raise AgentSpoolError(str(error)) from None
+
 
 
 def _collect_artifact_bundle(
@@ -950,18 +935,7 @@ def _collect_artifact_bundle(
 
 
 def _safe_output_path(value: str) -> bool:
-    if (
-        not value
-        or value.startswith("/")
-        or "\\" in value
-        or ":" in value
-        or "\x00" in value
-        or any(ord(character) < 32 for character in value)
-        or len(value.encode("utf-8")) > 240
-    ):
-        return False
-    parts = value.split("/")
-    return len(parts) <= 8 and all(part and part not in {".", ".."} for part in parts)
+    return central_protocol.safe_artifact_path(value)
 
 
 def _read_output_file(path: Path) -> bytes:
@@ -1212,6 +1186,54 @@ def _assert_bundle_quota(bundles: Path, pending: int, active: Path, lock: Path) 
         raise AgentSpoolError("bundle quota is unavailable") from error
     if total + pending > _MAX_BUNDLE_TOTAL:
         raise AgentSpoolError("bundle aggregate quota exceeded")
+    try:
+        _validate_bundles_storage_layout(bundles, lock)
+        # The active temporary is already in the real filesystem ledger.
+        # Linking it to its content-addressed name does not allocate another
+        # inode/block.
+        admit_owner_write(
+            bundles,
+            StorageDemand(0, 0),
+            _STORAGE_POLICY.bundles,
+            exclude=frozenset({lock.name}),
+        )
+    except StorageEnvelopeError as error:
+        raise AgentSpoolError("bundle directory is unsafe") from error
+
+
+def _validate_results_storage_layout(directory: Path) -> None:
+    try:
+        for entry in directory.iterdir():
+            if entry.name in {"bundles", ".retention", ".results.publish.lock"}:
+                continue
+            metadata = entry.lstat()
+            if (
+                entry.is_symlink()
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or re.fullmatch(r"[0-9a-f]{64}\.json", entry.name) is None
+            ):
+                raise StorageEnvelopeError("results storage layout is unsafe")
+    except OSError as error:
+        raise StorageEnvelopeError("results storage layout is unsafe") from error
+
+
+def _validate_bundles_storage_layout(bundles: Path, lock: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        for entry in bundles.iterdir():
+            if entry == lock:
+                continue
+            metadata = entry.lstat()
+            if (
+                entry.is_symlink()
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                raise StorageEnvelopeError("bundles storage layout is unsafe")
+    except OSError as error:
+        raise StorageEnvelopeError("bundles storage layout is unsafe") from error
 
 
 def _validate_bundle(path: Path, manifest: dict[str, object], digest: str) -> None:
@@ -1266,7 +1288,7 @@ def _validate_model_result(result: dict[str, object], phase: str) -> None:
         raise AgentSpoolError("successful execution has no report")
 
 
-def _publish_result(path: Path, data: bytes) -> None:
+def _publish_result(path: Path, data: bytes, *, terminal: bool = False) -> None:
     """Publish one complete regular result without ever replacing a prior result."""
     directory = path.parent
     try:
@@ -1282,8 +1304,16 @@ def _publish_result(path: Path, data: bytes) -> None:
     temporary: Path | None = None
     try:
         _recover_result_temporaries_locked(directory, lock)
+        _validate_results_storage_layout(directory)
         if path.exists() or path.is_symlink():
             raise AgentSpoolError("agent result path is unsafe")
+        admit_owner_write(
+            directory,
+            storage_demand_for_files(directory, (len(data),), 1),
+            _STORAGE_POLICY.results if terminal else _NORMAL_RESULTS_LIMIT,
+            exclude=frozenset({"bundles", ".retention", ".results.publish.lock"}),
+            root_headroom=not terminal,
+        )
         temporary = directory / f".{path.name}.{secrets.token_hex(16)}.tmp"
         _write_exclusive(temporary, data, 0o640)
         _fsync_bundle_file(temporary, 1)
@@ -1297,6 +1327,8 @@ def _publish_result(path: Path, data: bytes) -> None:
         temporary.unlink()
         _fsync_directory(directory)
         temporary = None
+    except StorageEnvelopeError as error:
+        raise AgentSpoolError("agent result directory is unsafe") from error
     except OSError as error:
         raise AgentSpoolError("could not publish agent result") from error
     finally:

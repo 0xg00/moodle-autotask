@@ -242,6 +242,41 @@ directories; it cannot read the approval database or application secret files. T
 pre-start refresher serializes concurrent refreshes, validates both JSON shapes, writes mode-`0600`
 files atomically, and never places secret values on a command line.
 
+The worker and agent are long-running services. Before normal approved-work processing or Codex
+execution, each cycle performs at most one bounded retention action. The worker explicitly uses
+`/var/lib/moodle-autotask`, `/var/lib/moodle-agent`,
+`/var/lib/moodle-agent/workspaces`, and
+`/var/spool/moodle-autotask/results/bundles`; scratch data expires after 24 hours, evidence after
+seven days, and candidate/scan passes are each capped at 1,024 entries. The agent receives its
+explicit bundles and agent-private retention roots. Durable terminal receipts and barriers remain
+immutable evidence: no service automatically sweeps terminal metadata.
+
+The supported controller root profile is 80 GiB or larger. First application deployment and every
+upgrade use `moodle-autotask-controller install` to create or exactly validate the separate 16 GiB
+agent-workspace image at `/var/lib/moodle-autotask-root/agent-workspaces.img`. Its dedicated parent
+is `root:root` mode `0700`, outside the controller-writable state tree. It is ext4 with at least
+100,000 inodes, ext4-rounded six-percent reserved blocks, and an exact `loop,nodev,nosuid` persistent mount at
+`/var/lib/moodle-agent/workspaces`. The installer fails closed on unsafe paths, non-empty bare
+workspaces, or any image/filesystem/mount mismatch; it does not migrate or delete workspace content.
+
+For an operational check, run `-Action Status` and inspect both services and their bounded-cycle
+records on the controller:
+
+```bash
+systemctl status moodle-autotask-worker.service moodle-autotask-agent.service --no-pager
+journalctl -u moodle-autotask-worker.service -u moodle-autotask-agent.service --no-pager -n 100
+```
+
+The JSON cycle records include the retention outcome; investigate a failed service or repeated
+non-idle retention result before changing files manually.
+
+The root health publisher additionally emits one storage dimension each minute: admission state,
+root free bytes/inodes, and workspace free bytes. Admission requires at least 12 GiB and 100,000
+free inodes on root, plus the exact mounted workspace with at least 2 GiB and 20,000 free inodes.
+`StorageAdmissionOpen` alarms after three consecutive failed/missing 60-second samples. Fresh
+cloud-init retains its pre-release bootstrap health publisher, so this storage alarm can remain
+missing/breaching until the first successful application deployment installs the canonical publisher.
+
 ## Link the central Codex agent
 
 Each deployment installs the pinned official Codex CLI archive only after verifying both the archive
@@ -426,6 +461,29 @@ VDI, and multiple appliance attachments remain fail-closed because their disk or
 licensing cannot be inferred safely from filenames. The bundled local `asix-router-lab.ova` is only
 a 76-byte routing fixture and is intentionally not a bootable image, so it must never be used for a
 live AWS import test.
+## CENTRAL terminal-failure retention
+
+The retention record for a terminal CENTRAL failure or reviewer rejection carries the
+actual ordered durable job prefix (one through three jobs), not a synthesized
+three-job chain. Controller preflight and agent deletion both verify its canonical
+jobs, results, input/workspace material, and any bound executor bundle before
+publishing an intent, barrier, or acknowledgement. A failure before any durable
+central result carries no provenance and therefore creates no retention plan.
+
+Scratch data is reclaimed through the existing two-owner protocol; an executor bundle
+is reclaimed only as evidence after delivery and the evidence TTL. Terminal intents,
+barriers, acknowledgements, and receipts remain immutable audit metadata, and a
+receipt suppresses replanning of the corresponding retained row.
+
+## Lab terminal retention
+
+HYBRID and IN_GUEST execution records retain the exact durable `lab_plan`/`lab_report` prefix,
+result digests, barriers, and, after dispatch, the canonical SSM dispatch record. The same
+two-owner protocol verifies every surviving input, job, result, workspace, and dispatch byte
+before deletion. A lost dispatch response remains `dispatch_unknown` and is reclaimed without
+inventing a command ID. Lab jobs and dispatch metadata share the bounded jobs quota and admission
+lock; capacity refusal occurs before input download, SSM dispatch, or partial publication.
+
 # Moodle draft finalization
 
 The worker journal has a durable `finalizing` state between exact draft verification and the

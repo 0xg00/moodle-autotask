@@ -14,12 +14,16 @@ from dataclasses import dataclass
 from hashlib import sha256
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, Literal, cast
 
+from moddle_autotask.adapters.aws import central_protocol, lab_protocol
 from moddle_autotask.domain.models import Digest, ExecutionMode, LabHandle
 
 from .path_safety import assert_no_indirection
-from .state import NotificationEvent, _event_from_json, _validate_identity
+from .state import NotificationEvent, _event_from_json, _event_id, _validate_identity
+
+if TYPE_CHECKING:
+    from moddle_autotask.adapters.aws.retention import PreparedTombstone
 
 
 class ApprovalStateError(RuntimeError):
@@ -91,8 +95,42 @@ class RetentionRecord:
     evidence_eligible_at: int | None
     central_job_ids: tuple[str, ...]
     bundle_digest: str | None
+    execution_family: str = "central"
+    barrier_ids: tuple[str, ...] = ()
+    dispatch_id: str | None = None
+    dispatch_digest: str | None = None
+    result_digests: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionCompletionReceipt:
+    tombstone_id: str
+    completed_at: int
+    event_id: str
+    target_phase: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionReconciliationPage:
+    cursor: tuple[int, str, str]
+    receipts: tuple[RetentionCompletionReceipt, ...]
     lab_phase_ids: tuple[str, ...] = ()
     dispatch_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionReconciliationResult:
+    """The one durable reconciliation state observed by a controller cycle."""
+
+    state: Literal["page", "wrapped", "empty_initial"]
+    page: RetentionReconciliationPage | None = None
+
+    def __post_init__(self) -> None:
+        if self.state == "page" and self.page is not None and self.page.receipts:
+            return
+        if self.state in {"wrapped", "empty_initial"} and self.page is None:
+            return
+        raise ValueError("retention reconciliation result is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +197,8 @@ class SubmissionNotification:
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32}$")
-_SCHEMA_VERSION = "5"
+_SCHEMA_VERSION = "7"
+_PREVIOUS_SCHEMA_VERSION = "6"
 _METADATA_SQL = "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 _REQUESTS_SQL = (
     "CREATE TABLE requests ("
@@ -217,6 +256,26 @@ _WORK_CLAIMABLE_INDEX_SQL = (
 )
 _OUTBOX_PENDING_INDEX_SQL = (
     "CREATE INDEX execution_outbox_pending_idx ON execution_outbox(delivered_at, created_at)"
+)
+_RETENTION_COMPLETIONS_SQL = (
+    "CREATE TABLE retention_completions ("
+    "event_id TEXT NOT NULL, target_phase TEXT NOT NULL CHECK (target_phase IN ('scratch','evidence')), "
+    "tombstone_id TEXT NOT NULL CHECK (length(tombstone_id) = 64 AND tombstone_id NOT GLOB '*[^0-9a-f]*'), "
+    "completed_at INTEGER NOT NULL CHECK (completed_at >= 0), "
+    "PRIMARY KEY(event_id, target_phase), FOREIGN KEY(event_id) REFERENCES requests(event_id))"
+)
+_RETENTION_COMPLETIONS_INDEX_SQL = (
+    "CREATE INDEX retention_completions_completed_idx ON retention_completions(completed_at, event_id)"
+)
+_RETENTION_RECONCILIATION_CURSOR_SQL = (
+    "CREATE TABLE retention_reconciliation_cursor ("
+    "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+    "completed_at INTEGER NOT NULL CHECK (completed_at >= -1), "
+    "event_id TEXT NOT NULL, "
+    "target_phase TEXT NOT NULL CHECK (target_phase IN ('','scratch','evidence')), "
+    "CHECK ((completed_at = -1 AND event_id = '' AND target_phase = '') OR "
+    "(completed_at >= 0 AND event_id != '' AND target_phase IN ('scratch','evidence')))"
+    ")"
 )
 _SUBMISSIONS_SQL_V4 = (
     "CREATE TABLE submissions (event_id TEXT PRIMARY KEY NOT NULL, manifest_digest TEXT NOT NULL, "
@@ -298,6 +357,9 @@ class ApprovalState:
                     connection.execute(_WORK_CLAIMABLE_INDEX_SQL)
                     connection.execute(_OUTBOX_SQL)
                     connection.execute(_OUTBOX_PENDING_INDEX_SQL)
+                    connection.execute(_RETENTION_COMPLETIONS_SQL)
+                    connection.execute(_RETENTION_COMPLETIONS_INDEX_SQL)
+                    connection.execute(_RETENTION_RECONCILIATION_CURSOR_SQL)
                     _create_submission_schema(connection)
                     connection.execute(
                         "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
@@ -305,6 +367,10 @@ class ApprovalState:
                     )
                     connection.execute(
                         "INSERT INTO telegram_cursor(singleton, next_update_id) VALUES (1, 0)"
+                    )
+                    connection.execute(
+                        "INSERT INTO retention_reconciliation_cursor "
+                        "(singleton, completed_at, event_id, target_phase) VALUES (1, -1, '', '')"
                     )
                 else:
                     version = connection.execute(
@@ -367,10 +433,42 @@ class ApprovalState:
                             "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                             (_SCHEMA_VERSION,),
                         )
+                        connection.execute(_RETENTION_COMPLETIONS_SQL)
+                        connection.execute(_RETENTION_COMPLETIONS_INDEX_SQL)
+                    elif version == ("5",):
+                        if not _valid_schema(connection, "5"):
+                            raise ApprovalStateError("approval state schema is corrupt")
+                        connection.execute(_RETENTION_COMPLETIONS_SQL)
+                        connection.execute(_RETENTION_COMPLETIONS_INDEX_SQL)
+                        connection.execute(
+                            "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                            (_SCHEMA_VERSION,),
+                        )
+                    elif version == (_PREVIOUS_SCHEMA_VERSION,):
+                        if not _valid_schema(connection, _PREVIOUS_SCHEMA_VERSION):
+                            raise ApprovalStateError("approval state schema is corrupt")
+                        connection.execute(_RETENTION_RECONCILIATION_CURSOR_SQL)
+                        connection.execute(
+                            "INSERT INTO retention_reconciliation_cursor "
+                            "(singleton, completed_at, event_id, target_phase) VALUES (1, -1, '', '')"
+                        )
+                        connection.execute(
+                            "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                            (_SCHEMA_VERSION,),
+                        )
                     elif version != (_SCHEMA_VERSION,) or not _valid_schema(
                         connection, _SCHEMA_VERSION
                     ):
                         raise ApprovalStateError("approval state schema is corrupt")
+                    if version in {("1",), ("2",), ("3",)}:
+                        connection.execute(_RETENTION_COMPLETIONS_SQL)
+                        connection.execute(_RETENTION_COMPLETIONS_INDEX_SQL)
+                    if version in {("1",), ("2",), ("3",), ("4",), ("5",)}:
+                        connection.execute(_RETENTION_RECONCILIATION_CURSOR_SQL)
+                        connection.execute(
+                            "INSERT INTO retention_reconciliation_cursor "
+                            "(singleton, completed_at, event_id, target_phase) VALUES (1, -1, '', '')"
+                        )
                 connection.execute("COMMIT")
             finally:
                 if connection.in_transaction:
@@ -708,12 +806,14 @@ class ApprovalState:
         central = claim.item.selected_mode is ExecutionMode.CENTRAL
         if (
             (central and succeeded and provenance is None)
-            or ((not central or not succeeded) and provenance is not None)
+            or (not central and provenance is None)
             or (provenance is not None and not isinstance(provenance, dict))
         ):
             raise ApprovalStateError("execution provenance is invalid")
         if provenance is not None:
             _validate_execution_provenance(provenance)
+            _validate_execution_provenance_binding(provenance, claim.item)
+            _validate_execution_provenance_outcome(provenance, succeeded)
         payload_value: dict[str, object] = {
             "reportMarkdown": report_markdown,
             "succeeded": succeeded,
@@ -797,7 +897,7 @@ class ApprovalState:
                 ).fetchone()
                 malformed = connection.execute(
                     "SELECT 1" + joined
-                    + "WHERE w.selected_mode = 'central' AND w.status = 'cleaned' AND ("
+                    + "WHERE w.status = 'cleaned' AND ("
                     "json_valid(o.payload) != 1 OR "
                     "CASE WHEN json_valid(o.payload) THEN "
                     "COALESCE(json_type(o.payload, '$.succeeded'), 'missing') "
@@ -810,32 +910,182 @@ class ApprovalState:
                     "ELSE 'invalid' END != 'text' OR "
                     "CASE WHEN json_valid(o.payload) THEN CASE WHEN "
                     "json_type(o.payload, '$.succeeded') = 'false' THEN CASE WHEN "
+                    "json_type(o.payload, '$.provenance') = 'object' THEN 0 ELSE CASE WHEN "
                     "(SELECT COUNT(*) FROM json_each(o.payload)) != 3 OR "
                     "(SELECT COUNT(DISTINCT key) FROM json_each(o.payload)) != 3 OR "
                     "(SELECT COUNT(*) FROM json_each(o.payload) "
                     "WHERE key IN ('succeeded','summary','reportMarkdown')) != 3 "
-                    "THEN 1 ELSE 0 END ELSE 0 END ELSE 1 END = 1) LIMIT 1"
+                    "THEN 1 ELSE 0 END END ELSE 0 END ELSE 1 END = 1) LIMIT 1"
                 ).fetchone()
                 if impossible is not None or malformed is not None:
                     raise ApprovalStateError("retention record is corrupt")
                 rows = connection.execute(
                     "SELECT r.event_id, r.task_key, r.revision_digest, r.payload, "
-                    "w.selected_mode, w.status, o.payload, o.created_at, o.delivered_at"
+                    "w.selected_mode, w.status, o.payload, o.created_at, o.delivered_at, "
+                    "w.specification_digest"
                     + joined
-                    + "WHERE w.selected_mode = 'central' AND w.status = 'cleaned' "
+                    + "WHERE w.status = 'cleaned' "
                     "AND json_valid(o.payload) = 1 "
-                    "AND json_type(o.payload, '$.succeeded') = 'true' "
+                    "AND ((w.selected_mode = 'central' AND ("
+                    "json_type(o.payload, '$.succeeded') = 'true' "
+                    "OR json_type(o.payload, '$.provenance') = 'object')) "
+                    "OR (w.selected_mode != 'central' "
+                    "AND json_type(o.payload, '$.provenance') = 'object')) "
+                    "AND NOT EXISTS (SELECT 1 FROM retention_completions c "
+                    "WHERE c.event_id = o.event_id AND c.target_phase = 'evidence') "
+                    "AND (NOT EXISTS (SELECT 1 FROM retention_completions c "
+                    "WHERE c.event_id = o.event_id AND c.target_phase = 'scratch') "
+                    "OR (o.delivered_at IS NOT NULL AND o.delivered_at + ? <= ? "
+                    "AND json_type(o.payload, '$.provenance.artifactBundleDigest') = 'text')) "
                     "ORDER BY o.created_at, o.event_id LIMIT ?",
-                    (limit,),
+                    (evidence_ttl, moment, limit),
                 ).fetchall()
-                records = [
-                    _retention_record(row, moment, scratch_ttl, evidence_ttl) for row in rows
-                ]
         except ApprovalStateError:
             raise
         except sqlite3.Error as error:
             raise ApprovalStateError("could not read retention records") from error
-        return tuple(records)
+        return tuple(_retention_record(row, moment, scratch_ttl, evidence_ttl) for row in rows)
+
+    def record_retention_completions(
+        self, completed: tuple[PreparedTombstone, ...], *, completed_at: int
+    ) -> bool:
+        """Atomically record exact terminal filesystem receipts without pruning audit rows."""
+        from moddle_autotask.adapters.aws.retention import PreparedTombstone
+
+        if (
+            type(completed_at) is not int
+            or completed_at < 0
+            or not isinstance(completed, tuple)
+            or not completed
+            or len(completed) > 10_000
+        ):
+            raise ApprovalStateError("retention completion is invalid")
+        seen: set[tuple[str, str]] = set()
+        for item in completed:
+            if (
+                not isinstance(item, PreparedTombstone)
+                or item.target_phase not in {"scratch", "evidence"}
+                or not isinstance(item.tombstone_id, str)
+                or _DIGEST.fullmatch(item.tombstone_id) is None
+                or item.event_id != _event_id(item.task_key, item.revision_digest)
+                or (item.target_phase == "scratch") != bool(item.job_ids)
+                or (item.target_phase == "evidence") != (item.bundle_digest is not None)
+                or (item.event_id, item.target_phase) in seen
+            ):
+                raise ApprovalStateError("retention completion is invalid")
+            seen.add((item.event_id, item.target_phase))
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                inserted = False
+                if not _valid_schema(connection, _SCHEMA_VERSION):
+                    raise ApprovalStateError("approval state schema is corrupt")
+                for item in completed:
+                    outbox = connection.execute(
+                        "SELECT 1 FROM execution_outbox WHERE event_id = ?", (item.event_id,)
+                    ).fetchone()
+                    if outbox is None:
+                        raise ApprovalStateError("retention completion is invalid")
+                    row = connection.execute(
+                        "SELECT tombstone_id FROM retention_completions "
+                        "WHERE event_id = ? AND target_phase = ?",
+                        (item.event_id, item.target_phase),
+                    ).fetchone()
+                    if row is None:
+                        connection.execute(
+                            "INSERT INTO retention_completions(event_id, target_phase, tombstone_id, completed_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (item.event_id, item.target_phase, item.tombstone_id, completed_at),
+                        )
+                        inserted = True
+                    elif row[0] != item.tombstone_id:
+                        raise ApprovalStateError("retention completion conflicts")
+                connection.execute("COMMIT")
+                return inserted
+        except ApprovalStateError:
+            raise
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not record retention completion") from error
+
+    def retention_reconciliation_page(self, *, limit: int) -> RetentionReconciliationResult:
+        """Read one durable completion-ledger page, wrapping only after its end."""
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("retention completion scan limit is invalid")
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if not _valid_schema(connection, _SCHEMA_VERSION):
+                    raise ApprovalStateError("approval state schema is corrupt")
+                cursor = _retention_reconciliation_cursor(connection)
+                rows = connection.execute(
+                    "SELECT tombstone_id, completed_at, event_id, target_phase "
+                    "FROM retention_completions WHERE completed_at > ? "
+                    "OR (completed_at = ? AND (event_id > ? "
+                    "OR (event_id = ? AND target_phase > ?))) "
+                    "ORDER BY completed_at, event_id, target_phase LIMIT ?",
+                    (cursor[0], cursor[0], cursor[1], cursor[1], cursor[2], limit),
+                ).fetchall()
+                wrapped = not rows and cursor != (-1, "", "")
+                if wrapped:
+                    connection.execute(
+                        "UPDATE retention_reconciliation_cursor SET completed_at = -1, "
+                        "event_id = '', target_phase = '' WHERE singleton = 1"
+                    )
+                connection.execute("COMMIT")
+        except ApprovalStateError:
+            raise
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not read retention completions") from error
+        receipts = tuple(_retention_completion_receipt(row) for row in rows)
+        if any(
+            current <= previous
+            for previous, current in zip(
+                ((cursor[0], cursor[1], cursor[2]), *(item_key(item) for item in receipts)),
+                (item_key(item) for item in receipts),
+                strict=False,
+            )
+        ):
+            raise ApprovalStateError("retention completion is corrupt")
+        if receipts:
+            return RetentionReconciliationResult(
+                "page", RetentionReconciliationPage(cursor, receipts)
+            )
+        if wrapped:
+            return RetentionReconciliationResult("wrapped")
+        return RetentionReconciliationResult("empty_initial")
+
+    def advance_retention_reconciliation(self, page: RetentionReconciliationPage) -> None:
+        """Persist the exact validated page boundary; an interrupted validation repeats it."""
+        if not isinstance(page, RetentionReconciliationPage) or not page.receipts:
+            raise ApprovalStateError("retention reconciliation page is invalid")
+        receipts = page.receipts
+        if any(
+            not isinstance(item, RetentionCompletionReceipt)
+            or item_key(item) <= page.cursor
+            for item in receipts
+        ) or any(
+            item_key(current) <= item_key(previous)
+            for previous, current in zip(receipts, receipts[1:], strict=False)
+        ):
+            raise ApprovalStateError("retention reconciliation page is invalid")
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if not _valid_schema(connection, _SCHEMA_VERSION):
+                    raise ApprovalStateError("approval state schema is corrupt")
+                if _retention_reconciliation_cursor(connection) != page.cursor:
+                    raise ApprovalStateError("retention reconciliation cursor changed")
+                last = receipts[-1]
+                connection.execute(
+                    "UPDATE retention_reconciliation_cursor SET completed_at = ?, event_id = ?, "
+                    "target_phase = ? WHERE singleton = 1",
+                    item_key(last),
+                )
+                connection.execute("COMMIT")
+        except ApprovalStateError:
+            raise
+        except sqlite3.Error as error:
+            raise ApprovalStateError("could not advance retention reconciliation") from error
 
     def pending_execution_notification(self) -> ExecutionNotification | None:
         try:
@@ -853,7 +1103,7 @@ class ApprovalState:
                     raise ApprovalStateError("stored execution completion is corrupt")
                 is_v2 = payload.get("kind") == "moodle-execution-outcome-v2"
                 if (str(row[2]) == "central" and bool(payload.get("succeeded")) and not is_v2) or (
-                    str(row[2]) != "central" and is_v2
+                    str(row[2]) != "central" and not is_v2
                 ):
                     raise ApprovalStateError("stored execution completion is corrupt")
                 expected = (
@@ -879,6 +1129,7 @@ class ApprovalState:
                     raise ApprovalStateError("stored execution completion is corrupt")
                 if provenance is not None:
                     _validate_execution_provenance(provenance)
+                    _validate_execution_provenance_outcome(provenance, succeeded)
                 return ExecutionNotification(event, succeeded, summary, report, provenance)
         except (ValueError, sqlite3.Error) as error:
             raise ApprovalStateError("could not read execution completion") from error
@@ -1657,7 +1908,7 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
         ("index", "sqlite_autoindex_callbacks_1", "callbacks", None),
         ("index", "sqlite_autoindex_callbacks_2", "callbacks", None),
     }
-    if version in {"2", "3", "4", _SCHEMA_VERSION}:
+    if version in {"2", "3", "4", "5", _PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}:
         expected.update(
             {
                 (
@@ -1676,7 +1927,7 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
                 ),
             }
         )
-    if version in {"3", "4", _SCHEMA_VERSION}:
+    if version in {"3", "4", "5", _PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}:
         expected.update(
             {
                 ("table", "execution_outbox", "execution_outbox", _OUTBOX_SQL),
@@ -1689,7 +1940,7 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
                 ),
             }
         )
-    if version in {"4", _SCHEMA_VERSION}:
+    if version in {"4", "5", _PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}:
         expected.update(
             {
                 (
@@ -1732,6 +1983,38 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
                 ),
             }
         )
+    if version in {_PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}:
+        expected.update(
+            {
+                (
+                    "table",
+                    "retention_completions",
+                    "retention_completions",
+                    _RETENTION_COMPLETIONS_SQL,
+                ),
+                (
+                    "index",
+                    "sqlite_autoindex_retention_completions_1",
+                    "retention_completions",
+                    None,
+                ),
+                (
+                    "index",
+                    "retention_completions_completed_idx",
+                    "retention_completions",
+                    _RETENTION_COMPLETIONS_INDEX_SQL,
+                ),
+            }
+        )
+    if version == _SCHEMA_VERSION:
+        expected.add(
+            (
+                "table",
+                "retention_reconciliation_cursor",
+                "retention_reconciliation_cursor",
+                _RETENTION_RECONCILIATION_CURSOR_SQL,
+            )
+        )
     actual = {
         (kind, name, table, sql if isinstance(sql, str) else None)
         for kind, name, table, sql in connection.execute(
@@ -1739,13 +2022,35 @@ def _valid_schema(connection: sqlite3.Connection, version: str) -> bool:
             "WHERE type IN ('table','index','view','trigger') AND name != 'sqlite_sequence'"
         )
     }
+    if actual != expected:
+        return False
     cursor = connection.execute("SELECT singleton, next_update_id FROM telegram_cursor").fetchall()
+    reconciliation_cursor = connection.execute(
+        "SELECT singleton, completed_at, event_id, target_phase "
+        "FROM retention_reconciliation_cursor"
+    ).fetchall() if version == _SCHEMA_VERSION else [()]
+    reconciliation_cursor_valid = False
+    if len(reconciliation_cursor) == 1:
+        reconciliation_row = cast(tuple[object, ...], reconciliation_cursor[0])
+        if len(reconciliation_row) == 4:
+            reconciliation_cursor_valid = (
+                reconciliation_row[0] == 1
+                and type(reconciliation_row[1]) is int
+                and reconciliation_row[1] >= 0
+                and isinstance(reconciliation_row[2], str)
+                and reconciliation_row[2] != ""
+                and reconciliation_row[3] in {"scratch", "evidence"}
+            )
     return (
-        actual == expected
-        and len(cursor) == 1
+        len(cursor) == 1
         and cursor[0][0] == 1
         and isinstance(cursor[0][1], int)
         and cursor[0][1] >= 0
+        and (
+            version != _SCHEMA_VERSION
+            or reconciliation_cursor == [(1, -1, "", "")]
+            or reconciliation_cursor_valid
+        )
         and not connection.execute("PRAGMA foreign_key_check").fetchone()
     )
 
@@ -1841,7 +2146,19 @@ def _provision_key(event: NotificationEvent, specification_digest: str) -> str:
 
 
 def _validate_execution_provenance(value: dict[str, object]) -> None:
-    """Strict v2 decoder: central outcomes never accept caller-defined metadata."""
+    """Strict decoder: execution outcomes never accept caller-defined metadata."""
+    if value.get("kind") == lab_protocol.LAB_PROVENANCE_KIND:
+        try:
+            lab_protocol.validate_provenance(value)
+        except lab_protocol.LabProtocolError as error:
+            raise ApprovalStateError("execution provenance is invalid") from error
+        return
+    if value.get("kind") == "moodle-central-provenance-v3":
+        try:
+            central_protocol.validate_terminal_provenance(value)
+        except central_protocol.CentralProtocolError as error:
+            raise ApprovalStateError("execution provenance is invalid") from error
+        return
     required = {
         "kind",
         "roles",
@@ -1909,12 +2226,105 @@ def _validate_execution_provenance(value: dict[str, object]) -> None:
         raise ApprovalStateError("execution provenance is invalid")
 
 
+def _validate_execution_provenance_binding(
+    provenance: dict[str, object], item: WorkItem
+) -> None:
+    expected: dict[str, object] = {
+        "selectedMode": item.selected_mode.value,
+        "specificationDigest": item.specification_digest.value,
+        "taskKey": item.event.task_key,
+        "revisionDigest": item.event.revision_digest,
+        "eventId": item.event.event_id,
+    }
+    if any(
+        key in provenance and provenance.get(key) != expected_value
+        for key, expected_value in expected.items()
+    ):
+        raise ApprovalStateError("execution provenance is invalid")
+
+
+def _validate_execution_provenance_outcome(
+    provenance: dict[str, object], succeeded: bool
+) -> None:
+    kind = provenance.get("kind")
+    if kind == "moodle-central-provenance-v2":
+        matches = succeeded
+    elif kind == "moodle-central-provenance-v3":
+        matches = not succeeded
+    elif kind == lab_protocol.LAB_PROVENANCE_KIND:
+        matches = (provenance.get("terminalStatus") == "succeeded") is succeeded
+    else:
+        matches = False
+    if not matches:
+        raise ApprovalStateError("execution provenance is invalid")
+
+
+def _retention_reconciliation_cursor(connection: sqlite3.Connection) -> tuple[int, str, str]:
+    rows = connection.execute(
+        "SELECT completed_at, event_id, target_phase FROM retention_reconciliation_cursor "
+        "WHERE singleton = 1"
+    ).fetchall()
+    if len(rows) != 1:
+        raise ApprovalStateError("retention reconciliation cursor is corrupt")
+    row = rows[0]
+    if len(row) != 3:
+        raise ApprovalStateError("retention reconciliation cursor is corrupt")
+    completed_at, event_id, target_phase = row
+    if (
+        type(completed_at) is not int
+        or not isinstance(event_id, str)
+        or target_phase not in {"", "scratch", "evidence"}
+        or (
+            (completed_at == -1 and (event_id != "" or target_phase != ""))
+            or (completed_at >= 0 and (not event_id or target_phase == ""))
+            or completed_at < -1
+        )
+    ):
+        raise ApprovalStateError("retention reconciliation cursor is corrupt")
+    return completed_at, event_id, target_phase
+
+
+def _retention_completion_receipt(row: tuple[object, ...]) -> RetentionCompletionReceipt:
+    if len(row) != 4:
+        raise ApprovalStateError("retention completion is corrupt")
+    tombstone_id, completed_at, event_id, target_phase = row
+    if (
+        not isinstance(tombstone_id, str)
+        or _DIGEST.fullmatch(tombstone_id) is None
+        or type(completed_at) is not int
+        or completed_at < 0
+        or not isinstance(event_id, str)
+        or not event_id.startswith("moodle-notification-event-v1:")
+        or _DIGEST.fullmatch(event_id.removeprefix("moodle-notification-event-v1:")) is None
+        or target_phase not in {"scratch", "evidence"}
+    ):
+        raise ApprovalStateError("retention completion is corrupt")
+    return RetentionCompletionReceipt(
+        tombstone_id, completed_at, event_id, target_phase
+    )
+
+
+def item_key(receipt: RetentionCompletionReceipt) -> tuple[int, str, str]:
+    return receipt.completed_at, receipt.event_id, receipt.target_phase
+
+
 def _retention_record(
     row: tuple[object, ...], now: int, scratch_ttl: int, evidence_ttl: int
 ) -> RetentionRecord:
-    if len(row) != 9:
+    if len(row) != 10:
         raise ApprovalStateError("retention record is corrupt")
-    event_id, task_key, revision_digest, event_payload, mode, status, payload, created, delivered = row
+    (
+        event_id,
+        task_key,
+        revision_digest,
+        event_payload,
+        mode,
+        status,
+        payload,
+        created,
+        delivered,
+        specification_digest,
+    ) = row
     if (
         not isinstance(event_id, str)
         or not isinstance(task_key, str)
@@ -1923,6 +2333,8 @@ def _retention_record(
         or mode not in {item.value for item in ExecutionMode}
         or status not in {"pending", "lab_pending", "ready", "failed", "cleaned"}
         or not isinstance(payload, str)
+        or not isinstance(specification_digest, str)
+        or _DIGEST.fullmatch(specification_digest) is None
         or type(created) is not int
         or created < 0
         or (delivered is not None and (type(delivered) is not int or delivered < created))
@@ -1943,6 +2355,12 @@ def _retention_record(
     succeeded = cast(bool, outcome["succeeded"])
     job_ids: tuple[str, ...] = ()
     bundle_digest: str | None = None
+    execution_family = "central"
+    barrier_ids: tuple[str, ...] = ()
+    dispatch_id: str | None = None
+    dispatch_digest: str | None = None
+    result_digests: tuple[str, ...] = ()
+    provenance: dict[str, object] | None = None
     if mode == ExecutionMode.CENTRAL.value and succeeded:
         if set(outcome) != required | {"kind", "provenance"}:
             raise ApprovalStateError("retention record is corrupt")
@@ -1952,8 +2370,66 @@ def _retention_record(
             raise ApprovalStateError("retention record is corrupt")
         provenance = cast(dict[str, object], outcome["provenance"])
         _validate_execution_provenance(provenance)
+        if provenance.get("specificationDigest") != specification_digest:
+            raise ApprovalStateError("retention record is corrupt")
         job_ids = tuple(cast(list[str], provenance["jobIds"]))
+        result_digests = (
+            cast(str, provenance["plannerResultDigest"]),
+            cast(str, provenance["executorResultDigest"]),
+            cast(str, provenance["reviewerResultDigest"]),
+        )
         bundle_digest = cast(str, provenance["artifactBundleDigest"])
+    elif mode == ExecutionMode.CENTRAL.value and not succeeded:
+        if set(outcome) == required:
+            pass
+        elif (
+            set(outcome) == required | {"kind", "provenance"}
+            and outcome.get("kind") == "moodle-execution-outcome-v2"
+            and isinstance(outcome.get("provenance"), dict)
+        ):
+            provenance = cast(dict[str, object], outcome["provenance"])
+            _validate_execution_provenance(provenance)
+            if provenance.get("kind") != "moodle-central-provenance-v3":
+                raise ApprovalStateError("retention record is corrupt")
+            if (
+                provenance.get("eventId") != event_id
+                or provenance.get("taskKey") != task_key
+                or provenance.get("revisionDigest") != revision_digest
+                or provenance.get("specificationDigest") != specification_digest
+            ):
+                raise ApprovalStateError("retention record is corrupt")
+            job_ids = tuple(cast(list[str], provenance["jobIds"]))
+            result_digests = tuple(cast(list[str], provenance["resultDigests"]))
+            bundle = provenance.get("artifactBundleDigest")
+            bundle_digest = cast(str | None, bundle)
+        else:
+            raise ApprovalStateError("retention record is corrupt")
+    elif mode in {ExecutionMode.IN_GUEST.value, ExecutionMode.HYBRID.value}:
+        if (
+            set(outcome) != required | {"kind", "provenance"}
+            or outcome.get("kind") != "moodle-execution-outcome-v2"
+            or not isinstance(outcome.get("provenance"), dict)
+        ):
+            raise ApprovalStateError("retention record is corrupt")
+        provenance = cast(dict[str, object], outcome["provenance"])
+        _validate_execution_provenance(provenance)
+        if (
+            provenance.get("kind") != lab_protocol.LAB_PROVENANCE_KIND
+            or provenance.get("selectedMode") != mode
+            or provenance.get("taskKey") != task_key
+            or provenance.get("revisionDigest") != revision_digest
+            or provenance.get("specificationDigest") != specification_digest
+        ):
+            raise ApprovalStateError("retention record is corrupt")
+        execution_family = "lab"
+        job_ids = tuple(cast(list[str], provenance["jobIds"]))
+        result_digests = tuple(cast(list[str], provenance["resultDigests"]))
+        barrier_ids = tuple(cast(list[str], provenance["barrierIds"]))
+        dispatch = provenance.get("dispatch")
+        if dispatch is not None:
+            dispatch_record = cast(dict[str, object], dispatch)
+            dispatch_id = cast(str, dispatch_record["dispatchId"])
+            dispatch_digest = cast(str, dispatch_record["dispatchDigest"])
     elif set(outcome) != required:
         raise ApprovalStateError("retention record is corrupt")
     valid_completion = (
@@ -1965,6 +2441,8 @@ def _retention_record(
     )
     if not valid_completion:
         raise ApprovalStateError("retention record is corrupt")
+    if provenance is not None:
+        _validate_execution_provenance_outcome(provenance, succeeded)
     scratch_at = created + scratch_ttl
     evidence_at = None if delivered is None else delivered + evidence_ttl
     return RetentionRecord(
@@ -1980,6 +2458,11 @@ def _retention_record(
         evidence_at,
         job_ids,
         bundle_digest,
+        execution_family,
+        barrier_ids,
+        dispatch_id,
+        dispatch_digest,
+        result_digests,
     )
 
 

@@ -45,7 +45,12 @@ without changing the EC2 client token. After readiness, a digest-bound filesyste
 only the approved assignment snapshot and verified non-appliance attachments to a separate
 `moodle-agent` user. Jobs and agent workspaces publish inputs only after a fully verified temporary
 directory is synced and renamed; startup revalidates prior inputs and replaces an incomplete stale
-directory before Codex can run. A root-owned Codex policy denies sandboxed commands access to the authentication
+directory before Codex can run. The agent workspace is an independently mounted, root-owned 16 GiB
+ext4 image under the dedicated `root:root` mode `0700` `/var/lib/moodle-autotask-root` parent,
+with `nodev,nosuid`; the agent cannot start unless that exact filesystem is mounted. Each runner
+holds its job-retention lock before the shared workspace admission lock, through materialization,
+Codex execution, validation, and result publication, preventing concurrent capacity admission.
+A root-owned Codex policy denies sandboxed commands access to the authentication
 cache and application secrets, disables tool network access, and prevents permission escalation.
 Central work is three fresh, stateless `central_planner`, `central_executor`, and
 `central_reviewer` jobs. The planner has no operational authority; its ordered plan binds the
@@ -54,7 +59,16 @@ manifest, and dependency digests. The collector accepts 1--64 regular files (2 M
 1,900,000 raw bytes) with canonical POSIX paths and publishes a deterministic stored ZIP under
 its SHA-256. Central success is impossible without reviewer acceptance, all role/result digests,
 and immutable bundle provenance. Telegram sends the reviewed Markdown and verified ZIP at least
-once; crashes between sends may duplicate them. Lab work first returns bounded PowerShell
+once; crashes between sends may duplicate them. Retention Phase B is an explicitly callable,
+crash-safe filesystem protocol, not a scheduled service: controller-private prepared/completed
+records and shared committed job barriers coordinate with agent-private intents/barriers/trash and
+agent-owned acknowledgement records. It validates canonical tombstones and fixed digest-named
+targets, deletes only its owner's trees, and leaves terminal receipts/barriers durable so the
+engine itself can suppress identical completed replays. The continuously running worker and agent
+each perform at most one bounded retention action before their ordinary work in every cycle: scratch
+data has a 24-hour TTL, evidence has a seven-day TTL, and each candidate/scan pass is capped at
+1,024 entries. Terminal metadata is intentionally immutable and is not automatically swept.
+Periodic wiring and installer directories remain outside this engine boundary. Lab work first returns bounded PowerShell
 commands; the worker validates the opaque handle and ownership tags, executes the plan with the
 official Systems Manager document, and sends the transcript back for an evidence-based final report.
 A guest-side execution marker makes retries idempotent and fails closed if a previous execution is
@@ -134,3 +148,26 @@ reaches the lab through the imported AMI pending a compatible OVA gate.
 the complete immutable request plus caller idempotency key, reconciles by that key, validates every
 opaque handle and ownership tag, and treats a lab as ready only after both EC2 and Systems Manager
 report it usable. Launch configuration is operator input, never data extracted from Moodle text.
+
+## CENTRAL terminal retention
+
+CENTRAL outcomes retain provenance only after a durable job/result exists. Successful
+three-role outcomes retain the existing v2 full-chain provenance. Failed or rejected
+outcomes use v3 provenance for the exact ordered durable prefix: planner only,
+planner/executor, or planner/executor/reviewer. The prefix binds the Moodle identity,
+prepared-input manifest, job IDs, completed result digests, terminal role and status;
+an executor bundle is bound only when it was durably produced.
+
+Retention deletes only that validated scratch prefix after the controller/agent
+two-owner acknowledgement protocol. A retained executor bundle is evidence-only and
+is eligible after delivery plus the evidence TTL. Durable intents, barriers,
+acknowledgements, and terminal receipts are audit records: they are never swept, and
+a receipt prevents a retained SQLite row from being planned again.
+
+HYBRID and IN_GUEST outcomes use an independent lab provenance contract. It binds the exact
+`lab_plan`/`lab_report` durable prefix, result digests, per-job barriers, and the immutable SSM
+dispatch record. Scratch retention validates that family-specific chain before the agent removes
+its workspaces/results and the controller removes its jobs/dispatch. Dispatch-unknown and capacity
+failures retain only the exact durable prefix; no missing job or command is synthesized. Lab job
+and dispatch publication share the jobs admission lock, so capacity is refused before input
+download or an SSM command.

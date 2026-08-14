@@ -28,51 +28,58 @@ fi
 if ! id --user ${project_name} >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/${project_name} --create-home --shell /usr/sbin/nologin ${project_name}
 fi
+if ! id --user moodle-agent >/dev/null 2>&1; then
+  useradd --system --home-dir /var/lib/moodle-agent --create-home --shell /usr/sbin/nologin moodle-agent
+fi
+! id -nG moodle-agent | tr ' ' '\n' | grep -Fxq ${project_name}
+! id -nG ${project_name} | tr ' ' '\n' | grep -Fxq moodle-agent
 
 install -d -o root -g root -m 0755 /opt/${project_name}
 install -d -o ${project_name} -g ${project_name} -m 0750 /var/lib/${project_name}
 install -d -o root -g ${project_name} -m 0750 /etc/${project_name}
 
-python3 - '${scheduler_config_base64}' /etc/${project_name}/scheduler.json ${project_name} <<'PY'
+python3 - '${scheduler_config_transport}' /etc/${project_name}/scheduler.json ${project_name} <<'PY'
 import base64
 import grp
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
 
 encoded, target, group = sys.argv[1:]
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate key")
-        result[key] = value
-    return result
 try:
-    raw = base64.b64decode(encoded, validate=True)
-    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
-except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+    fields = encoded.split(".")
+    if len(fields) < 2 or re.fullmatch(r"[1-9][0-9]{0,2}", fields[1]) is None:
+        raise ValueError("invalid transport")
+    mode, cap = fields[0], int(fields[1])
+    courses = [
+        base64.b64decode(item, validate=True).decode("utf-8") for item in fields[2:]
+    ]
+except (UnicodeDecodeError, ValueError) as error:
     raise SystemExit("invalid scheduler configuration") from error
-keys = set(value) if isinstance(value, dict) else set()
-courses = value.get("courseShortnames") if isinstance(value, dict) else None
-all_courses = value.get("allCourses") if isinstance(value, dict) else None
-cap = value.get("maxNewEventsPerCycle") if isinstance(value, dict) else None
 if (
-    (keys == {"courseShortnames", "maxNewEventsPerCycle"}
-     and isinstance(courses, list) and courses
+    (mode == "C" and courses
      and len(courses) <= 64
-     and all(isinstance(item, str) and item and len(item.encode("utf-8")) <= 255 and not any(ord(char) <= 0x1f or ord(char) == 0x7f for char in item) for item in courses)
+     and all(item and len(item.encode("utf-8")) <= 255 and not any(ord(char) <= 0x1f or ord(char) == 0x7f for char in item) for item in courses)
      and sum(len(item.encode("utf-8")) for item in courses) <= 2048
      and len(set(courses)) == len(courses))
-    or (keys == {"allCourses", "maxNewEventsPerCycle"} and all_courses is True)
+    or (mode == "A" and len(fields) == 2)
 ):
     pass
 else:
     raise SystemExit("scheduler scope must be explicit and unambiguous")
-if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 100:
+if not 1 <= cap <= 100:
     raise SystemExit("invalid scheduler event cap")
+value = (
+    {"courseShortnames": courses, "maxNewEventsPerCycle": cap}
+    if mode == "C"
+    else {"allCourses": True, "maxNewEventsPerCycle": cap}
+)
+raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+    "utf-8"
+)
 if len(raw) > 16 * 1024:
     raise SystemExit("scheduler configuration is too large")
 try:
@@ -237,12 +244,6 @@ RestrictSUIDSGID=true
 WantedBy=multi-user.target
 UNIT
 
-# Pre-created files are writable only through the owning service group.  The
-# directory itself is root-owned and non-writable, so applications cannot add
-# or replace heartbeat paths.
-if ! id --user moodle-agent >/dev/null 2>&1; then
-  useradd --system --home-dir /var/lib/moodle-agent --create-home --shell /usr/sbin/nologin moodle-agent
-fi
 install -d -o root -g root -m 0711 /run/${project_name}-health
 install -o root -g ${project_name} -m 0620 /dev/null /run/${project_name}-health/scheduler
 install -o root -g ${project_name} -m 0620 /dev/null /run/${project_name}-health/telegram

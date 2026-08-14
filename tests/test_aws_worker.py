@@ -30,7 +30,7 @@ from moddle_autotask.adapters.moodle.submission import (
     PermanentSubmissionOfferError,
 )
 from moddle_autotask.adapters.moodle.telegram import TelegramConfig
-from moddle_autotask.domain.models import ExecutionMode, LabHandle, LabProvisionRequest
+from moddle_autotask.domain.models import Digest, ExecutionMode, LabHandle, LabProvisionRequest
 from moddle_autotask.ports.contracts import LabReadiness
 
 
@@ -115,14 +115,23 @@ class _Broker:
         lab_handle: LabHandle | None,
         lab_executor: LabCommandExecutor,
     ) -> ExecutionProgress:
-        del event, prepared, lab_handle, lab_executor
+        del lab_handle, lab_executor
         self.calls.append(mode)
-        if mode is ExecutionMode.CENTRAL and self.progress.status == "succeeded":
+        if self.progress.status == "succeeded" and mode is ExecutionMode.CENTRAL:
+            provenance = dict(self.progress.provenance or _central_provenance())
+            provenance["specificationDigest"] = prepared.specification_digest
             return ExecutionProgress(
                 self.progress.status,
                 self.progress.summary,
                 self.progress.report_markdown,
-                self.progress.provenance or _central_provenance(),
+                provenance,
+            )
+        if self.progress.status == "succeeded" and mode is not ExecutionMode.CENTRAL:
+            return ExecutionProgress(
+                self.progress.status,
+                self.progress.summary,
+                self.progress.report_markdown,
+                self.progress.provenance or _lab_provenance(event, prepared, mode),
             )
         return self.progress
 
@@ -145,7 +154,7 @@ class _Transfer:
         return GuestInputReady("e" * 64, None, ())
 
 
-def _central_provenance() -> dict[str, object]:
+def _central_provenance(specification_digest: str = "d" * 64) -> dict[str, object]:
     manifest = {
         "kind": "artifact-manifest-v1",
         "files": [{"path": "report.md", "size": 1, "sha256": "0" * 64}],
@@ -163,7 +172,7 @@ def _central_provenance() -> dict[str, object]:
         "executorJobId": executor,
         "reviewerJobId": reviewer,
         "selectedMode": "central",
-        "specificationDigest": "d" * 64,
+        "specificationDigest": specification_digest,
         "preparedInputManifestDigest": "e" * 64,
         "planDigest": "f" * 64,
         "plannerResultDigest": "1" * 64,
@@ -174,6 +183,30 @@ def _central_provenance() -> dict[str, object]:
         "reviewerAccepted": True,
         "bundleLocator": f"bundles/{'3' * 64}.zip",
         "artifactManifest": manifest,
+    }
+
+
+def _lab_provenance(
+    event: NotificationEvent, prepared: PreparedAssignment, mode: ExecutionMode
+) -> dict[str, object]:
+    plan, report = "a" * 64, "b" * 64
+    return {
+        "kind": "moodle-lab-provenance-v1",
+        "selectedMode": mode.value,
+        "taskKey": event.task_key,
+        "revisionDigest": event.revision_digest,
+        "specificationDigest": prepared.specification_digest,
+        "phases": ["lab_plan", "lab_report"],
+        "jobIds": [plan, report],
+        "barrierIds": [plan, report],
+        "resultDigests": ["c" * 64, "d" * 64],
+        "terminalStatus": "succeeded",
+        "dispatch": {
+            "dispatchId": report,
+            "dispatchDigest": "e" * 64,
+            "state": "dispatched",
+            "commandId": "12345678-1234-1234-1234-123456789abc",
+        },
     }
 
 
@@ -497,7 +530,9 @@ def test_central_work_waits_for_agent_then_completes_exact_revision(tmp_path: Pa
     assert item is not None and item.status == "cleaned" and item.error_code is None
     assert broker.calls == [ExecutionMode.CENTRAL, ExecutionMode.CENTRAL]
     assert len(notifier.calls) == 1
-    assert notifier.calls[0][1].provenance == _central_provenance()
+    assert notifier.calls[0][1].provenance == _central_provenance(
+        Digest.of_json(notifier.calls[0][0].as_dict()).value
+    )
 
 
 def test_central_bundle_delivery_retries_after_zip_failure_without_marking_outbox(

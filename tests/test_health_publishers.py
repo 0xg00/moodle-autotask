@@ -24,6 +24,17 @@ _ROOT = Path(__file__).parents[1]
 _SERVICES = ("scheduler", "telegram", "worker", "agent")
 _GIDS = {"scheduler": 1001, "telegram": 1001, "worker": 1001, "agent": 1002}
 _THRESHOLDS = (180, 180, 3900, 2100)
+_BASE_METRICS = (
+    *("ServiceStateMatchesExpectation",) * 4,
+    "ControllerStateMatchesExpectation",
+    "ServicesExpectedRunning",
+)
+_STORAGE_METRICS = (
+    "StorageAdmissionOpen",
+    "RootFilesystemFreeBytes",
+    "RootFilesystemFreeInodes",
+    "WorkspaceFilesystemFreeBytes",
+)
 
 
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="Terraform is required")
@@ -266,20 +277,26 @@ def _assert_metric_batch(harness: _PublisherHarness, *, aggregate: int, expected
     ]
     assert arguments[6] == "--metric-data" and arguments[7].startswith("file://")
     metrics = harness.metrics()
-    assert [metric["MetricName"] for metric in metrics] == [
-        *("ServiceStateMatchesExpectation",) * 4,
-        "ControllerStateMatchesExpectation",
-        "ServicesExpectedRunning",
-    ]
-    assert len(metrics) == 6
-    for metric in metrics:
+    names = tuple(metric["MetricName"] for metric in metrics)
+    assert names in {_BASE_METRICS, _BASE_METRICS + _STORAGE_METRICS}
+    for index, metric in enumerate(metrics):
         dimensions = cast(list[dict[str, str]], metric["Dimensions"])
         assert dimensions[0] == {"Name": "InstanceId", "Value": "i-deadbeef"}
         assert dimensions[1] == {"Name": "Service", "Value": dimensions[1]["Value"]}
-        assert dimensions[1]["Value"] in {"aggregate", *_SERVICES}
+        expected_service = "storage" if index >= len(_BASE_METRICS) else None
+        if expected_service is None:
+            assert dimensions[1]["Value"] in {"aggregate", *_SERVICES}
+        else:
+            assert dimensions[1]["Value"] == expected_service
         assert set(metric) == {"MetricName", "Dimensions", "Value"}
-    assert metrics[-2]["Value"] == aggregate
-    assert metrics[-1]["Value"] == expected
+    assert metrics[4]["Value"] == aggregate
+    assert metrics[5]["Value"] == expected
+    if names == _BASE_METRICS + _STORAGE_METRICS:
+        assert metrics[6]["Value"] in {0, 1}
+        assert all(
+            isinstance(metric["Value"], int) and metric["Value"] >= 0
+            for metric in metrics[7:]
+        )
 
 
 def test_exact_generated_and_bootstrap_sources_pass_bash_syntax_check(tmp_path: Path) -> None:
@@ -292,7 +309,7 @@ def test_exact_generated_and_bootstrap_sources_pass_bash_syntax_check(tmp_path: 
 
 
 @pytest.mark.parametrize("publisher", ("generated_source", "bootstrap_source"))
-def test_inactive_services_publish_a_healthy_six_metric_batch(
+def test_inactive_services_publish_a_healthy_metric_batch(
     tmp_path: Path, publisher: str
 ) -> None:
     harness = _PublisherHarness(tmp_path)
@@ -418,7 +435,7 @@ def test_generated_restart_changes_remain_unhealthy_for_five_minutes_then_recove
     harness.precreate_pulses(10_301)
     recovered = harness.run(source, now=10_301)
     assert changed.returncode == under_300.returncode == recovered.returncode == 0
-    assert changed_metrics[-2]["Value"] == under_300_metrics[-2]["Value"] == 0
+    assert changed_metrics[4]["Value"] == under_300_metrics[4]["Value"] == 0
     assert changed_metrics[0]["Value"] == under_300_metrics[0]["Value"] == 0
     _assert_metric_batch(harness, aggregate=1, expected=1)
     assert [metric["Value"] for metric in harness.metrics()[:4]] == [1, 1, 1, 1]
