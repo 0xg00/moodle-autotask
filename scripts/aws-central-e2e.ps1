@@ -553,16 +553,16 @@ function Wait-ControllerState {
         if ($Gate -eq 'StartApproval') {
             $selectedMode = Get-OptionalPropertyValue -Object $state -Name 'selectedMode'
             if ($state.decision -eq 'approved' -and $selectedMode -eq 'central') { return $state }
-            if (-not $announced) { Write-Output 'Awaiting the real Telegram “Hacer tarea” approval for this exact run.'; $announced = $true }
+            if (-not $announced) { Write-Host 'Awaiting the real Telegram “Hacer tarea” approval for this exact run.'; $announced = $true }
         } elseif ($Gate -eq 'Execution') {
             if ($state.state -eq 'executed') { return $state }
-            if (-not $announced) { Write-Output 'Start approval received; awaiting planner, executor, and reviewer completion.'; $announced = $true }
+            if (-not $announced) { Write-Host 'Start approval received; awaiting planner, executor, and reviewer completion.'; $announced = $true }
         } else {
             $submission = Get-OptionalPropertyValue -Object $state -Name 'submission'
             $submissionStatus = Get-OptionalPropertyValue -Object $submission -Name 'status'
             if ($submissionStatus -eq 'submitted') { return $state }
             if ($submissionStatus -eq 'declined') { Fail 'The human declined the submission approval.' }
-            if (-not $announced) { Write-Output 'Awaiting the separate real Telegram “Entregar” approval; this harness never submits.'; $announced = $true }
+            if (-not $announced) { Write-Host 'Awaiting the separate real Telegram “Entregar” approval; this harness never submits.'; $announced = $true }
         }
         Start-Sleep -Seconds $PollSeconds
     }

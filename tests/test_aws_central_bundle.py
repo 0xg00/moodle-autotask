@@ -53,6 +53,18 @@ def test_collector_is_deterministic_and_reuses_exact_bundle(tmp_path: Path) -> N
     _validate_bundle(bundles / f"{digest}.zip", manifest, digest)
 
 
+@pytest.mark.parametrize("path", ["outputs/report.md", "OUTPUTS/report.md"])
+def test_collector_rejects_output_root_prefixed_expectation(
+    tmp_path: Path, path: str
+) -> None:
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "report.md").write_text("report", encoding="utf-8")
+
+    with pytest.raises(AgentSpoolError, match="expected artifact path"):
+        _collect_artifact_bundle(outputs, [path], tmp_path / "bundles")
+
+
 def test_collector_persists_new_bundle_before_removing_temporary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

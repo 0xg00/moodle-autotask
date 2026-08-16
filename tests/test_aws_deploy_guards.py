@@ -25,6 +25,8 @@ _CONTROLLER_FILES = (
     ("usr/local/sbin/moodle-autotask-install-codex", 0o750),
     ("usr/local/sbin/moodle-autotask-health-publish", 0o750),
     ("usr/local/sbin/moodle-autotask-health-prepare", 0o750),
+    ("usr/local/sbin/moodle-autotask-workspace-setup", 0o750),
+    ("etc/apparmor.d/moodle-autotask-bwrap", 0o644),
     ("etc/codex/requirements.toml", 0o644),
     ("etc/systemd/system/moodle-autotask-codex-login.service", 0o644),
     ("etc/systemd/system/moodle-autotask-agent.service", 0o644),
@@ -72,7 +74,10 @@ def _transported_commands(commands: list[str]) -> list[str]:
     ) in source
     assert "SSM commands must not contain NUL bytes." in source
     assert '$command.Replace("`r`n", "`n").Replace("`r", "`n")' in source
-    assert "$parameters = @{ commands = @($bashTransport) + $normalizedCommands }" in source
+    assert "$parameters = @{" in source
+    assert "commands = @($bashTransport) + $normalizedCommands" in source
+    assert "executionTimeout = @('2100')" in source
+    assert "'--timeout-seconds', '300'" in source
     normalized = [command.replace("\r\n", "\n").replace("\r", "\n") for command in commands]
     return [_BASH_TRANSPORT, *normalized]
 
@@ -165,9 +170,7 @@ def test_ssm_normalized_heredoc_runs_from_bin_sh(tmp_path: Path) -> None:
 def test_every_controller_ssm_action_uses_the_bash_first_command_contract() -> None:
     source = _DEPLOY.read_text(encoding="utf-8")
     transport = source.index("$bashTransport =")
-    parameters = source.index(
-        "$parameters = @{ commands = @($bashTransport) + $normalizedCommands }"
-    )
+    parameters = source.index("$parameters = @{")
 
     assert transport < parameters
     assert source.count("exec /bin/bash") == 1
@@ -259,6 +262,7 @@ class _RemoteHarness:
         self._fake("mktemp", self._once("/usr/bin/mktemp"))
         self._fake("cp", self._once("/bin/cp"))
         self._fake("mv", self._once("/bin/mv"))
+        self._fake("apparmor_parser", "#!/usr/bin/env bash\nexit 0\n")
         self._fake(
             "fault",
             "#!/usr/bin/env bash\n"
@@ -358,6 +362,7 @@ esac
             "run/moodle-autotask-health",
             "opt/moodle-autotask/current/venv/bin",
             "usr/local/sbin",
+            "etc/apparmor.d",
             "etc/codex",
             "etc/systemd/system",
         ):
@@ -419,6 +424,7 @@ esac
             "/run/moodle-autotask-health": self.root / "run/moodle-autotask-health",
             "/opt/moodle-autotask": self.root / "opt/moodle-autotask",
             "/usr/local/sbin": self.root / "usr/local/sbin",
+            "/etc/apparmor.d": self.root / "etc/apparmor.d",
             "/etc/systemd/system": self.root / "etc/systemd/system",
             "/etc/codex": self.root / "etc/codex",
         }
@@ -732,6 +738,7 @@ def test_literal_guard_contracts_remain_tied_to_the_deploy_payload() -> None:
         "restore_activation()",
         "restore_scheduler_config()",
         "restore_controller_install()",
+        "/usr/local/sbin/moodle-autotask-workspace-setup",
         'touch -d @0 -- "$path"',
         "systemctl enable --now moodle-autotask-health.timer",
         "ln -sfn '$releaseRoot' /opt/moodle-autotask/current.next",
@@ -798,7 +805,7 @@ def test_deploy_guard_backup_failures_are_nonzero_and_leave_no_candidates(
     assert not tuple(parent.glob(".health-marker.*"))
 
 
-def test_controller_guard_copies_and_restores_all_twelve_owned_files(tmp_path: Path) -> None:
+def test_controller_guard_copies_and_restores_all_fourteen_owned_files(tmp_path: Path) -> None:
     harness = _RemoteHarness(tmp_path)
     harness.set_states({"scheduler"}, {"scheduler"}, timer=(True, True))
     shutil.rmtree(harness.root / "opt/moodle-autotask/current")
@@ -823,7 +830,45 @@ def test_controller_guard_copies_and_restores_all_twelve_owned_files(tmp_path: P
     assert result.returncode != 0
     for target, (contents, mode) in expected.items():
         assert target.read_bytes() == contents
+        assert (target.stat().st_uid, target.stat().st_gid) == (0, 0)
         assert target.stat().st_mode & 0o777 == mode
+
+
+@pytest.mark.parametrize("tamper", ("symlink", "hardlink"))
+def test_controller_guard_rejects_workspace_helper_indirection_or_hardlink(
+    tmp_path: Path, tamper: str
+) -> None:
+    harness = _RemoteHarness(tmp_path)
+    harness.set_states({"scheduler"}, {"scheduler"}, timer=(True, True))
+    helper = harness.root / "usr/local/sbin/moodle-autotask-workspace-setup"
+    helper.write_bytes(b"previous-workspace-helper")
+    helper.chmod(0o750)
+    outside = harness.temporary / "outside-workspace-helper"
+    outside.write_bytes(b"outside")
+    helper.unlink()
+    if tamper == "symlink":
+        helper.symlink_to(outside)
+    else:
+        os.link(outside, helper)
+    prior = harness.snapshot()
+    payload = "\n".join(
+        (
+            "set -eu",
+            _function_payload("New-ControllerInstallGuardCommand"),
+            "false",
+        )
+    )
+
+    result = harness.run(payload)
+
+    assert result.returncode != 0
+    assert harness.snapshot() == prior
+    assert outside.read_bytes() == b"outside"
+    if tamper == "symlink":
+        assert helper.is_symlink()
+    else:
+        assert helper.stat().st_nlink == 2
+    _assert_no_deploy_backups(harness)
 
 
 def test_deploy_guard_rejects_malformed_config_and_marker_before_state_change(
@@ -889,6 +934,7 @@ def test_post_guard_deploy_failures_restore_the_complete_prior_machine(
     assert harness.snapshot() == prior
     for target, (contents, mode) in expected.items():
         assert target.read_bytes() == contents
+        assert (target.stat().st_uid, target.stat().st_gid) == (0, 0)
         assert target.stat().st_mode & 0o777 == mode
     _assert_no_deploy_backups(harness)
 
@@ -908,6 +954,7 @@ def test_post_guard_canonical_timer_enable_failure_restores_an_inactive_deployme
     assert harness.snapshot() == prior
     for target, (contents, mode) in expected.items():
         assert target.read_bytes() == contents
+        assert (target.stat().st_uid, target.stat().st_gid) == (0, 0)
         assert target.stat().st_mode & 0o777 == mode
     assert not (harness.root / "var/lib/moodle-autotask/health-enabled").exists()
     _assert_no_deploy_backups(harness)

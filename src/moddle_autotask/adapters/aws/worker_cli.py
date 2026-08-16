@@ -23,6 +23,8 @@ from .completion import TelegramExecutionNotifier
 from .image_imports import AwsImageImportConfig, AwsImageImporter
 from .input_transfer import AwsGuestInputTransfer
 from .labs import AwsCliJsonRunner, AwsEc2LabProvider, AwsLabConfig
+from .retention_fs import RetentionFilesystem, RetentionRoots
+from .retention_runtime import ControllerRetentionCoordinator, production_ownership
 from .worker import process_one
 
 
@@ -57,9 +59,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--agent-results", type=Path, default=Path("/var/spool/moodle-autotask/results")
     )
+    parser.add_argument(
+        "--retention-controller-private", type=Path, default=Path("/var/lib/moodle-autotask")
+    )
+    parser.add_argument(
+        "--retention-agent-private", type=Path, default=Path("/var/lib/moodle-agent")
+    )
+    parser.add_argument(
+        "--retention-workspaces", type=Path, default=Path("/var/lib/moodle-agent/workspaces")
+    )
+    parser.add_argument(
+        "--retention-bundles",
+        type=Path,
+        default=Path("/var/spool/moodle-autotask/results/bundles"),
+    )
+    parser.add_argument("--retention-scratch-ttl", type=int, default=86_400)
+    parser.add_argument("--retention-evidence-ttl", type=int, default=604_800)
+    parser.add_argument("--retention-candidate-limit", type=int, default=1_024)
+    parser.add_argument("--retention-scan-limit", type=int, default=1_024)
     parser.add_argument("--interval-seconds", type=int, default=15)
     args = parser.parse_args(argv)
-    if args.run != "run" or not 5 <= args.interval_seconds <= 3600:
+    if (
+        args.run != "run"
+        or not 5 <= args.interval_seconds <= 3600
+        or not 1 <= args.retention_scratch_ttl <= 90 * 24 * 3600
+        or not 1 <= args.retention_evidence_ttl <= 90 * 24 * 3600
+        or not 1 <= args.retention_candidate_limit <= 10_000
+        or not 1 <= args.retention_scan_limit <= 10_000
+    ):
         parser.error("run command and valid interval are required")
     try:
         state = ApprovalState(args.state)
@@ -95,11 +122,28 @@ def main(argv: list[str] | None = None) -> int:
             ),
             runner,
         )
+        retention_roots = RetentionRoots(
+            controller_private=args.retention_controller_private,
+            shared_jobs=args.agent_jobs,
+            agent_private=args.retention_agent_private,
+            agent_results=args.agent_results,
+            agent_workspaces=args.retention_workspaces,
+            agent_bundles=args.retention_bundles,
+        )
+        retention = ControllerRetentionCoordinator(
+            state,
+            RetentionFilesystem(retention_roots, production_ownership()),
+            scratch_ttl=args.retention_scratch_ttl,
+            evidence_ttl=args.retention_evidence_ttl,
+            candidate_limit=args.retention_candidate_limit,
+            scan_limit=args.retention_scan_limit,
+        )
         execution_broker = FileAgentBroker(
             args.agent_jobs,
             args.agent_results,
             args.region,
             runner,
+            controller_retention_root=args.agent_jobs / ".retention",
         )
         guest_input_transfer = AwsGuestInputTransfer(runner, args.region)
         telegram_config = TelegramConfig.from_file(args.telegram_config_file)
@@ -112,24 +156,28 @@ def main(argv: list[str] | None = None) -> int:
         owner = f"{socket.gethostname()}:{os.getpid()}"
         while True:
             pulse("worker")
-            cycle = process_one(
-                state,
-                provider,
-                owner=owner,
-                artifact_preparer=artifact_preparer,
-                image_importer=image_importer,
-                execution_broker=execution_broker,
-                execution_notifier=execution_notifier,
-                guest_input_transfer=guest_input_transfer,
-                submission_service=submission_service,
-                lease_seconds=3600,
-            )
+            retention_result = retention.cycle()
+            cycle = None
+            if retention_result == "idle":
+                cycle = process_one(
+                    state,
+                    provider,
+                    owner=owner,
+                    artifact_preparer=artifact_preparer,
+                    image_importer=image_importer,
+                    execution_broker=execution_broker,
+                    execution_notifier=execution_notifier,
+                    guest_input_transfer=guest_input_transfer,
+                    submission_service=submission_service,
+                    lease_seconds=3600,
+                )
             print(
                 json.dumps(
                     {
                         "kind": "approved-work-cycle-v1",
-                        "result": cycle.result,
-                        "mode": None if cycle.mode is None else cycle.mode.value,
+                        "result": retention_result if cycle is None else cycle.result,
+                        "mode": None if cycle is None or cycle.mode is None else cycle.mode.value,
+                        "retention": retention_result,
                     },
                     sort_keys=True,
                     separators=(",", ":"),

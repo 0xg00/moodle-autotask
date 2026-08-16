@@ -5,16 +5,17 @@ locals {
     telegram_secret_arn = aws_secretsmanager_secret.telegram_config.arn
     project_name        = var.project_name
     scheduler_interval  = 86400
-    scheduler_config_base64 = base64encode(
-      var.scheduler_all_courses ? jsonencode({
-        allCourses           = true
-        maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
-        }) : jsonencode({
-        courseShortnames     = var.scheduler_course_shortnames
-        maxNewEventsPerCycle = var.scheduler_max_new_events_per_cycle
-      })
-    )
+    scheduler_config_transport = join(".", concat(
+      [var.scheduler_all_courses ? "A" : "C", tostring(var.scheduler_max_new_events_per_cycle)],
+      [for shortname in var.scheduler_course_shortnames : base64encode(shortname)],
+    ))
   })
+  controller_user_data_base64 = base64encode(local.controller_user_data)
+  controller_user_data_bytes = 3 * floor(length(local.controller_user_data_base64) / 4) - (
+    endswith(local.controller_user_data_base64, "==") ? 2 : (
+      endswith(local.controller_user_data_base64, "=") ? 1 : 0
+    )
+  )
 }
 
 data "aws_ssm_parameter" "ubuntu_ami" {
@@ -38,7 +39,7 @@ resource "aws_instance" "controller" {
     ignore_changes = [user_data]
 
     precondition {
-      condition     = length(base64encode(local.controller_user_data)) <= 21848
+      condition     = local.controller_user_data_bytes <= 16384
       error_message = "Rendered controller user_data exceeds the EC2 16 KiB raw limit."
     }
   }

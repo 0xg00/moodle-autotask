@@ -214,18 +214,18 @@ function New-ControllerInstallGuardCommand {
     return @'
 if ! declare -F restore_release_set >/dev/null; then restore_release_set() { :; }; fi
 controller_guard_dir=""; controller_guard_complete=false; controller_current=""; controller_current_present=false; health_timer_unit_was_present=false; health_timer_was_enabled=false; health_timer_was_active=false
-controller_paths=(/usr/local/sbin/moodle-autotask-refresh-config /usr/local/sbin/moodle-autotask-install-codex /usr/local/sbin/moodle-autotask-health-publish /usr/local/sbin/moodle-autotask-health-prepare /etc/codex/requirements.toml /etc/systemd/system/moodle-autotask-codex-login.service /etc/systemd/system/moodle-autotask-agent.service /etc/systemd/system/moodle-autotask-scheduler.service /etc/systemd/system/moodle-autotask-worker.service /etc/systemd/system/moodle-autotask-telegram.service /etc/systemd/system/moodle-autotask-health.service /etc/systemd/system/moodle-autotask-health.timer)
-controller_modes=(750 750 750 750 644 644 644 644 644 644 644 644)
+controller_paths=(/usr/local/sbin/moodle-autotask-refresh-config /usr/local/sbin/moodle-autotask-install-codex /usr/local/sbin/moodle-autotask-health-publish /usr/local/sbin/moodle-autotask-health-prepare /usr/local/sbin/moodle-autotask-workspace-setup /etc/apparmor.d/moodle-autotask-bwrap /etc/codex/requirements.toml /etc/systemd/system/moodle-autotask-codex-login.service /etc/systemd/system/moodle-autotask-agent.service /etc/systemd/system/moodle-autotask-scheduler.service /etc/systemd/system/moodle-autotask-worker.service /etc/systemd/system/moodle-autotask-telegram.service /etc/systemd/system/moodle-autotask-health.service /etc/systemd/system/moodle-autotask-health.timer)
+controller_modes=(750 750 750 750 750 644 644 644 644 644 644 644 644 644)
 if [ -e /opt/moodle-autotask/current ] || [ -L /opt/moodle-autotask/current ]; then test -L /opt/moodle-autotask/current; controller_current="$(readlink /opt/moodle-autotask/current)"; [[ "$controller_current" =~ ^/opt/moodle-autotask/releases/[0-9a-f]{64}$ ]] && test -d "$controller_current" && test ! -L "$controller_current" || exit 1; controller_current_present=true; fi
 if systemctl cat moodle-autotask-health.timer >/dev/null 2>&1; then health_timer_unit_was_present=true; fi
 if systemctl is-enabled --quiet moodle-autotask-health.timer; then health_timer_was_enabled=true; fi
 if systemctl is-active --quiet moodle-autotask-health.timer; then health_timer_was_active=true; fi
 controller_guard_dir="$(mktemp -d /var/lib/moodle-autotask/.controller-install.previous.XXXXXX)"; chmod 0700 "$controller_guard_dir"; chown root:root "$controller_guard_dir"
 cleanup_controller_guard_candidate() { test -d "$controller_guard_dir" && test ! -L "$controller_guard_dir" && test "$(stat -c '%u:%a' "$controller_guard_dir")" = 0:700 || return; for index in "${!controller_paths[@]}"; do rm -f "$controller_guard_dir/$index" "$controller_guard_dir/$index.present"; done; rmdir "$controller_guard_dir" || true; }; trap 'cleanup_controller_guard_candidate; restore_release_set' EXIT
-for index in "${!controller_paths[@]}"; do path="${controller_paths[$index]}"; mode="${controller_modes[$index]}"; if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" && test "$(stat -c '%u:%a:%h' "$path")" = "0:$mode:1" || exit 1; cp -p "$path" "$controller_guard_dir/$index"; cmp -s "$path" "$controller_guard_dir/$index" && test "$(stat -c '%u:%a' "$controller_guard_dir/$index")" = "0:$mode" || exit 1; printf 1 >"$controller_guard_dir/$index.present"; else printf 0 >"$controller_guard_dir/$index.present"; fi; done
+for index in "${!controller_paths[@]}"; do path="${controller_paths[$index]}"; mode="${controller_modes[$index]}"; if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" && test "$(stat -c '%u:%g:%a:%h' "$path")" = "0:0:$mode:1" || exit 1; cp -p "$path" "$controller_guard_dir/$index"; cmp -s "$path" "$controller_guard_dir/$index" && test "$(stat -c '%u:%g:%a' "$controller_guard_dir/$index")" = "0:0:$mode" || exit 1; printf 1 >"$controller_guard_dir/$index.present"; else printf 0 >"$controller_guard_dir/$index.present"; fi; done
 controller_guard_complete=true
 trap - EXIT
-restore_controller_install() { if [ "$controller_guard_complete" = true ]; then if [ "$health_timer_unit_was_present" = false ]; then systemctl stop moodle-autotask-health.timer 2>/dev/null || true; systemctl disable moodle-autotask-health.timer 2>/dev/null || true; fi; for index in "${!controller_paths[@]}"; do path="${controller_paths[$index]}"; present="$(cat "$controller_guard_dir/$index.present")"; if [ "$present" = 1 ]; then if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" || return 1; fi; temporary="$(mktemp "$(dirname "$path")/.restore.XXXXXX")"; cp -p "$controller_guard_dir/$index" "$temporary"; mv -f "$temporary" "$path"; else if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" || return 1; rm -f "$path"; fi; fi; done; if [ "$controller_current_present" = true ]; then ln -sfn "$controller_current" /opt/moodle-autotask/current.restore; mv -Tf /opt/moodle-autotask/current.restore /opt/moodle-autotask/current; else rm -f /opt/moodle-autotask/current; fi; systemctl daemon-reload || return 1; if [ "$health_timer_unit_was_present" = true ]; then if [ "$health_timer_was_enabled" = true ]; then systemctl enable moodle-autotask-health.timer || return 1; else systemctl disable moodle-autotask-health.timer || return 1; fi; if [ "$health_timer_was_active" = true ]; then systemctl start moodle-autotask-health.timer || return 1; else systemctl stop moodle-autotask-health.timer || return 1; fi; fi; fi; }
+restore_controller_install() { if [ "$controller_guard_complete" = true ]; then if [ "$health_timer_unit_was_present" = false ]; then systemctl stop moodle-autotask-health.timer 2>/dev/null || true; systemctl disable moodle-autotask-health.timer 2>/dev/null || true; fi; for index in "${!controller_paths[@]}"; do path="${controller_paths[$index]}"; present="$(cat "$controller_guard_dir/$index.present")"; if [ "$present" = 1 ]; then if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" || return 1; fi; temporary="$(mktemp "$(dirname "$path")/.restore.XXXXXX")"; cp -p "$controller_guard_dir/$index" "$temporary"; mv -f "$temporary" "$path"; else if [ -e "$path" ] || [ -L "$path" ]; then test -f "$path" && test ! -L "$path" || return 1; if [ "$path" = /etc/apparmor.d/moodle-autotask-bwrap ]; then apparmor_parser -R "$path" 2>/dev/null || true; fi; rm -f "$path"; fi; fi; done; if [ "$(cat "$controller_guard_dir/5.present")" = 1 ]; then apparmor_parser -r /etc/apparmor.d/moodle-autotask-bwrap || return 1; fi; if [ "$controller_current_present" = true ]; then ln -sfn "$controller_current" /opt/moodle-autotask/current.restore; mv -Tf /opt/moodle-autotask/current.restore /opt/moodle-autotask/current; else rm -f /opt/moodle-autotask/current; fi; systemctl daemon-reload || return 1; if [ "$health_timer_unit_was_present" = true ]; then if [ "$health_timer_was_enabled" = true ]; then systemctl enable moodle-autotask-health.timer || return 1; else systemctl disable moodle-autotask-health.timer || return 1; fi; if [ "$health_timer_was_active" = true ]; then systemctl start moodle-autotask-health.timer || return 1; else systemctl stop moodle-autotask-health.timer || return 1; fi; fi; fi; }
 cleanup_controller_install() { cleanup_controller_guard_candidate; }
 '@
 }
@@ -363,7 +363,7 @@ function Wait-SsmCommand {
     )
 
     $terminalStatuses = @('Success', 'Cancelled', 'TimedOut', 'Failed', 'Cancelling')
-    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+    for ($attempt = 0; $attempt -lt 1200; $attempt++) {
         Start-Sleep -Seconds 2
         try {
             $response = Invoke-Aws -Arguments @(
@@ -393,7 +393,7 @@ function Wait-SsmCommand {
         return
     }
 
-    throw 'SSM command did not finish within 180 seconds.'
+    throw 'SSM command did not finish within 2400 seconds.'
 }
 
 function Send-ControllerCommand {
@@ -419,7 +419,10 @@ function Send-ControllerCommand {
             $command.Replace("`r`n", "`n").Replace("`r", "`n")
         }
     )
-    $parameters = @{ commands = @($bashTransport) + $normalizedCommands } | ConvertTo-Json -Compress
+    $parameters = @{
+        commands = @($bashTransport) + $normalizedCommands
+        executionTimeout = @('2100')
+    } | ConvertTo-Json -Compress
     $parametersPath = Join-Path $runtimeRoot "ssm-$([Guid]::NewGuid().ToString('N')).json"
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($parametersPath, $parameters, $utf8NoBom)
@@ -432,7 +435,7 @@ function Send-ControllerCommand {
                 '--document-name', 'AWS-RunShellScript',
                 '--comment', $Comment,
                 '--parameters', $parametersUri,
-                '--timeout-seconds', '180',
+                '--timeout-seconds', '300',
                 '--query', 'Command.CommandId',
                 '--output', 'text'
             )
@@ -496,15 +499,27 @@ if ($Action -eq 'CodexLogin') {
 if ($Action -eq 'CodexSmoke') {
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Verify isolated Codex authentication' -Commands @(
         'set -eu',
+        'codex_target="$(readlink -f /usr/local/bin/moodle-autotask-codex)"',
+        'test "$codex_target" = /opt/moodle-autotask/codex/package-0.147.0/bin/codex',
+        'test "$(sha256sum "$(dirname "$codex_target")/codex-code-mode-host" | cut -d '' '' -f 1)" = 00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6',
         'test "$(stat -c ''%U:%G:%a'' /var/lib/moodle-agent/.codex/auth.json)" = "moodle-agent:moodle-agent:600"',
         'test "$(stat -c ''%U:%G:%a'' /etc/codex/requirements.toml)" = "root:root:644"',
+        'test "$(stat -c ''%U:%G:%a:%h'' /etc/apparmor.d/moodle-autotask-bwrap)" = "root:root:644:1"',
+        'grep -Fqx ''moodle-autotask-bwrap (unconfined)'' /sys/kernel/security/apparmor/profiles',
         '! id -nG moodle-agent | tr '' '' ''\n'' | grep -Fxq moodle-autotask',
         'if runuser -u moodle-agent -- test -r /etc/moodle-autotask/moodle-token.json; then echo secret-boundary-failed; exit 1; fi',
-        'install -d -o moodle-agent -g moodle-agent -m 0700 /var/lib/moodle-agent/smoke',
-        'runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex sandbox --permission-profile moodle-autotask --include-managed-config -C /var/lib/moodle-agent/smoke -- sh -c ''test ! -r /var/lib/moodle-agent/.codex/auth.json && test ! -r /etc/moodle-autotask/moodle-token.json && test -w /var/lib/moodle-agent/smoke''',
-        'result="$(timeout 120s runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex exec --ephemeral --skip-git-repo-check --color never -C /var/lib/moodle-agent/smoke ''Reply with exactly: CODEX_SMOKE_OK'')"',
+        'smoke="$(mktemp -d /var/lib/moodle-agent/.codex-smoke.XXXXXX)"; chown moodle-agent:moodle-agent "$smoke"; chmod 0700 "$smoke"',
+        'cleanup_smoke() { result=$?; trap - EXIT; if [ -n "${smoke:-}" ] && test -d "$smoke" && test ! -L "$smoke" && test "$(stat -c ''%U:%G:%a'' "$smoke")" = moodle-agent:moodle-agent:700 && test -z "$(find "$smoke" -xdev -type l -print -quit)"; then rm -rf -- "$smoke"; fi; exit "$result"; }; trap cleanup_smoke EXIT',
+        'runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex sandbox --permission-profile moodle-autotask --include-managed-config -C "$smoke" -- sh -c ''test ! -r /var/lib/moodle-agent/.codex/auth.json && test ! -r /etc/moodle-autotask/moodle-token.json && test -w "$PWD"''',
+        'result="$(timeout 240s systemd-run --quiet --wait --pipe --collect --uid=moodle-agent --gid=moodle-agent --working-directory="$smoke" --setenv=HOME=/var/lib/moodle-agent --setenv=CODEX_HOME=/var/lib/moodle-agent/.codex -p UMask=0027 -p NoNewPrivileges=true -p PrivateDevices=true -p PrivateTmp=true -p ProtectControlGroups=true -p ProtectHome=true -p ProtectKernelModules=true -p ProtectKernelTunables=true -p ProtectSystem=strict -p "ReadOnlyPaths=/var/spool/moodle-autotask/jobs /etc/codex" -p "ReadWritePaths=/var/lib/moodle-agent /var/spool/moodle-autotask/results /run/moodle-autotask-health" -p "IPAddressDeny=169.254.169.254/32" -p "IPAddressDeny=fd00:ec2::254/128" -p "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" -p RestrictSUIDSGID=true /usr/bin/timeout 180s /usr/local/bin/moodle-autotask-codex exec --ephemeral --skip-git-repo-check --color never -C "$smoke" "Use the shell tool to create outputs/sandbox-proof.txt with exactly SANDBOX_PROOF_OK followed by one newline. Read the file back. Reply exactly CODEX_SMOKE_OK only after the file is verified.")"',
         'test "$result" = "CODEX_SMOKE_OK"',
+        'test "$(find "$smoke" -mindepth 1 -printf ''%P\n'' | LC_ALL=C sort)" = "$(printf ''%s\n'' outputs outputs/sandbox-proof.txt)"',
+        'test -d "$smoke/outputs" && test ! -L "$smoke/outputs" && test "$(stat -c ''%U:%G:%a'' "$smoke/outputs")" = moodle-agent:moodle-agent:750',
+        'test -f "$smoke/outputs/sandbox-proof.txt" && test ! -L "$smoke/outputs/sandbox-proof.txt" && test "$(stat -c ''%U:%G:%a:%h'' "$smoke/outputs/sandbox-proof.txt")" = moodle-agent:moodle-agent:640:1',
+        'test "$(sha256sum "$smoke/outputs/sandbox-proof.txt" | cut -d '' '' -f 1)" = e09474671b51ea728018129b4befad154fc407e0729bc0b2856cdf2af576a1b6',
+        'trap - EXIT; rm -rf -- "$smoke"; smoke=',
         'echo codex-smoke=ok',
+        'echo codex-code-mode-host=verified',
         'echo codex-sandbox=isolated',
         'echo auth-permissions=private',
         'echo application-secrets=unreadable'

@@ -26,10 +26,12 @@ from moddle_autotask.domain.models import (
 )
 from moddle_autotask.ports.contracts import LabProvider, LabReadiness
 
+from . import central_protocol
 from .agent_spool import ExecutionBroker, ExecutionProgress, LabCommandExecutor
 from .artifacts import PreparedAssignment
 from .image_imports import ImageImportReadiness, ImageImportResult
 from .input_transfer import GuestCommandExecutor, GuestInputReady
+from .storage_quota import StorageCapacityError
 
 
 class ArtifactPreparer(Protocol):
@@ -127,6 +129,16 @@ def process_one(
         return cycle
     except ApprovalStateError:
         raise
+    except StorageCapacityError:
+        if not state.retry_work(
+            claim,
+            "storage_capacity",
+            _retry_delay(claim.item.attempts),
+            now=now,
+            exhaustible=False,
+        ):
+            return WorkerCycle("ownership_lost", claim.item.selected_mode)
+        return WorkerCycle("storage_capacity", claim.item.selected_mode)
     except (OSError, RuntimeError, ValueError):
         if _is_cleanup_claim(claim, execution_broker):
             error_code = (
@@ -182,6 +194,18 @@ def _process_claim(
         return WorkerCycle("lab_cleaned", item.selected_mode)
     if item.status == "pending":
         if item.selected_mode is ExecutionMode.CENTRAL:
+            try:
+                central_protocol.validate_declared_prepared_input_envelope(
+                    tuple(
+                        (attachment.filename, attachment.size_bytes)
+                        for attachment in item.event.attachments
+                        if not attachment.is_lab_artifact
+                    )
+                )
+            except central_protocol.CentralProtocolError:
+                if not state.fail_work(claim, "central_input_envelope_invalid", now=now):
+                    return WorkerCycle("ownership_lost", item.selected_mode)
+                return WorkerCycle("central_input_envelope_invalid", item.selected_mode)
             if not state.mark_ready(claim, now=now, for_execution=execution_broker is not None):
                 return WorkerCycle("ownership_lost", item.selected_mode)
             return WorkerCycle("central_ready", item.selected_mode)
