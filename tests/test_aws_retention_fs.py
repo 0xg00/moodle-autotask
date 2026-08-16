@@ -1298,6 +1298,13 @@ def test_hard_byte_boundary_admits_exactly_and_refuses_one_byte_less(tmp_path: P
 @_POSIX_ONLY
 def test_chain_admission_serializes_one_soft_capacity_slot(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
+    retention_fs._ensure_dirs(
+        engine.roots.controller_private,
+        engine._controller_anchor_dir,
+        (engine._prepared, engine._controller_private_dir),
+        (engine._completed, engine._controller_private_dir),
+        (engine._deleting, engine._controller_private_dir),
+    )
     engine.storage_policy = _quota_policy(
         controller_soft=StorageLimit(1 << 30, 5),
     )
