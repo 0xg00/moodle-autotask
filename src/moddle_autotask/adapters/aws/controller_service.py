@@ -89,6 +89,7 @@ def install_controller_services(
     health = _health_publisher_script(region)
     health_prepare = _health_prepare_script()
     workspace_setup = _workspace_setup_script()
+    bwrap_profile = _bwrap_apparmor_profile()
     _write(root, Path("usr/local/sbin/moodle-autotask-refresh-config"), refresh, 0o750)
     _write(
         root,
@@ -131,6 +132,12 @@ def install_controller_services(
     _write(root, Path("usr/local/sbin/moodle-autotask-health-publish"), health, 0o750)
     _write(root, Path("usr/local/sbin/moodle-autotask-health-prepare"), health_prepare, 0o750)
     _write(root, Path("usr/local/sbin/moodle-autotask-workspace-setup"), workspace_setup, 0o750)
+    _write(
+        root,
+        Path("etc/apparmor.d/moodle-autotask-bwrap"),
+        bwrap_profile,
+        0o644,
+    )
     _write(
         root,
         Path("etc/systemd/system/moodle-autotask-health.service"),
@@ -180,6 +187,18 @@ def main(argv: list[str] | None = None) -> int:
             args.vmimport_role_name,
         )
         install_controller_services(Path("/"), args.region, args.environment, config)
+        subprocess.run(
+            [
+                "/usr/sbin/apparmor_parser",
+                "-r",
+                "/etc/apparmor.d/moodle-autotask-bwrap",
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
         subprocess.run(
             ["/usr/local/sbin/moodle-autotask-workspace-setup"],
             check=True,
@@ -731,7 +750,9 @@ if ! command -v bwrap >/dev/null 2>&1; then
   apt-get install -y --no-install-recommends bubblewrap
 fi
 bwrap_path="$(command -v bwrap)"
-test -x "$bwrap_path"
+test "$bwrap_path" = /usr/bin/bwrap
+test -x "$bwrap_path" && test ! -L "$bwrap_path"
+test "$(stat -c '%U:%G:%a:%h' "$bwrap_path")" = root:root:755:1
 ln -sfn "$install_target" /usr/local/bin/moodle-autotask-codex.next
 mv -Tf /usr/local/bin/moodle-autotask-codex.next \
   /usr/local/bin/moodle-autotask-codex
@@ -806,6 +827,19 @@ def _codex_login_unit() -> str:
             "",
         )
     )
+
+
+def _bwrap_apparmor_profile() -> str:
+    return """# Allow the root-owned bubblewrap binary to create Codex user namespaces.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile moodle-autotask-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/moodle-autotask-bwrap>
+}
+"""
 
 
 def _health_publisher_script(region: str) -> str:
@@ -1598,7 +1632,7 @@ def _agent_unit() -> str:
             "/run/moodle-autotask-health",
             "IPAddressDeny=169.254.169.254/32",
             "IPAddressDeny=fd00:ec2::254/128",
-            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
             "RestrictSUIDSGID=true",
             "",
             "[Install]",

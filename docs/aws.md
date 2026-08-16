@@ -299,6 +299,9 @@ A root-owned `/etc/codex/requirements.toml` forces approval policy `never`, disa
 network access, permits only the managed workspace profile, and denies sandboxed commands any read
 access to both `/var/lib/moodle-agent/.codex` and `/etc/moodle-autotask`. The systemd unit also blocks
 both EC2 Instance Metadata Service addresses, so the agent cannot obtain the controller role credentials.
+Ubuntu's user-namespace restriction is kept enabled. A root-owned AppArmor profile grants only the
+root-owned `/usr/bin/bwrap` executable permission to create the namespaces used by Codex, and the
+agent unit admits `AF_NETLINK` solely so bubblewrap can configure its isolated loopback interface.
 
 Central jobs are not a conversational terminal session. The spool executes three isolated Codex
 invocations (`central_planner`, `central_executor`, `central_reviewer`) with different job IDs and
@@ -326,9 +329,11 @@ change, or a refresh failure. Never copy, print, commit, or place `auth.json` in
 `-Action Status` reports only `authenticated` or `unauthenticated`; it never returns tokens. The login
 unit is transient and cannot read the Moodle or Telegram secret directory.
 
-After linking, run the live smoke test. It checks the root-owned policy and cache permissions, proves
-inside the actual Codex sandbox that neither the Codex cache nor Moodle token is readable, and makes
-one ephemeral Codex request:
+After linking, run the live smoke test. It checks the AppArmor profile, root-owned policy, and cache
+permissions; proves inside the actual Codex sandbox that neither the Codex cache nor Moodle token is
+readable; then launches one ephemeral Codex request under the same systemd restrictions as the agent.
+That request must use Code Mode to create an exact file, which the smoke test verifies by type,
+ownership, mode, link count, path set, and SHA-256 before removing its temporary workspace:
 
 ```powershell
 .\scripts\aws-deploy.ps1 `

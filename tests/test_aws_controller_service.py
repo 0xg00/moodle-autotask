@@ -43,6 +43,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     telegram = tmp_path / "etc/systemd/system/moodle-autotask-telegram.service"
     health = tmp_path / "usr/local/sbin/moodle-autotask-health-publish"
     workspace_setup = tmp_path / "usr/local/sbin/moodle-autotask-workspace-setup"
+    bwrap_profile = tmp_path / "etc/apparmor.d/moodle-autotask-bwrap"
     health_unit = tmp_path / "etc/systemd/system/moodle-autotask-health.service"
     health_timer = tmp_path / "etc/systemd/system/moodle-autotask-health.timer"
     refresh_text = refresh.read_text(encoding="utf-8")
@@ -53,6 +54,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     agent_text = agent.read_text(encoding="utf-8")
     health_text = health.read_text(encoding="utf-8")
     workspace_setup_text = workspace_setup.read_text(encoding="utf-8")
+    bwrap_profile_text = bwrap_profile.read_text(encoding="utf-8")
 
     assert "moodle-autotask/development/moodle-token" in refresh_text
     assert "moodle-autotask/development/telegram-config" in refresh_text
@@ -205,7 +207,11 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "if ! command -v bwrap >/dev/null 2>&1; then" in codex_installer_text
     assert "apt-get install -y --no-install-recommends bubblewrap" in codex_installer_text
     assert 'bwrap_path="$(command -v bwrap)"' in codex_installer_text
-    assert 'test -x "$bwrap_path"' in codex_installer_text
+    assert 'test "$bwrap_path" = /usr/bin/bwrap' in codex_installer_text
+    assert 'test -x "$bwrap_path" && test ! -L "$bwrap_path"' in (
+        codex_installer_text
+    )
+    assert "root:root:755:1" in codex_installer_text
     bwrap_install = codex_installer_text.split(
         "if ! command -v bwrap >/dev/null 2>&1; then", 1
     )[1].split('bwrap_path="$(command -v bwrap)"', 1)[0]
@@ -232,6 +238,11 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "ExecStartPre=+/usr/local/sbin/moodle-autotask-workspace-setup" in agent_text
     assert "TimeoutStartSec=30min" in agent_text
     assert "IPAddressDeny=169.254.169.254/32" in agent_text
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" in agent_text
+    assert "profile moodle-autotask-bwrap /usr/bin/bwrap flags=(unconfined)" in (
+        bwrap_profile_text
+    )
+    assert "  userns," in bwrap_profile_text
     for unit in (scheduler_text, telegram_text):
         assert "NoNewPrivileges=true" in unit
         assert "ProtectSystem=strict" in unit
@@ -245,6 +256,7 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
         assert stat.S_IMODE(agent.stat().st_mode) == 0o644
         assert stat.S_IMODE(scheduler.stat().st_mode) == 0o644
         assert stat.S_IMODE(telegram.stat().st_mode) == 0o644
+        assert stat.S_IMODE(bwrap_profile.stat().st_mode) == 0o644
     bash = shutil.which("bash")
     if bash is not None:
         for script in (refresh_text, codex_installer_text, health_text, workspace_setup_text):

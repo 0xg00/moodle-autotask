@@ -52,6 +52,9 @@ holds its job-retention lock before the shared workspace admission lock, through
 Codex execution, validation, and result publication, preventing concurrent capacity admission.
 A root-owned Codex policy denies sandboxed commands access to the authentication
 cache and application secrets, disables tool network access, and prevents permission escalation.
+The controller installs a root-owned AppArmor attachment for `/usr/bin/bwrap`; Ubuntu's global
+unprivileged-user-namespace restriction stays enabled while the agent unit grants only the
+`AF_NETLINK` family needed to configure the sandbox loopback interface.
 Central work is three fresh, stateless `central_planner`, `central_executor`, and
 `central_reviewer` jobs. The planner has no operational authority; its ordered plan binds the
 executor's exact `outputs/` set and the reviewer receives only wrapper-validated plan, evidence,

@@ -780,7 +780,7 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "CODEX_HOME=/var/lib/moodle-agent/.codex" in script
     assert (
         "moodle-autotask-codex sandbox --permission-profile moodle-autotask "
-        "--include-managed-config -C /var/lib/moodle-agent/smoke -- sh -c"
+        "--include-managed-config -C \"$smoke\" -- sh -c"
     ) in script
     assert "test ! -r /var/lib/moodle-agent/.codex/auth.json" in script
     assert "test ! -r /etc/moodle-autotask/moodle-token.json" in script
@@ -789,6 +789,11 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "/opt/moodle-autotask/codex/package-0.147.0/bin/codex" in script
     assert "00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6" in script
     assert "--ephemeral --skip-git-repo-check" in script
+    assert "systemd-run --quiet --wait --pipe --collect --uid=moodle-agent" in script
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" in script
+    assert "outputs/sandbox-proof.txt" in script
+    assert "e09474671b51ea728018129b4befad154fc407e0729bc0b2856cdf2af576a1b6" in script
+    assert "/etc/apparmor.d/moodle-autotask-bwrap" in script
     assert "application-secrets=unreadable" in script
     assert "test -r /etc/moodle-autotask/moodle-token.json" in script
     deploy_commands = script.split("$gitStatus =", 1)[1]

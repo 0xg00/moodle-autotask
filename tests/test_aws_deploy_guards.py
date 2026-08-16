@@ -26,6 +26,7 @@ _CONTROLLER_FILES = (
     ("usr/local/sbin/moodle-autotask-health-publish", 0o750),
     ("usr/local/sbin/moodle-autotask-health-prepare", 0o750),
     ("usr/local/sbin/moodle-autotask-workspace-setup", 0o750),
+    ("etc/apparmor.d/moodle-autotask-bwrap", 0o644),
     ("etc/codex/requirements.toml", 0o644),
     ("etc/systemd/system/moodle-autotask-codex-login.service", 0o644),
     ("etc/systemd/system/moodle-autotask-agent.service", 0o644),
@@ -261,6 +262,7 @@ class _RemoteHarness:
         self._fake("mktemp", self._once("/usr/bin/mktemp"))
         self._fake("cp", self._once("/bin/cp"))
         self._fake("mv", self._once("/bin/mv"))
+        self._fake("apparmor_parser", "#!/usr/bin/env bash\nexit 0\n")
         self._fake(
             "fault",
             "#!/usr/bin/env bash\n"
@@ -360,6 +362,7 @@ esac
             "run/moodle-autotask-health",
             "opt/moodle-autotask/current/venv/bin",
             "usr/local/sbin",
+            "etc/apparmor.d",
             "etc/codex",
             "etc/systemd/system",
         ):
@@ -421,6 +424,7 @@ esac
             "/run/moodle-autotask-health": self.root / "run/moodle-autotask-health",
             "/opt/moodle-autotask": self.root / "opt/moodle-autotask",
             "/usr/local/sbin": self.root / "usr/local/sbin",
+            "/etc/apparmor.d": self.root / "etc/apparmor.d",
             "/etc/systemd/system": self.root / "etc/systemd/system",
             "/etc/codex": self.root / "etc/codex",
         }
@@ -801,7 +805,7 @@ def test_deploy_guard_backup_failures_are_nonzero_and_leave_no_candidates(
     assert not tuple(parent.glob(".health-marker.*"))
 
 
-def test_controller_guard_copies_and_restores_all_thirteen_owned_files(tmp_path: Path) -> None:
+def test_controller_guard_copies_and_restores_all_fourteen_owned_files(tmp_path: Path) -> None:
     harness = _RemoteHarness(tmp_path)
     harness.set_states({"scheduler"}, {"scheduler"}, timer=(True, True))
     shutil.rmtree(harness.root / "opt/moodle-autotask/current")
