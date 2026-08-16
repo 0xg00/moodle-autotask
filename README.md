@@ -180,8 +180,8 @@ python -m pytest -q
 ## Local Moodle integration
 
 The development stack uses pinned official Moodle and `moodle-docker` sources, PostgreSQL, and a
-deterministic fictitious ASIX fixture. It binds to loopback by default and must never be exposed to
-the public internet.
+deterministic fictitious ASIX fixture. It binds to loopback by default; a validated private/Tailscale opt-in
+is documented for explicitly private access, and it must never be exposed to the public internet.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/moodle.ps1 -Action Bootstrap
