@@ -348,7 +348,7 @@ def test_submission_gate_handles_absent_then_awaiting_then_submitted_under_stric
         + script[helper_start:helper_end]
         + function
         + "\n$deadline = (Get-Date).ToUniversalTime().AddSeconds(10)\n"
-        + "$result = @(Wait-ControllerState -Gate Submission -Deadline $deadline)[-1]\n"
+        + "$result = Wait-ControllerState -Gate Submission -Deadline $deadline\n"
         + "if ($result.submission.status -ne 'submitted') { exit 7 }\n",
         encoding="utf-8",
     )
