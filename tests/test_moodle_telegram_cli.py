@@ -7,9 +7,9 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.moodle.approval_state import ApprovalState
-from moddle_autotask.adapters.moodle.telegram import TelegramTransport
-from moddle_autotask.adapters.moodle.telegram_cli import _parser, main
+from moodle_autotask.adapters.moodle.approval_state import ApprovalState
+from moodle_autotask.adapters.moodle.telegram import TelegramTransport
+from moodle_autotask.adapters.moodle.telegram_cli import _parser, main
 
 TOKEN = "123456:" + "A" * 35
 

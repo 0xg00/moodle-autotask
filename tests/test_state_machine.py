@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from moddle_autotask.domain.state_machine import (
+from moodle_autotask.domain.state_machine import (
     InvalidTaskTransitionError,
     TaskState,
     transition,

@@ -5,14 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.service import (
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.service import (
     MoodleRequiredFunctionCapabilityError,
     MoodleService,
     MoodleServiceError,
     MoodleUploadCapabilityError,
 )
-from moddle_autotask.adapters.moodle.state import MoodleState
+from moodle_autotask.adapters.moodle.state import MoodleState
 
 
 class _Client:

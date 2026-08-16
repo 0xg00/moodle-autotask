@@ -11,11 +11,11 @@ import time
 from pathlib import Path
 from typing import Never
 
-from moddle_autotask.adapters.moodle.approval_state import ApprovalState
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.submission import MoodleSubmissionClient
-from moddle_autotask.adapters.moodle.telegram import TelegramClient, TelegramConfig
-from moddle_autotask.health import pulse
+from moodle_autotask.adapters.moodle.approval_state import ApprovalState
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.submission import MoodleSubmissionClient
+from moodle_autotask.adapters.moodle.telegram import TelegramClient, TelegramConfig
+from moodle_autotask.health import pulse
 
 from .agent_spool import FileAgentBroker
 from .artifacts import AwsMoodleArtifactPreparer

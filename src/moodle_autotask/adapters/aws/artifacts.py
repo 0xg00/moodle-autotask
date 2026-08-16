@@ -9,12 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.downloads import MoodleDownloadReceipt, download_attachment
-from moddle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot
-from moddle_autotask.adapters.moodle.path_safety import assert_no_indirection
-from moddle_autotask.adapters.moodle.service import MoodleService
-from moddle_autotask.adapters.moodle.state import NotificationEvent
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.downloads import MoodleDownloadReceipt, download_attachment
+from moodle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot
+from moodle_autotask.adapters.moodle.path_safety import assert_no_indirection
+from moodle_autotask.adapters.moodle.service import MoodleService
+from moodle_autotask.adapters.moodle.state import NotificationEvent
 
 from .labs import JsonCommandRunner
 

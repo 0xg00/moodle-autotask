@@ -9,10 +9,10 @@ from typing import Any, cast
 
 import pytest
 
-import moddle_autotask.adapters.moodle.scheduler as scheduler_module
-from moddle_autotask.adapters.moodle.approval_state import _select_mode
-from moddle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot, MoodleAttachment
-from moddle_autotask.adapters.moodle.scheduler import (
+import moodle_autotask.adapters.moodle.scheduler as scheduler_module
+from moodle_autotask.adapters.moodle.approval_state import _select_mode
+from moodle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot, MoodleAttachment
+from moodle_autotask.adapters.moodle.scheduler import (
     CycleResult,
     LocalJsonSink,
     SchedulerOptions,
@@ -21,8 +21,8 @@ from moddle_autotask.adapters.moodle.scheduler import (
     run,
     summary_json,
 )
-from moddle_autotask.adapters.moodle.state import MoodleState
-from moddle_autotask.domain.models import ExecutionMode
+from moodle_autotask.adapters.moodle.state import MoodleState
+from moodle_autotask.domain.models import ExecutionMode
 
 
 def _assignment(letter: str = "a") -> MoodleAssignmentSnapshot:
@@ -504,7 +504,7 @@ def test_keyboard_interrupt_stops_heartbeat_without_state_mutation(
         return worker
 
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler.threading.Thread", capture_thread
+        "moodle_autotask.adapters.moodle.scheduler.threading.Thread", capture_thread
     )
 
     class State:

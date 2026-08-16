@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 
-from moddle_autotask.adapters.moodle.models import MoodlePayloadError, parse_assignments
+from moodle_autotask.adapters.moodle.models import MoodlePayloadError, parse_assignments
 
 
 def test_assignment_keys_and_revision_are_stable() -> None:

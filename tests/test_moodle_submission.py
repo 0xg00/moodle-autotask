@@ -9,15 +9,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from moddle_autotask.adapters.moodle.approval_state import SubmissionManifest, _submission_manifest
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.service import (
+from moodle_autotask.adapters.moodle.approval_state import SubmissionManifest, _submission_manifest
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.service import (
     MoodleRequiredFunctionCapabilityError,
     MoodleService,
     MoodleServiceError,
 )
-from moddle_autotask.adapters.moodle.state import MoodleState, NotificationDraft
-from moddle_autotask.adapters.moodle.submission import (
+from moodle_autotask.adapters.moodle.state import MoodleState, NotificationDraft
+from moodle_autotask.adapters.moodle.submission import (
     MoodleSubmissionClient,
     MoodleSubmissionError,
     PermanentSubmissionOfferError,

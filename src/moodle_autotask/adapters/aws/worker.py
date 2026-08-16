@@ -5,26 +5,26 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Protocol, cast, runtime_checkable
 
-from moddle_autotask.adapters.moodle.approval_state import (
+from moodle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
     ApprovalStateError,
     SubmissionClaim,
     SubmissionManifest,
     WorkClaim,
 )
-from moddle_autotask.adapters.moodle.state import NotificationEvent
-from moddle_autotask.adapters.moodle.submission import (
+from moodle_autotask.adapters.moodle.state import NotificationEvent
+from moodle_autotask.adapters.moodle.submission import (
     PermanentSubmissionOfferError,
     UnsupportedSubmissionPolicyError,
 )
-from moddle_autotask.domain.models import (
+from moodle_autotask.domain.models import (
     ExecutionMode,
     LabHandle,
     LabProvisionRequest,
     TaskId,
     WorkflowRevision,
 )
-from moddle_autotask.ports.contracts import LabProvider, LabReadiness
+from moodle_autotask.ports.contracts import LabProvider, LabReadiness
 
 from . import central_protocol
 from .agent_spool import ExecutionBroker, ExecutionProgress, LabCommandExecutor

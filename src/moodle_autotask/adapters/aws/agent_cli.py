@@ -21,8 +21,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Never, cast
 
-from moddle_autotask.adapters.moodle.path_safety import assert_no_indirection
-from moddle_autotask.health import pulse
+from moodle_autotask.adapters.moodle.path_safety import assert_no_indirection
+from moodle_autotask.health import pulse
 
 from . import central_protocol
 from .agent_spool import (

@@ -673,13 +673,17 @@ $wheelRoot = Join-Path $runtimeRoot $commitSha
 if (-not (Test-Path -LiteralPath $wheelRoot)) {
     New-Item -ItemType Directory -Path $wheelRoot | Out-Null
 }
+$sourceArchive = Join-Path $wheelRoot "$commitSha.zip"
+Invoke-Native -Executable 'git' -Arguments @(
+    '-C', $repoRoot, 'archive', '--format=zip', "--output=$sourceArchive", $commitSha
+) | Write-Output
 
 Invoke-Native -Executable 'python' -Arguments @(
     '-m', 'pip', 'wheel', '--disable-pip-version-check', '--no-deps',
-    '--wheel-dir', $wheelRoot, $repoRoot
+    '--wheel-dir', $wheelRoot, $sourceArchive
 ) | Write-Output
 
-$wheels = @(Get-ChildItem -File -LiteralPath $wheelRoot -Filter 'moddle_autotask-*.whl')
+$wheels = @(Get-ChildItem -File -LiteralPath $wheelRoot -Filter 'moodle_autotask-*.whl')
 if ($wheels.Count -ne 1) {
     throw 'Expected exactly one Moodle Autotask wheel.'
 }

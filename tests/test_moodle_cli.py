@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.moodle.cli import main
+from moodle_autotask.adapters.moodle.cli import main
 
 
 def test_acknowledge_uses_state_only_and_emits_json(

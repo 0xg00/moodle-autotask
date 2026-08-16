@@ -1,6 +1,6 @@
 # Architecture
 
-`moddle_autotask` is a deliberately small hexagonal automation foundation.
+`moodle_autotask` is a deliberately small hexagonal automation foundation.
 The domain contains immutable IDs, revision and digest bindings, execution and submission values,
 and a pure task-state transition function. It imports neither application code nor adapters.
 

@@ -13,7 +13,7 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.aws.controller_service import _health_publisher_script
+from moodle_autotask.adapters.aws.controller_service import _health_publisher_script
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt" or getattr(os, "geteuid", lambda: -1)() != 0,

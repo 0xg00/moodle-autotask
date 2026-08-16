@@ -5,14 +5,14 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.aws import retention_runtime
-from moddle_autotask.adapters.aws.retention_fs import RetentionCapacityError, RetentionFilesystem
-from moddle_autotask.adapters.aws.retention_runtime import (
+from moodle_autotask.adapters.aws import retention_runtime
+from moodle_autotask.adapters.aws.retention_fs import RetentionCapacityError, RetentionFilesystem
+from moodle_autotask.adapters.aws.retention_runtime import (
     AgentRetentionCoordinator,
     ControllerRetentionCoordinator,
     production_roots,
 )
-from moddle_autotask.adapters.moodle.approval_state import (
+from moodle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
     RetentionCompletionReceipt,
     RetentionReconciliationPage,

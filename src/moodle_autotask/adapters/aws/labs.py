@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Protocol, cast
 
-from moddle_autotask.domain.models import LabHandle, LabProvisionRequest
-from moddle_autotask.ports.contracts import LabReadiness
+from moodle_autotask.domain.models import LabHandle, LabProvisionRequest
+from moodle_autotask.ports.contracts import LabReadiness
 
 _APPROVED_INSTANCE_TYPES = frozenset({"t3.large", "m6i.large"})
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")

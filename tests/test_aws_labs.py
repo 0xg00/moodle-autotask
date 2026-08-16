@@ -9,13 +9,13 @@ from unittest.mock import patch
 
 import pytest
 
-from moddle_autotask.adapters.aws.labs import (
+from moodle_autotask.adapters.aws.labs import (
     AwsCliJsonRunner,
     AwsEc2LabProvider,
     AwsLabConfig,
     AwsLabError,
 )
-from moddle_autotask.domain.models import (
+from moodle_autotask.domain.models import (
     Digest,
     ExecutionMode,
     LabHandle,
@@ -23,7 +23,7 @@ from moddle_autotask.domain.models import (
     TaskId,
     WorkflowRevision,
 )
-from moddle_autotask.ports.contracts import LabReadiness
+from moodle_autotask.ports.contracts import LabReadiness
 
 
 @dataclass
@@ -495,7 +495,7 @@ def test_powershell_uses_owned_instance_official_document_and_guest_marker() -> 
     provider = AwsEc2LabProvider(_config(), runner)
     handle = provider.provision(_request(), idempotency_key="same-key")
 
-    with patch("moddle_autotask.adapters.aws.labs.time.sleep") as sleep:
+    with patch("moodle_autotask.adapters.aws.labs.time.sleep") as sleep:
         transcript = provider.run_powershell(handle, ("Write-Output 'ok'",), execution_key="f" * 64)
 
     assert transcript.succeeded and transcript.output == "verified"
@@ -621,9 +621,9 @@ def test_wait_powershell_stops_at_monotonic_deadline_without_another_poll() -> N
     clock = [0.0]
 
     with (
-        patch("moddle_autotask.adapters.aws.labs.time.monotonic", lambda: clock[0]),
+        patch("moodle_autotask.adapters.aws.labs.time.monotonic", lambda: clock[0]),
         patch(
-            "moddle_autotask.adapters.aws.labs.time.sleep",
+            "moodle_autotask.adapters.aws.labs.time.sleep",
             side_effect=lambda seconds: clock.__setitem__(0, clock[0] + 1800.0),
         ) as sleep,
         pytest.raises(AwsLabError, match="did not finish"),
@@ -654,9 +654,9 @@ def test_wait_powershell_preflight_consumes_the_same_monotonic_deadline(
         clock[0] = 1799.0
         return original_owned_instance(self, instance_id, provision_key, deadline=deadline)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.labs.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("moodle_autotask.adapters.aws.labs.time.monotonic", lambda: clock[0])
     monkeypatch.setattr(
-        "moddle_autotask.adapters.aws.labs.time.sleep",
+        "moodle_autotask.adapters.aws.labs.time.sleep",
         lambda seconds: clock.__setitem__(0, clock[0] + seconds),
     )
     monkeypatch.setattr(AwsEc2LabProvider, "_owned_instance", delayed_ownership)
@@ -696,7 +696,7 @@ def test_powershell_retries_list_get_eventual_consistency_without_resending() ->
     provider = AwsEc2LabProvider(_config(), runner)
     handle = provider.provision(_request(), idempotency_key="same-key")
 
-    with patch("moddle_autotask.adapters.aws.labs.time.sleep") as sleep:
+    with patch("moodle_autotask.adapters.aws.labs.time.sleep") as sleep:
         transcript = provider.run_powershell(handle, ("Write-Output 'ok'",), execution_key="f" * 64)
 
     assert transcript.succeeded and transcript.output == "verified"
@@ -725,7 +725,7 @@ def test_powershell_rejects_malformed_or_oversize_transcript(payload: str) -> No
 
 
 def test_powershell_wrapper_truncates_unicode_with_a_bounded_valid_envelope() -> None:
-    from moddle_autotask.adapters.aws.labs import _idempotent_powershell
+    from moodle_autotask.adapters.aws.labs import _idempotent_powershell
 
     text = "😀" * 4_000
     raw = text.encode("utf-8")[:12_000]
@@ -783,7 +783,7 @@ def test_blank_idempotency_key_is_rejected_before_aws() -> None:
 
 def test_cli_timeout_is_reported_without_command_or_environment_details() -> None:
     with patch(
-        "moddle_autotask.adapters.aws.labs.subprocess.run",
+        "moodle_autotask.adapters.aws.labs.subprocess.run",
         side_effect=subprocess.TimeoutExpired(["aws", "operation"], 1),
     ):
         with pytest.raises(AwsLabError, match="timed out") as captured:

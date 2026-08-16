@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 from moodle_http_support import moodle_server
 
-from moddle_autotask.adapters.moodle.client import MoodleClient, MoodleClientError
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.client import MoodleClient, MoodleClientError
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
 
 
 def _client(base: str, limit: int = 100) -> MoodleClient:

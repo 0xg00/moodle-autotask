@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from moddle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
-from moddle_autotask.adapters.aws.image_imports import (
+from moodle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
+from moodle_autotask.adapters.aws.image_imports import (
     AwsImageImportConfig,
     AwsImageImporter,
     ImageImportError,

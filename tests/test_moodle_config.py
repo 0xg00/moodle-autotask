@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.moodle.config import MoodleConfigurationError, MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.config import MoodleConfigurationError, MoodleConnectionConfig
 
 
 def test_current_bootstrap_token_file_bom_and_obtained_at_loads(tmp_path: Path) -> None:

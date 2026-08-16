@@ -10,6 +10,7 @@ if (!defined('AUTOTASK_FIXTURE_LIBRARY')) {
     require_once $CFG->dirroot . '/course/modlib.php';
 }
 
+// Stable v0.1 Moodle config keys: changing them would orphan migration state.
 const AUTOTASK_FIXTURE_CONFIG = 'moddle_autotask_rich_fixture_version';
 const AUTOTASK_FIXTURE_ANCHOR_CONFIG = 'moddle_autotask_rich_fixture_anchor';
 const AUTOTASK_FIXTURE_CATALOG_DIGEST_CONFIG = 'moddle_autotask_rich_fixture_catalog_v3_sha256';

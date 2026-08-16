@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from moddle_autotask.domain.models import (
+from moodle_autotask.domain.models import (
     ExecutionRequest,
     ExecutionResult,
     LabHandle,

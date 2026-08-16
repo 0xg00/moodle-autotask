@@ -53,6 +53,7 @@ $Versions = $null
 if ($Action -eq 'Bootstrap') {
     $Versions = Read-MoodleVersions -Path $VersionsPath
 }
+# Stable v0.1 Compose identity: keep it so upgrades manage existing local containers.
 $ProjectName = 'moddle_autotask_moodle'
 $script:GitBashPath = $null
 

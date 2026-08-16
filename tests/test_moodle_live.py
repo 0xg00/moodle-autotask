@@ -14,12 +14,12 @@ from typing import TypeVar
 
 import pytest
 
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.downloads import download_attachment
-from moddle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot
-from moddle_autotask.adapters.moodle.scheduler import LocalJsonSink, once
-from moddle_autotask.adapters.moodle.service import MoodleService
-from moddle_autotask.adapters.moodle.state import MoodleState
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.downloads import download_attachment
+from moodle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot
+from moodle_autotask.adapters.moodle.scheduler import LocalJsonSink, once
+from moodle_autotask.adapters.moodle.service import MoodleService
+from moodle_autotask.adapters.moodle.state import MoodleState
 
 _Result = TypeVar("_Result")
 

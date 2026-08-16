@@ -8,7 +8,7 @@ from threading import Barrier, Thread
 
 import pytest
 
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     MoodleStateError,
     NotificationAttachment,

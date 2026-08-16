@@ -5,7 +5,7 @@ from typing import assert_type, cast
 
 import pytest
 
-from moddle_autotask.domain.models import (
+from moodle_autotask.domain.models import (
     ArtifactReference,
     Digest,
     ExecutionMode,

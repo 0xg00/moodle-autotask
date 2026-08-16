@@ -5,10 +5,10 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.scheduler import CycleResult, SchedulerOptions
-from moddle_autotask.adapters.moodle.scheduler_cli import _parser, main
-from moddle_autotask.adapters.moodle.service import MoodleService
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.scheduler import CycleResult, SchedulerOptions
+from moodle_autotask.adapters.moodle.scheduler_cli import _parser, main
+from moodle_autotask.adapters.moodle.service import MoodleService
 
 
 def test_scheduler_rejects_raw_token_without_echoing_it(capsys: pytest.CaptureFixture[str]) -> None:
@@ -131,11 +131,11 @@ def test_scheduler_numeric_option_boundaries_are_safe(
     extra: tuple[str, ...],
 ) -> None:
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
         lambda path: MoodleConnectionConfig("https://example.test", "safe"),
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleState",
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleState",
         lambda path: object(),
     )
     command = "run" if option == "--interval-seconds" else "once"
@@ -197,10 +197,10 @@ def test_injected_once_and_runner_are_used_without_secrets(
     token = tmp_path / "token.json"
     token.write_text('{"baseUrl":"https://example.test","token":"safe"}', encoding="utf-8")
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
         lambda path: MoodleConnectionConfig("https://example.test", "safe"),
     )
     seen: list[object] = []
@@ -266,26 +266,26 @@ def test_scheduler_constructs_telegram_sink_only_when_requested(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
         lambda path: MoodleConnectionConfig("https://example.test", "safe"),
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.TelegramConfig.from_file",
+        "moodle_autotask.adapters.moodle.scheduler_cli.TelegramConfig.from_file",
         lambda path: object(),
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.ApprovalState", lambda path: object()
+        "moodle_autotask.adapters.moodle.scheduler_cli.ApprovalState", lambda path: object()
     )
     client = object()
     sink = object()
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.TelegramClient", lambda config: client
+        "moodle_autotask.adapters.moodle.scheduler_cli.TelegramClient", lambda config: client
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.TelegramApprovalSink",
+        "moodle_autotask.adapters.moodle.scheduler_cli.TelegramApprovalSink",
         lambda config, selected_client, state: sink,
     )
     seen: list[object] = []
@@ -323,15 +323,15 @@ def test_scheduler_config_file_is_exclusive_and_sets_scope(
     config = tmp_path / "scheduler.json"
     config.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.load_scheduler_config",
+        "moodle_autotask.adapters.moodle.scheduler_cli.load_scheduler_config",
         lambda path: SchedulerOptions(course_shortnames=("ASIX",), max_new_events_per_cycle=4),
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleConnectionConfig.from_token_file",
         lambda path: MoodleConnectionConfig("https://example.test", "safe"),
     )
     monkeypatch.setattr(
-        "moddle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
+        "moodle_autotask.adapters.moodle.scheduler_cli.MoodleState", lambda path: object()
     )
     seen: list[object] = []
 

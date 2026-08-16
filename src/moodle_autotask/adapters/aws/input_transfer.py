@@ -18,8 +18,8 @@ from datetime import datetime
 from typing import Protocol
 from urllib.parse import parse_qsl, quote, urlsplit
 
-from moddle_autotask.adapters.moodle.state import NotificationEvent
-from moddle_autotask.domain.models import LabHandle
+from moodle_autotask.adapters.moodle.state import NotificationEvent
+from moodle_autotask.domain.models import LabHandle
 
 from .artifacts import PreparedArtifact, PreparedAssignment
 from .labs import LabTranscript

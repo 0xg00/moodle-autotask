@@ -8,17 +8,17 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.aws.artifacts import (
+from moodle_autotask.adapters.aws.artifacts import (
     ArtifactPreparationError,
     AwsMoodleArtifactPreparer,
 )
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.downloads import MoodleDownloadReceipt
-from moddle_autotask.adapters.moodle.models import (
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.downloads import MoodleDownloadReceipt
+from moodle_autotask.adapters.moodle.models import (
     MoodleAssignmentSnapshot,
     MoodleAttachment,
 )
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
     NotificationDraft,

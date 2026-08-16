@@ -18,14 +18,14 @@ from typing import Any, cast
 
 import pytest
 
-from moddle_autotask.adapters.aws import agent_cli, agent_spool, central_protocol, lab_protocol
-from moddle_autotask.adapters.aws.agent_cli import (
+from moodle_autotask.adapters.aws import agent_cli, agent_spool, central_protocol, lab_protocol
+from moodle_autotask.adapters.aws.agent_cli import (
     CodexSpoolRunner,
     _BundlePublicationBusy,
     _collect_artifact_bundle,
     _load_job,
 )
-from moddle_autotask.adapters.aws.agent_spool import (
+from moodle_autotask.adapters.aws.agent_spool import (
     _MAX_CENTRAL_RESULT_BYTES,
     _MAX_RESULT_BYTES,
     AgentSpoolError,
@@ -37,15 +37,15 @@ from moddle_autotask.adapters.aws.agent_spool import (
     _job_storage_demand,
     _write_exclusive,
 )
-from moddle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
-from moddle_autotask.adapters.aws.labs import LabTranscript
-from moddle_autotask.adapters.aws.retention import PreparedTombstone, plan_retention
-from moddle_autotask.adapters.aws.retention_fs import (
+from moodle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
+from moodle_autotask.adapters.aws.labs import LabTranscript
+from moodle_autotask.adapters.aws.retention import PreparedTombstone, plan_retention
+from moodle_autotask.adapters.aws.retention_fs import (
     RetentionFilesystem,
     RetentionRoots,
     retention_job_lock,
 )
-from moddle_autotask.adapters.aws.storage_quota import (
+from moodle_autotask.adapters.aws.storage_quota import (
     StorageCapacityError,
     StorageDemand,
     StorageLimit,
@@ -53,15 +53,15 @@ from moddle_autotask.adapters.aws.storage_quota import (
     admit_owner_write,
     measure_tree_no_follow,
 )
-from moddle_autotask.adapters.moodle.approval_state import ApprovalState, RetentionRecord, WorkClaim
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.moodle.approval_state import ApprovalState, RetentionRecord, WorkClaim
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
     NotificationDraft,
     NotificationEvent,
     _event_id,
 )
-from moddle_autotask.domain.models import Digest, ExecutionMode, LabHandle
+from moodle_autotask.domain.models import Digest, ExecutionMode, LabHandle
 
 
 @dataclass
@@ -511,7 +511,7 @@ def test_runner_publishes_terminal_failure_for_invalid_executor_coverage(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", invalid_executor)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", invalid_executor)
     agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
 
     assert agent.process_one() == "processed"
@@ -592,7 +592,7 @@ def test_runner_publishes_terminal_failure_for_invalid_reviewer_coverage(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", invalid_reviewer)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", invalid_reviewer)
     agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
 
     assert agent.process_one() == "processed"
@@ -688,7 +688,7 @@ def test_runner_converts_oversized_central_model_result_to_durable_failure(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", oversized_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", oversized_run)
     agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
 
     assert agent.process_one() == "processed"
@@ -1151,7 +1151,7 @@ def test_noncentral_broker_jobs_run_through_codex_with_bound_guest_transfer(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
     agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
     handle = LabHandle("lab:test")
 
@@ -1590,7 +1590,7 @@ def test_codex_runner_uses_structured_output_and_scrubs_aws_environment(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-cross")
     agent = CodexSpoolRunner(
         jobs,
@@ -1726,7 +1726,7 @@ def test_codex_runner_recovers_stale_workspace_inputs_before_execution(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
     agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
 
     assert agent.process_one() == "processed"
@@ -1790,7 +1790,7 @@ def test_workspace_admission_lock_serializes_runners_through_result_publication(
 
     runner = CodexSpoolRunner(jobs, results, workspaces, tmp_path / "codex", 60)
     monkeypatch.setattr(agent_cli, "_admit_workspace_materialization", record_admission)
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", fake_run)
 
     def execute(job_id: str) -> None:
         try:
@@ -1942,7 +1942,7 @@ def test_codex_runner_reports_workspace_poison_and_processes_later_job(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", successful_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", successful_run)
     agent = CodexSpoolRunner(jobs, results, workspaces, tmp_path / "codex", 60)
 
     assert [agent.process_one() for _ in range(3)] == ["processed"] * 3
@@ -1995,7 +1995,7 @@ def test_codex_runner_reports_last_message_directory_and_processes_later_job(
         )
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", successful_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", successful_run)
     agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
     assert [agent.process_one() for _ in range(2)] == ["processed", "processed"]
     poisoned_result = json.loads(
@@ -2084,7 +2084,7 @@ def test_codex_runner_publishes_failure_and_skips_corrupt_preceding_job(
         del kwargs
         return subprocess.CompletedProcess(arguments, 1)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", failed_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", failed_run)
     agent = CodexSpoolRunner(jobs, results, tmp_path / "workspaces", tmp_path / "codex", 60)
 
     assert agent.process_one() == "processed"
@@ -2537,7 +2537,7 @@ def test_controller_publish_cannot_recreate_job_after_scratch_barrier(
         with original_lock(root, job_id):
             yield
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_spool.retention_job_lock", gated_lock)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_spool.retention_job_lock", gated_lock)
 
     def publish() -> None:
         try:
@@ -2622,7 +2622,7 @@ def test_lab_publish_cannot_recreate_job_after_scratch_barrier(
         with original_lock(root, job_id):
             yield
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_spool.retention_job_lock", gated_lock)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_spool.retention_job_lock", gated_lock)
 
     def publish() -> None:
         try:
@@ -2694,7 +2694,7 @@ def test_agent_execution_cannot_publish_result_after_scratch_barrier(
         output.write_bytes(_canonical(models[role]))
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", accepted_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", accepted_run)
     fixture_runner = CodexSpoolRunner(
         engine.roots.shared_jobs,
         fixture_results,
@@ -2739,8 +2739,8 @@ def test_agent_execution_cannot_publish_result_after_scratch_barrier(
         invoked.append(object())
         raise AssertionError("Codex must not run after the retention barrier")
 
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.retention_job_lock", gated_lock)
-    monkeypatch.setattr("moddle_autotask.adapters.aws.agent_cli.subprocess.run", should_not_run)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.retention_job_lock", gated_lock)
+    monkeypatch.setattr("moodle_autotask.adapters.aws.agent_cli.subprocess.run", should_not_run)
     runner = CodexSpoolRunner(
         engine.roots.shared_jobs,
         engine.roots.agent_results,
@@ -2826,7 +2826,7 @@ def test_fallback_failure_does_not_recreate_result_after_barrier_race(
     )
     monkeypatch.setattr(agent, "_execute", fail_after_execution_lock)
     monkeypatch.setattr(
-        "moddle_autotask.adapters.aws.agent_cli.retention_job_lock", gate_fallback_lock
+        "moodle_autotask.adapters.aws.agent_cli.retention_job_lock", gate_fallback_lock
     )
     outcomes: list[str] = []
 

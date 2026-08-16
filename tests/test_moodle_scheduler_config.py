@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.moodle import scheduler_config
-from moddle_autotask.adapters.moodle.scheduler_config import (
+from moodle_autotask.adapters.moodle import scheduler_config
+from moodle_autotask.adapters.moodle.scheduler_config import (
     SchedulerConfigError,
     load_scheduler_config,
     parse_scheduler_config,

@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "moddle-autotask"
+name = "moodle-autotask"
 version = "0.1.0"
 description = "Provider-neutral task automation lifecycle foundation."
 readme = "README.md"
@@ -13,12 +13,12 @@ authors = [{ name = "0xg00" }]
 dependencies = []
 
 [project.scripts]
-moodle-autotask-moodle = "moddle_autotask.adapters.moodle.cli:main"
-moodle-autotask-scheduler = "moddle_autotask.adapters.moodle.scheduler_cli:main"
-moodle-autotask-telegram = "moddle_autotask.adapters.moodle.telegram_cli:main"
-moodle-autotask-controller = "moddle_autotask.adapters.aws.controller_service:main"
-moodle-autotask-worker = "moddle_autotask.adapters.aws.worker_cli:main"
-moodle-autotask-agent = "moddle_autotask.adapters.aws.agent_cli:main"
+moodle-autotask-moodle = "moodle_autotask.adapters.moodle.cli:main"
+moodle-autotask-scheduler = "moodle_autotask.adapters.moodle.scheduler_cli:main"
+moodle-autotask-telegram = "moodle_autotask.adapters.moodle.telegram_cli:main"
+moodle-autotask-controller = "moodle_autotask.adapters.aws.controller_service:main"
+moodle-autotask-worker = "moodle_autotask.adapters.aws.worker_cli:main"
+moodle-autotask-agent = "moodle_autotask.adapters.aws.agent_cli:main"
 
 [project.optional-dependencies]
 dev = ["mypy>=1.10", "pytest>=8.0", "ruff>=0.5"]
