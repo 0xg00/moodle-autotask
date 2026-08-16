@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from moddle_autotask.adapters.moodle.approval_state import ApprovalState
+from moodle_autotask.adapters.moodle.approval_state import ApprovalState
 
 from .retention import plan_retention
 from .retention_fs import (

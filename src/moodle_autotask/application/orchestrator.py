@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from moddle_autotask.domain.models import (
+from moodle_autotask.domain.models import (
     ApprovalCheckpoint,
     ApprovalRecord,
     Digest,
@@ -16,8 +16,8 @@ from moddle_autotask.domain.models import (
     TaskId,
     WorkflowRevision,
 )
-from moddle_autotask.domain.state_machine import TaskState, transition
-from moddle_autotask.ports.contracts import (
+from moodle_autotask.domain.state_machine import TaskState, transition
+from moodle_autotask.ports.contracts import (
     AgentRuntime,
     LabProvider,
     LabReadiness,

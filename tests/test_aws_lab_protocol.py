@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.aws import lab_protocol
+from moodle_autotask.adapters.aws import lab_protocol
 
 _TASK = "moodle-task-v1:" + "1" * 64
 _REVISION = "moodle-assignment-v1:" + "2" * 64

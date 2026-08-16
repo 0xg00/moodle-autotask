@@ -177,6 +177,10 @@ python -m mypy src tests
 python -m pytest -q
 ```
 
+The canonical Python distribution and import namespace are `moodle-autotask` and
+`moodle_autotask`. The `v0.1.0` source archive used the misspelled experimental namespace
+`moddle_autotask`; it was corrected before publishing a Python package registry release.
+
 ## Local Moodle integration
 
 The development stack uses pinned official Moodle and `moodle-docker` sources, PostgreSQL, and a
@@ -214,10 +218,10 @@ workflow. AWS usage can incur costs.
 
 | Path | Purpose |
 | --- | --- |
-| `src/moddle_autotask/domain/` | Provider-neutral identities, lifecycle values, and state transitions |
-| `src/moddle_autotask/application/` | Approval-aware orchestration and ports |
-| `src/moddle_autotask/adapters/moodle/` | Moodle REST, scheduler, Telegram, state, and submission adapters |
-| `src/moddle_autotask/adapters/aws/` | Controller, lab, agent spool, protocols, quotas, and retention |
+| `src/moodle_autotask/domain/` | Provider-neutral identities, lifecycle values, and state transitions |
+| `src/moodle_autotask/application/` | Approval-aware orchestration and ports |
+| `src/moodle_autotask/adapters/moodle/` | Moodle REST, scheduler, Telegram, state, and submission adapters |
+| `src/moodle_autotask/adapters/aws/` | Controller, lab, agent spool, protocols, quotas, and retention |
 | `infra/moodle/` | Pinned deterministic Moodle fixture and catalog |
 | `infra/aws/` | Terraform bootstrap and controller infrastructure |
 | `scripts/` | Local Moodle, AWS deployment, and central E2E entry points |

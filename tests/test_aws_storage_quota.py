@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from moddle_autotask.adapters.aws.storage_quota import (
+from moodle_autotask.adapters.aws.storage_quota import (
     StorageCapacityError,
     StorageDemand,
     StorageEnvelopeError,
@@ -91,7 +91,7 @@ def test_allocation_rounding_preserves_exact_and_plus_one_boundaries(tmp_path: P
 def test_headroom_rejects_root_path_replacement_after_descriptor_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import moddle_autotask.adapters.aws.storage_quota as quota
+    import moodle_autotask.adapters.aws.storage_quota as quota
 
     root = tmp_path / "root"
     root.mkdir()

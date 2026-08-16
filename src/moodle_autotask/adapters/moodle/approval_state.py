@@ -16,14 +16,14 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-from moddle_autotask.adapters.aws import central_protocol, lab_protocol
-from moddle_autotask.domain.models import Digest, ExecutionMode, LabHandle
+from moodle_autotask.adapters.aws import central_protocol, lab_protocol
+from moodle_autotask.domain.models import Digest, ExecutionMode, LabHandle
 
 from .path_safety import assert_no_indirection
 from .state import NotificationEvent, _event_from_json, _event_id, _validate_identity
 
 if TYPE_CHECKING:
-    from moddle_autotask.adapters.aws.retention import PreparedTombstone
+    from moodle_autotask.adapters.aws.retention import PreparedTombstone
 
 
 class ApprovalStateError(RuntimeError):
@@ -950,7 +950,7 @@ class ApprovalState:
         self, completed: tuple[PreparedTombstone, ...], *, completed_at: int
     ) -> bool:
         """Atomically record exact terminal filesystem receipts without pruning audit rows."""
-        from moddle_autotask.adapters.aws.retention import PreparedTombstone
+        from moodle_autotask.adapters.aws.retention import PreparedTombstone
 
         if (
             type(completed_at) is not int

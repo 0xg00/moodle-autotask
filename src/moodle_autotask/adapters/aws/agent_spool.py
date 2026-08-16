@@ -17,9 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
-from moddle_autotask.adapters.moodle.path_safety import assert_no_indirection
-from moddle_autotask.adapters.moodle.state import NotificationEvent
-from moddle_autotask.domain.models import ExecutionMode, LabHandle
+from moodle_autotask.adapters.moodle.path_safety import assert_no_indirection
+from moodle_autotask.adapters.moodle.state import NotificationEvent
+from moodle_autotask.domain.models import ExecutionMode, LabHandle
 
 from . import central_protocol, lab_protocol
 from .artifacts import PreparedArtifact, PreparedAssignment

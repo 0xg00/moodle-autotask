@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.moodle.path_safety import assert_no_indirection
+from moodle_autotask.adapters.moodle.path_safety import assert_no_indirection
 
 
 @pytest.mark.skipif(os.name != "nt", reason="junctions are a Windows reparse-point feature")

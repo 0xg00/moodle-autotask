@@ -12,8 +12,8 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.aws import agent_cli
-from moddle_autotask.adapters.aws.agent_spool import (
+from moodle_autotask.adapters.aws import agent_cli
+from moodle_autotask.adapters.aws.agent_spool import (
     _CENTRAL_JOB_KIND,
     _CENTRAL_RESULT_KIND,
     _CENTRAL_ROLES,
@@ -25,7 +25,7 @@ from moddle_autotask.adapters.aws.agent_spool import (
     _validate_artifact_manifest,
     _validate_central_result,
 )
-from moddle_autotask.adapters.aws.central_protocol import (
+from moodle_autotask.adapters.aws.central_protocol import (
     CENTRAL_JOB_KIND,
     CENTRAL_RESULT_KIND,
     CENTRAL_ROLES,
@@ -52,7 +52,7 @@ from moddle_autotask.adapters.aws.central_protocol import (
     validate_prepared_inputs,
     validate_terminal_provenance,
 )
-from moddle_autotask.adapters.aws.central_protocol import _safe_filename as _leaf_safe_filename
+from moodle_autotask.adapters.aws.central_protocol import _safe_filename as _leaf_safe_filename
 
 
 def _plan() -> dict[str, object]:
@@ -251,10 +251,10 @@ def test_leaf_import_does_not_load_spool_cli_or_retention_modules() -> None:
     environment = os.environ | {"PYTHONPATH": str(source_root)}
     command = (
         "import sys; "
-        "import moddle_autotask.adapters.aws.central_protocol; "
-        "blocked = {'moddle_autotask.adapters.aws.agent_spool', "
-        "'moddle_autotask.adapters.aws.agent_cli', "
-        "'moddle_autotask.adapters.aws.retention_fs'}; "
+        "import moodle_autotask.adapters.aws.central_protocol; "
+        "blocked = {'moodle_autotask.adapters.aws.agent_spool', "
+        "'moodle_autotask.adapters.aws.agent_cli', "
+        "'moodle_autotask.adapters.aws.retention_fs'}; "
         "raise SystemExit(bool(blocked & sys.modules.keys()))"
     )
 

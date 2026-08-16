@@ -16,15 +16,15 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.aws import central_protocol, lab_protocol, retention_fs
-from moddle_autotask.adapters.aws.retention import (
+from moodle_autotask.adapters.aws import central_protocol, lab_protocol, retention_fs
+from moodle_autotask.adapters.aws.retention import (
     AgentRetentionAck,
     CommittedTombstone,
     PreparedTombstone,
     decode_committed,
     plan_retention,
 )
-from moddle_autotask.adapters.aws.retention_fs import (
+from moodle_autotask.adapters.aws.retention_fs import (
     RetentionCapacityError,
     RetentionFilesystem,
     RetentionFilesystemError,
@@ -33,14 +33,14 @@ from moddle_autotask.adapters.aws.retention_fs import (
     RetentionStoragePolicy,
     retention_job_lock,
 )
-from moddle_autotask.adapters.aws.retention_runtime import ControllerRetentionCoordinator
-from moddle_autotask.adapters.aws.storage_quota import StorageLimit, measure_tree_no_follow
-from moddle_autotask.adapters.moodle.approval_state import (
+from moodle_autotask.adapters.aws.retention_runtime import ControllerRetentionCoordinator
+from moodle_autotask.adapters.aws.storage_quota import StorageLimit, measure_tree_no_follow
+from moodle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
     RetentionRecord,
 )
-from moddle_autotask.adapters.moodle.state import MoodleState, NotificationDraft, _event_id
-from moddle_autotask.domain.models import ExecutionMode
+from moodle_autotask.adapters.moodle.state import MoodleState, NotificationDraft, _event_id
+from moodle_autotask.domain.models import ExecutionMode
 
 _POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="requires POSIX dirfd/no-follow traversal")
 
@@ -2651,16 +2651,16 @@ def test_linux_docker_two_uid_shared_group_harness() -> None:
         import sys
         from pathlib import Path
 
-        from moddle_autotask.adapters.aws.retention import plan_retention
-        from moddle_autotask.adapters.aws import central_protocol
-        from moddle_autotask.adapters.aws.retention_fs import (
+        from moodle_autotask.adapters.aws.retention import plan_retention
+        from moodle_autotask.adapters.aws import central_protocol
+        from moodle_autotask.adapters.aws.retention_fs import (
             RetentionFilesystem,
             RetentionOwnership,
             RetentionRoots,
         )
-        from moddle_autotask.adapters.moodle.approval_state import RetentionRecord
-        from moddle_autotask.adapters.moodle.state import _event_id
-        from moddle_autotask.domain.models import ExecutionMode
+        from moodle_autotask.adapters.moodle.approval_state import RetentionRecord
+        from moodle_autotask.adapters.moodle.state import _event_id
+        from moodle_autotask.domain.models import ExecutionMode
 
         task = "moodle-task-v1:" + "a" * 64
         revision = "moodle-assignment-v1:" + "b" * 64

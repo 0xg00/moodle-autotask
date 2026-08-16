@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.aws import input_transfer
-from moddle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
-from moddle_autotask.adapters.aws.input_transfer import (
+from moodle_autotask.adapters.aws import input_transfer
+from moodle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
+from moodle_autotask.adapters.aws.input_transfer import (
     _MAX_COMMAND_SOURCE_BYTES,
     AwsGuestInputTransfer,
     GuestInputTransferError,
@@ -22,14 +22,14 @@ from moddle_autotask.adapters.aws.input_transfer import (
     _validate_presigned_url,
     canonical_guest_input_manifest,
 )
-from moddle_autotask.adapters.aws.labs import LabTranscript
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.aws.labs import LabTranscript
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
     NotificationDraft,
     NotificationEvent,
 )
-from moddle_autotask.domain.models import LabHandle
+from moodle_autotask.domain.models import LabHandle
 
 # ruff: noqa: E501
 

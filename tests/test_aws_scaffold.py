@@ -60,7 +60,7 @@ def test_controller_scheduler_pins_a_campaign_safe_moodle_timeout() -> None:
 def test_controller_bootstrap_defers_retention_layout_to_canonical_installer() -> None:
     cloud_init = (AWS_ROOT / "controller" / "cloud-init.sh.tftpl").read_text(encoding="utf-8")
     controller = (
-        ROOT / "src" / "moddle_autotask" / "adapters" / "aws" / "controller_service.py"
+        ROOT / "src" / "moodle_autotask" / "adapters" / "aws" / "controller_service.py"
     ).read_text(encoding="utf-8")
     deploy = (ROOT / "scripts" / "aws-deploy.ps1").read_text(encoding="utf-8")
 
@@ -744,8 +744,14 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
         "$script:awsCli = Resolve-AwsCli"
     )
     assert "status', '--porcelain', '--untracked-files=all" in script
+    assert "'archive', '--format=zip'" in script
+    assert '"--output=$sourceArchive", $commitSha' in script
     assert "'pip', 'wheel'" in script
     assert "--no-deps" in script
+    assert "'--wheel-dir', $wheelRoot, $sourceArchive" in script
+    assert "'--wheel-dir', $wheelRoot, $repoRoot" not in script
+    assert "-Filter 'moodle_autotask-*.whl'" in script
+    assert "moddle_autotask-*.whl" not in script
     assert "Get-FileHash -Algorithm SHA256" in script
     assert "sha256sum --check --strict" in script
     assert "AWS-RunShellScript" in script

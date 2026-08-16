@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, TextIO
 
-from moddle_autotask.health import pulse
+from moodle_autotask.health import pulse
 
 from .models import MoodleAssignmentSnapshot
 from .state import MoodleState, NotificationAttachment, NotificationDraft, OutboxClaim

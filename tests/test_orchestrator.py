@@ -4,12 +4,12 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from moddle_autotask.application.orchestrator import (
+from moodle_autotask.application.orchestrator import (
     ApprovalValidationError,
     IdempotencyConflictError,
     TaskOrchestrator,
 )
-from moddle_autotask.domain.models import (
+from moodle_autotask.domain.models import (
     ApprovalCheckpoint,
     ApprovalRecord,
     ArtifactReference,
@@ -24,8 +24,8 @@ from moddle_autotask.domain.models import (
     TaskId,
     WorkflowRevision,
 )
-from moddle_autotask.domain.state_machine import InvalidTaskTransitionError, TaskState
-from moddle_autotask.ports.contracts import LabReadiness, SubmissionReceipt
+from moodle_autotask.domain.state_machine import InvalidTaskTransitionError, TaskState
+from moodle_autotask.ports.contracts import LabReadiness, SubmissionReceipt
 
 
 @dataclass

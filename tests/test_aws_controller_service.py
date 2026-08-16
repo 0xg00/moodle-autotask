@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.aws.controller_service import (
+from moodle_autotask.adapters.aws.controller_service import (
     ControllerLabConfig,
     ControllerServiceError,
     install_controller_services,

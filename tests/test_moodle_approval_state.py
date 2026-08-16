@@ -10,8 +10,8 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.aws.retention import PreparedTombstone
-from moddle_autotask.adapters.moodle.approval_state import (
+from moodle_autotask.adapters.aws.retention import PreparedTombstone
+from moodle_autotask.adapters.moodle.approval_state import (
     _CALLBACKS_SQL,
     _CURSOR_SQL,
     _METADATA_SQL,
@@ -26,13 +26,13 @@ from moddle_autotask.adapters.moodle.approval_state import (
     ApprovalStateError,
     _submission_manifest,
 )
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
     NotificationDraft,
     NotificationEvent,
 )
-from moddle_autotask.domain.models import Digest, LabHandle
+from moodle_autotask.domain.models import Digest, LabHandle
 
 
 def _event(tmp_path: Path, revision: str = "b", *, lab: bool = True) -> NotificationEvent:

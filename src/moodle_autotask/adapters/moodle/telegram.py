@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from moddle_autotask.health import pulse
+from moodle_autotask.health import pulse
 
 from .approval_state import (
     ApprovalButtons,

@@ -8,17 +8,17 @@ from typing import Any, cast
 
 import pytest
 
-from moddle_autotask.adapters.moodle.approval_state import (
+from moodle_autotask.adapters.moodle.approval_state import (
     ApprovalButtons,
     ApprovalState,
     SubmissionButtons,
 )
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationDraft,
     NotificationEvent,
 )
-from moddle_autotask.adapters.moodle.telegram import (
+from moodle_autotask.adapters.moodle.telegram import (
     TelegramApprovalSink,
     TelegramClient,
     TelegramConfig,

@@ -13,23 +13,23 @@ from typing import Any, cast
 
 import pytest
 
-from moddle_autotask.adapters.aws import agent_cli
-from moddle_autotask.adapters.aws.agent_cli import (
+from moodle_autotask.adapters.aws import agent_cli
+from moodle_autotask.adapters.aws.agent_cli import (
     CodexSpoolRunner,
     _BundlePublicationBusy,
     _collect_artifact_bundle,
     _validate_bundle,
 )
-from moddle_autotask.adapters.aws.agent_spool import (
+from moodle_autotask.adapters.aws.agent_spool import (
     AgentSpoolError,
     ExecutionProgress,
     FileAgentBroker,
     _canonical,
 )
-from moddle_autotask.adapters.aws.completion import TelegramExecutionNotifier
-from moddle_autotask.adapters.aws.labs import JsonCommandRunner
-from moddle_autotask.adapters.moodle.state import MoodleState, NotificationDraft, NotificationEvent
-from moddle_autotask.adapters.moodle.telegram import TelegramConfig
+from moodle_autotask.adapters.aws.completion import TelegramExecutionNotifier
+from moodle_autotask.adapters.aws.labs import JsonCommandRunner
+from moodle_autotask.adapters.moodle.state import MoodleState, NotificationDraft, NotificationEvent
+from moodle_autotask.adapters.moodle.telegram import TelegramConfig
 
 
 def _manifest(path: str, data: bytes) -> dict[str, object]:

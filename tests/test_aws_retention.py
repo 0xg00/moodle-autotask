@@ -9,8 +9,8 @@ from typing import cast
 
 import pytest
 
-from moddle_autotask.adapters.aws import central_protocol
-from moddle_autotask.adapters.aws.retention import (
+from moodle_autotask.adapters.aws import central_protocol
+from moodle_autotask.adapters.aws.retention import (
     AgentRetentionAck,
     CommittedTombstone,
     PreparedTombstone,
@@ -20,17 +20,17 @@ from moddle_autotask.adapters.aws.retention import (
     decode_prepared,
     plan_retention,
 )
-from moddle_autotask.adapters.moodle.approval_state import (
+from moodle_autotask.adapters.moodle.approval_state import (
     ApprovalState,
     ApprovalStateError,
     RetentionRecord,
 )
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationDraft,
     _event_id,
 )
-from moddle_autotask.domain.models import ExecutionMode, LabHandle
+from moodle_autotask.domain.models import ExecutionMode, LabHandle
 
 
 def _record(*, delivered: int | None = None, scratch: int = 10) -> RetentionRecord:

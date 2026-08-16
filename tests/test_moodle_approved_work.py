@@ -4,16 +4,16 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from moddle_autotask.adapters.moodle.approval_state import ApprovalState, ApprovalStateError
-from moddle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot, MoodleAttachment
-from moddle_autotask.adapters.moodle.scheduler import draft_from_assignment
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.moodle.approval_state import ApprovalState, ApprovalStateError
+from moodle_autotask.adapters.moodle.models import MoodleAssignmentSnapshot, MoodleAttachment
+from moodle_autotask.adapters.moodle.scheduler import draft_from_assignment
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
     NotificationDraft,
     NotificationEvent,
 )
-from moddle_autotask.domain.models import ExecutionMode, LabHandle
+from moodle_autotask.domain.models import ExecutionMode, LabHandle
 
 
 def _event(

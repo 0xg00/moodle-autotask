@@ -8,30 +8,30 @@ from pathlib import Path
 
 import pytest
 
-from moddle_autotask.adapters.aws.agent_spool import ExecutionProgress, LabCommandExecutor
-from moddle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
-from moddle_autotask.adapters.aws.completion import TelegramExecutionNotifier
-from moddle_autotask.adapters.aws.image_imports import (
+from moodle_autotask.adapters.aws.agent_spool import ExecutionProgress, LabCommandExecutor
+from moodle_autotask.adapters.aws.artifacts import PreparedArtifact, PreparedAssignment
+from moodle_autotask.adapters.aws.completion import TelegramExecutionNotifier
+from moodle_autotask.adapters.aws.image_imports import (
     ImageImportReadiness,
     ImageImportResult,
 )
-from moddle_autotask.adapters.aws.input_transfer import GuestInputReady
-from moddle_autotask.adapters.aws.worker import process_one
-from moddle_autotask.adapters.moodle import approval_state
-from moddle_autotask.adapters.moodle.approval_state import ApprovalState, SubmissionManifest
-from moddle_autotask.adapters.moodle.state import (
+from moodle_autotask.adapters.aws.input_transfer import GuestInputReady
+from moodle_autotask.adapters.aws.worker import process_one
+from moodle_autotask.adapters.moodle import approval_state
+from moodle_autotask.adapters.moodle.approval_state import ApprovalState, SubmissionManifest
+from moodle_autotask.adapters.moodle.state import (
     MoodleState,
     NotificationAttachment,
     NotificationDraft,
     NotificationEvent,
 )
-from moddle_autotask.adapters.moodle.submission import (
+from moodle_autotask.adapters.moodle.submission import (
     MoodleSubmissionError,
     PermanentSubmissionOfferError,
 )
-from moddle_autotask.adapters.moodle.telegram import TelegramConfig
-from moddle_autotask.domain.models import Digest, ExecutionMode, LabHandle, LabProvisionRequest
-from moddle_autotask.ports.contracts import LabReadiness
+from moodle_autotask.adapters.moodle.telegram import TelegramConfig
+from moodle_autotask.domain.models import Digest, ExecutionMode, LabHandle, LabProvisionRequest
+from moodle_autotask.ports.contracts import LabReadiness
 
 
 @dataclass
@@ -335,6 +335,9 @@ class _LifecycleSubmissionService:
     def save(self, manifest: SubmissionManifest, draft_item_id: int) -> None:
         assert draft_item_id == 17
         self.save_calls += 1
+        if self.fail_at == "save_after_submit_process_death":
+            self.remote_status = "submitted"
+            raise KeyboardInterrupt("worker died after Moodle accepted the save")
         if self.fail_at == "save_after_submit":
             self.remote_status = "submitted"
             raise RuntimeError("save response lost")
@@ -1086,7 +1089,7 @@ def test_cleanup_retry_preserves_execution_phase_and_deadline_without_reexecutio
 
 def test_worker_cli_uses_bounded_lab_runner_and_long_import_runner() -> None:
     source = (
-        Path(__file__).parents[1] / "src/moddle_autotask/adapters/aws/worker_cli.py"
+        Path(__file__).parents[1] / "src/moodle_autotask/adapters/aws/worker_cli.py"
     ).read_text(encoding="utf-8")
 
     assert "runner = AwsCliJsonRunner(timeout_seconds=3600)" in source
@@ -1260,6 +1263,41 @@ def test_save_response_loss_reconciles_exact_submitted_receipt(tmp_path: Path) -
         == "submission_confirmed"
     )
     assert _submission_row(state) == ("submitted", 17, None)
+    assert (service.upload_calls, service.save_calls, service.verify_calls) == (1, 1, 1)
+
+
+def test_direct_save_response_loss_survives_process_death_without_duplicate_mutation(
+    tmp_path: Path,
+) -> None:
+    state, _event = _submission_approved(tmp_path)
+    service = _LifecycleSubmissionService(fail_at="save_after_submit_process_death")
+
+    with pytest.raises(KeyboardInterrupt, match="worker died"):
+        process_one(state, _Provider(), owner="first", submission_service=service, now=10)
+
+    assert _submission_row(state) == ("saving", 17, None)
+    restarted = ApprovalState(tmp_path / "submission-approval.sqlite3")
+    recovered = process_one(
+        restarted,
+        _Provider(),
+        owner="restarted",
+        submission_service=service,
+        now=310,
+    )
+
+    assert recovered.result == "submission_confirmed"
+    assert _submission_row(restarted) == ("submitted", 17, None)
+    assert (service.upload_calls, service.save_calls, service.verify_calls) == (1, 1, 1)
+    assert (
+        process_one(
+            restarted,
+            _Provider(),
+            owner="restarted",
+            submission_service=service,
+            now=311,
+        ).result
+        == "idle"
+    )
     assert (service.upload_calls, service.save_calls, service.verify_calls) == (1, 1, 1)
 
 

@@ -11,13 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from moddle_autotask.adapters.moodle.approval_state import (
+from moodle_autotask.adapters.moodle.approval_state import (
     SubmissionButtons,
     SubmissionManifest,
     SubmissionNotification,
 )
-from moddle_autotask.adapters.moodle.state import NotificationEvent
-from moddle_autotask.adapters.moodle.telegram import TelegramConfig
+from moodle_autotask.adapters.moodle.state import NotificationEvent
+from moodle_autotask.adapters.moodle.telegram import TelegramConfig
 
 from .agent_spool import (
     AgentSpoolError,
@@ -114,7 +114,7 @@ class TelegramExecutionNotifier:
 
 def _verified_bundle(root: Path | None, provenance: dict[str, object]) -> bytes:
 
-    from moddle_autotask.adapters.moodle.path_safety import assert_no_indirection
+    from moodle_autotask.adapters.moodle.path_safety import assert_no_indirection
 
     digest, locator, manifest, manifest_digest = (
         provenance.get("artifactBundleDigest"),

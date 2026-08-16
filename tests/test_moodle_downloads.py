@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 from moodle_http_support import moodle_server
 
-from moddle_autotask.adapters.moodle.config import MoodleConnectionConfig
-from moddle_autotask.adapters.moodle.downloads import MoodleDownloadError, download_attachment
-from moddle_autotask.adapters.moodle.models import (
+from moodle_autotask.adapters.moodle.config import MoodleConnectionConfig
+from moodle_autotask.adapters.moodle.downloads import MoodleDownloadError, download_attachment
+from moodle_autotask.adapters.moodle.models import (
     MoodleAssignmentSnapshot,
     MoodlePayloadError,
     parse_assignments,

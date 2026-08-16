@@ -9,9 +9,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from moddle_autotask.adapters.moodle.approval_state import RetentionRecord
-from moddle_autotask.adapters.moodle.state import _event_id
-from moddle_autotask.domain.models import ExecutionMode
+from moodle_autotask.adapters.moodle.approval_state import RetentionRecord
+from moodle_autotask.adapters.moodle.state import _event_id
+from moodle_autotask.domain.models import ExecutionMode
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^moodle-assignment-v1:[0-9a-f]{64}$")
