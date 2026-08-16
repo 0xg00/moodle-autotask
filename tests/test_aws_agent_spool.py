@@ -943,7 +943,10 @@ def test_setgid_jobs_are_readable_by_distinct_agent_identity(tmp_path: Path) -> 
         if progress.status != "pending":
             raise RuntimeError("central job was not published")
 
-    run_as(worker_uid, worker_gid, [worker_gid, shared_gid], publish_central)
+    # Production deliberately keeps the controller out of the agent's primary
+    # group. Publication must rely on setgid inheritance, not supplementary
+    # membership in the shared directory group.
+    run_as(worker_uid, worker_gid, [worker_gid], publish_central)
     lab_event = _event(tmp_path, lab=True, marker="b")
     lab_prepared = _prepared(lab_event, runner)
     lab_results = tmp_path / "lab-results"
@@ -958,7 +961,7 @@ def test_setgid_jobs_are_readable_by_distinct_agent_identity(tmp_path: Path) -> 
         if progress.status != "pending":
             raise RuntimeError("lab job was not published")
 
-    run_as(worker_uid, worker_gid, [worker_gid, shared_gid], publish_lab)
+    run_as(worker_uid, worker_gid, [worker_gid], publish_lab)
     published = [path for path in jobs.iterdir() if path.is_dir()]
     assert len(published) == 2
     for job in published:

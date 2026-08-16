@@ -11,7 +11,6 @@ import re
 import secrets
 import shutil
 import stat
-import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
@@ -592,15 +591,10 @@ class FileAgentBroker:
                             _STORAGE_POLICY.jobs,
                             exclude=frozenset({".retention"}),
                         )
-                    temporary = Path(tempfile.mkdtemp(prefix=f".{job_id}.", dir=self.jobs_root))
+                    temporary = _make_shared_job_directory(self.jobs_root, job_id)
                     try:
-                        # jobs_root is setgid to the controller/agent shared group.
-                        # Retain it on every directory so file group access does not
-                        # depend on the controller process's primary group.
-                        os.chmod(temporary, 0o2750)
                         inputs = temporary / "inputs"
-                        inputs.mkdir(mode=0o2750)
-                        os.chmod(inputs, 0o2750)
+                        _mkdir_inheriting_shared_group(inputs)
                         for index, artifact in enumerate(self._agent_artifacts(event, prepared)):
                             self._download(artifact, inputs / f"{index:04d}-{artifact.filename}")
                         _write_exclusive(temporary / "job.json", encoded, 0o640)
@@ -979,12 +973,10 @@ class FileAgentBroker:
                         _STORAGE_POLICY.jobs,
                         exclude=frozenset({".retention"}),
                     )
-                    temporary = Path(tempfile.mkdtemp(prefix=f".{job_id}.", dir=self.jobs_root))
+                    temporary = _make_shared_job_directory(self.jobs_root, job_id)
                     try:
-                        os.chmod(temporary, 0o2750)
                         inputs = temporary / "inputs"
-                        inputs.mkdir(mode=0o2750)
-                        os.chmod(inputs, 0o2750)
+                        _mkdir_inheriting_shared_group(inputs)
                         for index, artifact in enumerate(artifacts):
                             destination = inputs / f"{index:04d}-{artifact.filename}"
                             self._download(artifact, destination)
@@ -1273,6 +1265,46 @@ def _write_exclusive(path: Path, data: bytes, mode: int) -> None:
         except OSError:
             pass
         raise
+
+
+def _make_shared_job_directory(root: Path, job_id: str) -> Path:
+    for _attempt in range(8):
+        target = root / f".{job_id}.{secrets.token_urlsafe(18)}"
+        try:
+            _mkdir_inheriting_shared_group(target)
+        except FileExistsError:
+            continue
+        return target
+    raise AgentSpoolError("could not allocate a unique agent job directory")
+
+
+def _mkdir_inheriting_shared_group(path: Path) -> None:
+    if os.name == "nt":
+        path.mkdir(mode=0o750)
+        return
+    parent = path.parent.lstat()
+    if stat.S_IMODE(parent.st_mode) & stat.S_ISGID:
+        previous_umask = os.umask(0)
+        try:
+            path.mkdir(mode=0o750)
+        finally:
+            os.umask(previous_umask)
+    else:
+        path.mkdir(mode=0o750)
+        os.chmod(path, 0o2750)
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != parent.st_uid
+        or metadata.st_gid != parent.st_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o2750
+    ):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+        raise AgentSpoolError("agent job directory did not inherit the shared group")
 
 
 def _read_regular(path: Path, limit: int) -> bytes:
