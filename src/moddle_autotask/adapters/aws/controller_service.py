@@ -24,11 +24,26 @@ _REGION = re.compile(r"^[a-z]{2}-[a-z]+-[0-9]$")
 _ENVIRONMENT = re.compile(r"^[a-z0-9][a-z0-9-]{1,19}$")
 _PROJECT = "moodle-autotask"
 _CODEX_VERSION = "0.147.0"
-_CODEX_ARCHIVE_SHA256 = (
-    "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36"
+_CODEX_PACKAGE_ARCHIVE_SHA256 = (
+    "bd758d53d56e41dc65e045f4589df79a038ed197a011adcb52a258e6ad64cfda"
 )
 _CODEX_BINARY_SHA256 = (
     "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40"
+)
+_CODEX_CODE_MODE_HOST_SHA256 = (
+    "00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6"
+)
+_CODEX_PACKAGE_METADATA_SHA256 = (
+    "00f66f11cc7d5c4133d500b4aae6ed4975608d6b040eefd56dc1ff343566e8cf"
+)
+_CODEX_RG_SHA256 = (
+    "e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849"
+)
+_CODEX_BWRAP_SHA256 = (
+    "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c"
+)
+_CODEX_ZSH_SHA256 = (
+    "67faaaa89242c4a332e16e508a1977cffc24bf7fca31d4411cdfd101f3831ef3"
 )
 
 
@@ -309,7 +324,7 @@ rmdir "$temporary_directory"
 
 
 def _codex_installer_script() -> str:
-    archive_name = "codex-x86_64-unknown-linux-musl"
+    archive_name = "codex-package-x86_64-unknown-linux-musl"
     archive_url = (
         "https://github.com/openai/codex/releases/download/"
         f"rust-v{_CODEX_VERSION}/{archive_name}.tar.gz"
@@ -323,11 +338,16 @@ agent_home=/var/lib/moodle-agent
 codex_home="$agent_home/.codex"
 version={shlex.quote(_CODEX_VERSION)}
 archive_url={shlex.quote(archive_url)}
-archive_sha256={shlex.quote(_CODEX_ARCHIVE_SHA256)}
+archive_sha256={shlex.quote(_CODEX_PACKAGE_ARCHIVE_SHA256)}
 binary_sha256={shlex.quote(_CODEX_BINARY_SHA256)}
-binary_name={shlex.quote(archive_name)}
-install_root="/opt/moodle-autotask/codex/$version"
-install_target="$install_root/codex"
+host_sha256={shlex.quote(_CODEX_CODE_MODE_HOST_SHA256)}
+metadata_sha256={shlex.quote(_CODEX_PACKAGE_METADATA_SHA256)}
+rg_sha256={shlex.quote(_CODEX_RG_SHA256)}
+bwrap_sha256={shlex.quote(_CODEX_BWRAP_SHA256)}
+zsh_sha256={shlex.quote(_CODEX_ZSH_SHA256)}
+install_parent=/opt/moodle-autotask/codex
+install_root="$install_parent/package-$version"
+install_target="$install_root/bin/codex"
 
 if id --user "$agent_user" >/dev/null 2>&1; then
   passwd_entry="$(getent passwd "$agent_user")"
@@ -507,30 +527,204 @@ if [ -e "$codex_home/auth.json" ] || [ -L "$codex_home/auth.json" ]; then
 fi
 
 temporary_directory="$(mktemp -d /tmp/moodle-autotask-codex.XXXXXX)"
+package_candidate=
 cleanup() {{
+  if [ -n "$package_candidate" ]; then
+    rm -rf -- "$package_candidate"
+  fi
   rm -rf "$temporary_directory"
 }}
 trap cleanup EXIT
 
-if [ ! -f "$install_target" ] || \
-   [ "$(sha256sum "$install_target" | cut -d ' ' -f 1)" != "$binary_sha256" ]; then
+validate_package() {{
+  local root="$1"
+  test -d "$root" && test ! -L "$root" || return 1
+  test "$(stat -c '%U:%G:%a' "$root")" = root:root:755 || return 1
+  local expected_inventory
+  expected_inventory="$(printf '%s\n' \
+    bin bin/codex bin/codex-code-mode-host codex-package.json codex-path \
+    codex-path/rg codex-resources codex-resources/bwrap codex-resources/zsh \
+    codex-resources/zsh/bin codex-resources/zsh/bin/zsh | sort)"
+  test "$(find -P "$root" -mindepth 1 -printf '%P\n' | sort)" = \
+    "$expected_inventory" || return 1
+  local directory
+  for directory in bin codex-path codex-resources codex-resources/zsh \
+    codex-resources/zsh/bin; do
+    test -d "$root/$directory" && test ! -L "$root/$directory" || return 1
+    test "$(stat -c '%U:%G:%a' "$root/$directory")" = root:root:755 || return 1
+  done
+  local executable
+  for executable in bin/codex bin/codex-code-mode-host codex-path/rg \
+    codex-resources/bwrap codex-resources/zsh/bin/zsh; do
+    test -f "$root/$executable" && test ! -L "$root/$executable" || return 1
+    test "$(stat -c '%U:%G:%a:%h' "$root/$executable")" = root:root:755:1 \
+      || return 1
+  done
+  test -f "$root/codex-package.json" && test ! -L "$root/codex-package.json" \
+    || return 1
+  test "$(stat -c '%U:%G:%a:%h' "$root/codex-package.json")" = root:root:644:1 \
+    || return 1
+  echo "$binary_sha256  $root/bin/codex" | sha256sum --check --strict --status \
+    || return 1
+  echo "$host_sha256  $root/bin/codex-code-mode-host" \
+    | sha256sum --check --strict --status || return 1
+  echo "$metadata_sha256  $root/codex-package.json" \
+    | sha256sum --check --strict --status || return 1
+  echo "$rg_sha256  $root/codex-path/rg" | sha256sum --check --strict --status \
+    || return 1
+  echo "$bwrap_sha256  $root/codex-resources/bwrap" \
+    | sha256sum --check --strict --status || return 1
+  echo "$zsh_sha256  $root/codex-resources/zsh/bin/zsh" \
+    | sha256sum --check --strict --status || return 1
+}}
+
+test -d /opt && test ! -L /opt
+test "$(stat -c '%U:%G:%a' /opt)" = root:root:755
+for trusted_directory in /opt/moodle-autotask "$install_parent"; do
+  if [ -e "$trusted_directory" ] || [ -L "$trusted_directory" ]; then
+    test -d "$trusted_directory"
+    test ! -L "$trusted_directory"
+    test "$(stat -c '%U:%G:%a' "$trusted_directory")" = root:root:755
+  else
+    mkdir -- "$trusted_directory"
+    chown root:root "$trusted_directory"
+    chmod 0755 "$trusted_directory"
+  fi
+  test "$(stat -c '%U:%G:%a' "$trusted_directory")" = root:root:755
+done
+
+if [ -e "$install_root" ] || [ -L "$install_root" ]; then
+  validate_package "$install_root"
+else
   curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
     --fail --silent --show-error --location "$archive_url" \
     --output "$temporary_directory/codex.tar.gz"
   echo "$archive_sha256  $temporary_directory/codex.tar.gz" \
     | sha256sum --check --strict
-  test "$(tar -tzf "$temporary_directory/codex.tar.gz")" = "$binary_name"
-  tar -xzf "$temporary_directory/codex.tar.gz" --no-same-owner \
-    --no-same-permissions -C "$temporary_directory"
-  test -f "$temporary_directory/$binary_name"
-  test ! -L "$temporary_directory/$binary_name"
-  echo "$binary_sha256  $temporary_directory/$binary_name" \
-    | sha256sum --check --strict
-  install -d -o root -g root -m 0755 "$install_root"
+  python3 - "$temporary_directory/codex.tar.gz" \
+    "$temporary_directory/extracted" "$binary_sha256" "$host_sha256" \
+    "$metadata_sha256" "$rg_sha256" "$bwrap_sha256" "$zsh_sha256" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import sys
+import tarfile
+
+archive_path, extraction_path, *hashes = sys.argv[1:]
+expected_files = dict(
+    zip(
+        (
+            "bin/codex",
+            "bin/codex-code-mode-host",
+            "codex-package.json",
+            "codex-path/rg",
+            "codex-resources/bwrap",
+            "codex-resources/zsh/bin/zsh",
+        ),
+        zip(
+            hashes,
+            (258278208, 49682360, 205, 5408904, 529776, 898480),
+            strict=True,
+        ),
+        strict=True,
+    )
+)
+expected_directories = set(
+    (
+        "bin",
+        "codex-path",
+        "codex-resources",
+        "codex-resources/zsh",
+        "codex-resources/zsh/bin",
+    )
+)
+expected_names = expected_directories | set(expected_files)
+destination_root = Path(extraction_path)
+destination_root.mkdir(mode=0o700)
+
+with tarfile.open(archive_path, mode="r:gz") as archive:
+    members = archive.getmembers()
+    seen = set()
+    by_name = dict()
+    for member in members:
+        name = member.name.rstrip("/")
+        if name in seen or name not in expected_names or member.name.startswith("/"):
+            raise SystemExit("Codex package inventory is invalid")
+        seen.add(name)
+        by_name[name] = member
+        if name in expected_directories:
+            if not member.isdir():
+                raise SystemExit("Codex package directory is invalid")
+        elif not member.isreg() or member.linkname:
+            raise SystemExit("Codex package file is invalid")
+    if seen != expected_names:
+        raise SystemExit("Codex package inventory is incomplete")
+
+    for name, (expected_hash, expected_size) in expected_files.items():
+        member = by_name[name]
+        if member.size != expected_size:
+            raise SystemExit("Codex package file size is invalid")
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit("Codex package file is unavailable")
+        target = destination_root.joinpath(*name.split("/"))
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        digest = hashlib.sha256()
+        remaining = expected_size
+        try:
+            while remaining:
+                block = source.read(min(1024 * 1024, remaining))
+                if not block:
+                    raise SystemExit("Codex package file is truncated")
+                digest.update(block)
+                view = memoryview(block)
+                while view:
+                    written = os.write(descriptor, view)
+                    view = view[written:]
+                remaining -= len(block)
+            if source.read(1):
+                raise SystemExit("Codex package file is oversized")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            source.close()
+        if digest.hexdigest() != expected_hash:
+            raise SystemExit("Codex package file digest is invalid")
+PY
+  package_candidate="$(mktemp -d "$install_parent/.package-$version.XXXXXX")"
+  chmod 0755 "$package_candidate"
+  install -d -o root -g root -m 0755 \
+    "$package_candidate/bin" "$package_candidate/codex-path" \
+    "$package_candidate/codex-resources" \
+    "$package_candidate/codex-resources/zsh" \
+    "$package_candidate/codex-resources/zsh/bin"
+  install -o root -g root -m 0644 \
+    "$temporary_directory/extracted/codex-package.json" \
+    "$package_candidate/codex-package.json"
   install -o root -g root -m 0755 \
-    "$temporary_directory/$binary_name" "$install_target"
+    "$temporary_directory/extracted/bin/codex" \
+    "$temporary_directory/extracted/bin/codex-code-mode-host" \
+    "$package_candidate/bin/"
+  install -o root -g root -m 0755 \
+    "$temporary_directory/extracted/codex-path/rg" \
+    "$package_candidate/codex-path/rg"
+  install -o root -g root -m 0755 \
+    "$temporary_directory/extracted/codex-resources/bwrap" \
+    "$package_candidate/codex-resources/bwrap"
+  install -o root -g root -m 0755 \
+    "$temporary_directory/extracted/codex-resources/zsh/bin/zsh" \
+    "$package_candidate/codex-resources/zsh/bin/zsh"
+  validate_package "$package_candidate"
+  test ! -e "$install_root" && test ! -L "$install_root"
+  mv -T "$package_candidate" "$install_root"
+  package_candidate=
 fi
-echo "$binary_sha256  $install_target" | sha256sum --check --strict
+validate_package "$install_root"
 if ! command -v bwrap >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update

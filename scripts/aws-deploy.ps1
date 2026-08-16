@@ -499,6 +499,9 @@ if ($Action -eq 'CodexLogin') {
 if ($Action -eq 'CodexSmoke') {
     Send-ControllerCommand -TargetInstanceId $controllerInstanceId -Comment 'Verify isolated Codex authentication' -Commands @(
         'set -eu',
+        'codex_target="$(readlink -f /usr/local/bin/moodle-autotask-codex)"',
+        'test "$codex_target" = /opt/moodle-autotask/codex/package-0.147.0/bin/codex',
+        'test "$(sha256sum "$(dirname "$codex_target")/codex-code-mode-host" | cut -d '' '' -f 1)" = 00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6',
         'test "$(stat -c ''%U:%G:%a'' /var/lib/moodle-agent/.codex/auth.json)" = "moodle-agent:moodle-agent:600"',
         'test "$(stat -c ''%U:%G:%a'' /etc/codex/requirements.toml)" = "root:root:644"',
         '! id -nG moodle-agent | tr '' '' ''\n'' | grep -Fxq moodle-autotask',
@@ -508,6 +511,7 @@ if ($Action -eq 'CodexSmoke') {
         'result="$(timeout 120s runuser -u moodle-agent -- env HOME=/var/lib/moodle-agent CODEX_HOME=/var/lib/moodle-agent/.codex /usr/local/bin/moodle-autotask-codex exec --ephemeral --skip-git-repo-check --color never -C /var/lib/moodle-agent/smoke ''Reply with exactly: CODEX_SMOKE_OK'')"',
         'test "$result" = "CODEX_SMOKE_OK"',
         'echo codex-smoke=ok',
+        'echo codex-code-mode-host=verified',
         'echo codex-sandbox=isolated',
         'echo auth-permissions=private',
         'echo application-secrets=unreadable'

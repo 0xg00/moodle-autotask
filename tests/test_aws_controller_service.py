@@ -143,13 +143,28 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
         health_unit.read_text(encoding="utf-8")
     )
     assert "OnUnitActiveSec=60s" in health_timer.read_text(encoding="utf-8")
-    assert "rust-v0.147.0/codex-x86_64-unknown-linux-musl.tar.gz" in codex_installer_text
-    assert "0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36" in (
+    assert (
+        "rust-v0.147.0/codex-package-x86_64-unknown-linux-musl.tar.gz"
+        in codex_installer_text
+    )
+    assert "bd758d53d56e41dc65e045f4589df79a038ed197a011adcb52a258e6ad64cfda" in (
         codex_installer_text
     )
     assert "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40" in (
         codex_installer_text
     )
+    assert "00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6" in (
+        codex_installer_text
+    )
+    assert 'install_root="$install_parent/package-$version"' in codex_installer_text
+    assert 'install_target="$install_root/bin/codex"' in codex_installer_text
+    assert "Codex package inventory is invalid" in codex_installer_text
+    assert "member.isreg()" in codex_installer_text
+    assert 'find -P "$root" -mindepth 1' in codex_installer_text
+    assert "test -d /opt && test ! -L /opt" in codex_installer_text
+    assert 'validate_package "$package_candidate"' in codex_installer_text
+    assert 'mv -T "$package_candidate" "$install_root"' in codex_installer_text
+    assert 'validate_package "$install_root"' in codex_installer_text
     assert "cli_auth_credentials_store = \"file\"" in codex_installer_text
     assert "forced_login_method = \"chatgpt\"" in codex_installer_text
     assert "allowed_approval_policies = [\"never\"]" in codex_installer_text

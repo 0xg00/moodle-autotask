@@ -785,6 +785,9 @@ def test_deployment_is_commit_and_digest_bound_over_ssm() -> None:
     assert "test ! -r /var/lib/moodle-agent/.codex/auth.json" in script
     assert "test ! -r /etc/moodle-autotask/moodle-token.json" in script
     assert "codex-sandbox=isolated" in script
+    assert "codex-code-mode-host=verified" in script
+    assert "/opt/moodle-autotask/codex/package-0.147.0/bin/codex" in script
+    assert "00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6" in script
     assert "--ephemeral --skip-git-repo-check" in script
     assert "application-secrets=unreadable" in script
     assert "test -r /etc/moodle-autotask/moodle-token.json" in script

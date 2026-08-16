@@ -289,8 +289,9 @@ missing/breaching until the first successful application deployment installs the
 
 ## Link the central Codex agent
 
-Each deployment installs the pinned official Codex CLI archive only after verifying both the archive
-and extracted binary SHA-256. Codex runs as the separate `moodle-agent` system account. That account
+Each deployment installs the pinned official Codex package only after verifying the archive and the
+exact package inventory, sizes, modes, and SHA-256 digests, including the Code Mode host and bundled
+tools. Codex runs as the separate `moodle-agent` system account. That account
 is not a member of the application group, cannot read `/etc/moodle-autotask`, and stores its login in
 `/var/lib/moodle-agent/.codex/auth.json` with private permissions.
 
