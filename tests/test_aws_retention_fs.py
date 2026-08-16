@@ -1458,6 +1458,77 @@ def test_terminal_v3_prefixes_reclaim_exact_targets_and_preserve_neighbors(
 
 
 @_POSIX_ONLY
+def test_legacy_prefixed_plan_with_wrapper_failure_remains_reclaimable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = "moodle-task-v1:" + "a" * 64
+    revision = "moodle-assignment-v1:" + "b" * 64
+    jobs, results, models = _central_corpus(task, revision)
+    plan = cast(dict[str, object], results[0]["plan"])
+    plan["expectedArtifacts"] = ["outputs/report.md"]
+    results[0]["planDigest"] = central_protocol.canonical_digest(plan)
+    _rehash_result(results[0])
+    dependencies = cast(dict[str, str], jobs[1]["dependencies"])
+    dependencies["planDigest"] = cast(str, results[0]["planDigest"])
+    dependencies["plannerResultDigest"] = cast(str, results[0]["plannerResultDigest"])
+    _rehash_job(jobs[1])
+    failure: dict[str, object] = {
+        "kind": central_protocol.CENTRAL_RESULT_KIND,
+        "jobId": jobs[1]["jobId"],
+        "role": "central_executor",
+        "succeeded": False,
+        "summary": "Agent workspace is unsafe",
+        "reportMarkdown": "",
+    }
+    failure["executorResultDigest"] = central_protocol.canonical_digest(failure)
+    jobs, results, models = jobs[:2], [results[0], failure], models[:2]
+    job_ids = tuple(cast(str, job["jobId"]) for job in jobs)
+    result_digests = tuple(
+        cast(str, result[field])
+        for result, field in zip(
+            results,
+            ("plannerResultDigest", "executorResultDigest"),
+            strict=True,
+        )
+    )
+    record = RetentionRecord(
+        _event_id(task, revision),
+        task,
+        revision,
+        ExecutionMode.CENTRAL,
+        "cleaned",
+        False,
+        1,
+        1,
+        1,
+        1,
+        job_ids,
+        None,
+        result_digests=result_digests,
+    )
+    prepared = plan_retention((record,), now=1, limit=1)[0]
+    monkeypatch.setitem(
+        _seed_targets.__globals__,
+        "_central_corpus",
+        lambda _task, _revision, *, specification_digest="f" * 64: (
+            jobs,
+            results,
+            models,
+        ),
+    )
+    engine = _engine(tmp_path)
+    _seed_targets(engine, prepared)
+
+    engine.commit(prepared, committed_at=1)
+    engine.agent_consume(prepared.tombstone_id, acknowledged_at=2, now=2)
+    engine.controller_consume_ack(prepared.tombstone_id)
+
+    assert engine.is_completed(prepared)
+    assert all(not (engine.roots.shared_jobs / job_id).exists() for job_id in job_ids)
+    assert all(not (engine.roots.agent_workspaces / job_id).exists() for job_id in job_ids)
+
+
+@_POSIX_ONLY
 @pytest.mark.parametrize(("prefix", "bundle"), [(1, False), (2, True)])
 def test_budget_prefixes_reclaim_exact_scratch_and_preserve_executor_bundle(
     tmp_path: Path, prefix: int, bundle: bool

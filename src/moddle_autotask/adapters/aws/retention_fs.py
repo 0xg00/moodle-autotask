@@ -2370,7 +2370,9 @@ def _validate_central_workspace(
         role = cast(str, job["role"])
         central_protocol.validate_central_model_result(model, role)
         central_protocol.validate_central_model_context(job, model)
-        if result is not None:
+        if result is not None and (
+            result.get("succeeded") is True or model.get("succeeded") is False
+        ):
             central_protocol.validate_central_model_result_binding(job, model, result)
     except central_protocol.CentralProtocolError as error:
         raise RetentionFilesystemError("central scratch provenance is invalid") from error
@@ -2509,7 +2511,9 @@ def _validate_recoverable_trash(
             role = cast(str, job["role"])
             central_protocol.validate_central_model_result(model, role)
             central_protocol.validate_central_model_context(job, model)
-            if result is not None:
+            if result is not None and (
+                result.get("succeeded") is True or model.get("succeeded") is False
+            ):
                 central_protocol.validate_central_model_result_binding(job, model, result)
         except central_protocol.CentralProtocolError as error:
             raise RetentionFilesystemError("central scratch provenance is invalid") from error

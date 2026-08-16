@@ -48,6 +48,7 @@ from moddle_autotask.adapters.aws.central_protocol import (
     validate_central_result_chain,
     validate_central_result_context,
     validate_central_terminal_chain,
+    validate_new_central_plan,
     validate_prepared_inputs,
     validate_terminal_provenance,
 )
@@ -135,6 +136,65 @@ def test_plan_and_manifest_compatibility_accepts_identical_values() -> None:
     assert _central_plan(plan) == plan
     assert validate_artifact_manifest(manifest) == manifest
     assert _validate_artifact_manifest(manifest) == manifest
+
+
+@pytest.mark.parametrize("path", ["outputs/report.md", "OUTPUTS/report.md"])
+def test_new_plan_rejects_output_root_prefixed_artifacts(path: str) -> None:
+    plan = _plan()
+    plan["expectedArtifacts"] = [path]
+
+    with pytest.raises(CentralProtocolError, match="expected artifact path"):
+        validate_new_central_plan(plan)
+
+
+def test_v2_decoder_accepts_persisted_output_root_prefixed_plan() -> None:
+    result = _result("central_planner")
+    plan = cast(dict[str, object], result["plan"])
+    plan["expectedArtifacts"] = ["outputs/report.md"]
+    result["planDigest"] = canonical_digest(plan)
+    result["plannerResultDigest"] = canonical_digest(
+        {key: value for key, value in result.items() if key != "plannerResultDigest"}
+    )
+
+    assert central_plan(plan) == plan
+    validate_central_result(result, "central_planner")
+
+
+def test_new_planner_wrapper_rejects_output_root_prefixed_plan(tmp_path: Path) -> None:
+    job = _central_corpus()[0]
+    model = {
+        "succeeded": True,
+        "summary": "planned",
+        "reportMarkdown": "# Informe\nPlan.",
+        "plan": {
+            "steps": ["Produce the report."],
+            "acceptanceCriteria": [{"id": "report", "text": "A report exists."}],
+            "expectedArtifacts": ["outputs/report.md"],
+        },
+    }
+
+    with pytest.raises(AgentSpoolError, match="expected artifact path"):
+        agent_cli._wrap_central_result(job, model, tmp_path / "workspace", tmp_path / "bundles")
+
+
+def test_planner_schema_documents_output_relative_artifacts() -> None:
+    schema = central_model_schema(_central_corpus()[0])
+    properties = cast(dict[str, object], schema["properties"])
+    plan = cast(dict[str, object], properties["plan"])
+    plan_properties = cast(dict[str, object], plan["properties"])
+    expected = cast(dict[str, object], plan_properties["expectedArtifacts"])
+    items = cast(dict[str, object], expected["items"])
+
+    assert items["description"] == (
+        "Ruta POSIX relativa a outputs/, sin el prefijo outputs/."
+    )
+
+
+def test_planner_prompt_requires_output_relative_artifacts() -> None:
+    prompt = agent_cli._central_prompt(_central_corpus()[0])
+
+    assert "relativas a outputs/" in prompt
+    assert "sin incluir el prefijo outputs/" in prompt
 
 
 @pytest.mark.parametrize("role", ["central_planner", "central_executor", "central_reviewer"])

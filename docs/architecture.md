@@ -57,7 +57,8 @@ unprivileged-user-namespace restriction stays enabled while the agent unit grant
 `AF_NETLINK` family needed to configure the sandbox loopback interface.
 Central work is three fresh, stateless `central_planner`, `central_executor`, and
 `central_reviewer` jobs. The planner has no operational authority; its ordered plan binds the
-executor's exact `outputs/` set and the reviewer receives only wrapper-validated plan, evidence,
+executor's exact `outputs/` set; plan artifact names are POSIX paths relative to that directory and
+must not repeat the `outputs/` prefix. The reviewer receives only wrapper-validated plan, evidence,
 manifest, and dependency digests. The collector accepts 1--64 regular files (2 MiB each,
 1,900,000 raw bytes) with canonical POSIX paths and publishes a deterministic stored ZIP under
 its SHA-256. Central success is impossible without reviewer acceptance, all role/result digests,

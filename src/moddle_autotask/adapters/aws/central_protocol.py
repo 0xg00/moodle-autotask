@@ -63,6 +63,14 @@ def safe_artifact_path(value: str) -> bool:
     )
 
 
+def safe_expected_artifact_path(value: str) -> bool:
+    """Validate a path relative to the output root, never the root name itself."""
+    if not safe_artifact_path(value):
+        return False
+    first_component = unicodedata.normalize("NFC", value.split("/", 1)[0]).casefold()
+    return first_component != "outputs"
+
+
 _safe_artifact_path = safe_artifact_path
 
 
@@ -150,6 +158,15 @@ def central_plan(value: object) -> dict[str, object]:
             raise CentralProtocolError("central expected artifacts collide")
         seen.add(key)
     return value
+
+
+def validate_new_central_plan(value: object) -> dict[str, object]:
+    """Validate a newly generated plan while retaining v2 wire read compatibility."""
+    plan = central_plan(value)
+    artifacts = cast(list[str], plan["expectedArtifacts"])
+    if any(not safe_expected_artifact_path(item) for item in artifacts):
+        raise CentralProtocolError("central expected artifact path is invalid")
+    return plan
 
 
 def validate_central_result(result: dict[str, object], role: str) -> None:
@@ -445,7 +462,13 @@ def central_model_schema(job: dict[str, object]) -> dict[str, object]:
                         "type": "array",
                         "minItems": 1,
                         "maxItems": MAX_CENTRAL_ARTIFACT_FILES,
-                        "items": {"type": "string", "minLength": 1},
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": (
+                                "Ruta POSIX relativa a outputs/, sin el prefijo outputs/."
+                            ),
+                        },
                     },
                 },
             }

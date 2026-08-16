@@ -306,7 +306,8 @@ agent unit admits `AF_NETLINK` solely so bubblewrap can configure its isolated l
 Central jobs are not a conversational terminal session. The spool executes three isolated Codex
 invocations (`central_planner`, `central_executor`, `central_reviewer`) with different job IDs and
 workspaces. Planner text is untrusted operational data and cannot enable commands, network,
-AWS, Moodle, or lab access. The executor must create only the planner's expected `outputs/` paths;
+AWS, Moodle, or lab access. `expectedArtifacts` contains POSIX paths relative to `outputs/`, without
+the `outputs/` prefix. The executor must create only that exact expected set;
 the wrapper validates and publishes a deterministic ZIP (at most 64 regular files, 2 MiB per file,
 1,900,000 raw bytes, and 512 MiB retained-bundle quota). The reviewer binds every plan/executor
 digest and rejects terminally without an automatic replan. Bundle/report delivery is at least once;

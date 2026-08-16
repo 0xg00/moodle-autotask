@@ -29,7 +29,6 @@ from .agent_spool import (
     _MAX_CENTRAL_RESULT_BYTES,
     AgentSpoolError,
     _canonical,
-    _central_plan,
     _read_regular,
     _safe_filename,
     _write_exclusive,
@@ -766,7 +765,10 @@ def _wrap_central_result(
         plan = model.get("plan")
         if not isinstance(plan, dict):
             raise AgentSpoolError("planner did not return a plan")
-        _central_plan(plan)
+        try:
+            central_protocol.validate_new_central_plan(plan)
+        except central_protocol.CentralProtocolError as error:
+            raise AgentSpoolError(str(error)) from None
         result["plan"] = plan
         result["planDigest"] = hashlib.sha256(_canonical(plan)).hexdigest()
         result["plannerResultDigest"] = hashlib.sha256(_canonical(result)).hexdigest()
@@ -828,7 +830,9 @@ def _collect_artifact_bundle(
         raise AgentSpoolError("expected artifacts are invalid")
     wanted: dict[str, str] = {}
     for value in expected:
-        if not isinstance(value, str) or not _safe_output_path(value):
+        if not isinstance(value, str) or not central_protocol.safe_expected_artifact_path(
+            value
+        ):
             raise AgentSpoolError("expected artifact path is invalid")
         key = unicodedata.normalize("NFC", value).casefold()
         if key in wanted:
@@ -1469,7 +1473,8 @@ def _central_prompt(job: dict[str, object]) -> str:
     if role == "central_planner":
         return (
             base + "Devuelve un plan operativo ordenado: pasos no vacíos, criterios únicos "
-            "{id,text} y expectedArtifacts con rutas POSIX exactas bajo outputs/. "
+            "{id,text} y expectedArtifacts con rutas POSIX relativas a outputs/, sin incluir "
+            "el prefijo outputs/. "
             "No ejecutes ni propongas comandos, capacidades o accesos."
         )
     if role == "central_executor":
