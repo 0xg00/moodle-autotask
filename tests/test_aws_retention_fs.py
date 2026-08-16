@@ -2100,7 +2100,7 @@ def test_scratch_provenance_rejects_before_agent_publication(
     elif poison == "hardlink":
         os.link(planner_workspace / "last-message.json", planner_workspace / "duplicate")
     elif poison == "fifo":
-        os.mkfifo(planner_workspace / "fifo")  # type: ignore[attr-defined]
+        os.mkfifo(planner_workspace / "fifo")  # type: ignore[attr-defined, unused-ignore]
     elif poison == "bundle-missing":
         digest = hashlib.sha256(b"bundle").hexdigest()
         (engine.roots.agent_bundles / f"{digest}.zip").unlink()
@@ -2386,7 +2386,7 @@ def test_scratch_trash_tampering_fails_before_ack(tmp_path: Path, poison: str) -
         elif poison == "hardlink":
             os.link(trash / "last-message.json", trash / "duplicate")
         else:
-            os.mkfifo(trash / "fifo")  # type: ignore[attr-defined]
+            os.mkfifo(trash / "fifo")  # type: ignore[attr-defined, unused-ignore]
         # Simulate an exact durable intent after the rename; its absence must never recover trash.
         retention_fs._publish_immutable(
             engine._intents / f"{prepared.tombstone_id}.json",
@@ -2558,7 +2558,7 @@ def test_publication_locks_reject_root_and_lock_tampering(
             os.link(lock, tmp_path / "duplicate.lock")
         else:
             lock.unlink()
-            os.mkfifo(lock)  # type: ignore[attr-defined]
+            os.mkfifo(lock)  # type: ignore[attr-defined, unused-ignore]
     with pytest.raises(RetentionFilesystemError):
         with retention_fs._publication_locks(
             engine.roots.agent_results, engine.roots.agent_bundles, ownership

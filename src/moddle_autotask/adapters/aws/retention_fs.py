@@ -1344,7 +1344,7 @@ def _ensure_dir(path: Path, node: _ProtocolNode) -> None:
 def _set_protocol_identity(path: Path, node: _ProtocolNode, descriptor: int | None = None) -> None:
     if os.name == "nt":
         return
-    current_uid = os.getuid()  # type: ignore[attr-defined]
+    current_uid = os.getuid()  # type: ignore[attr-defined, unused-ignore]
     current = os.fstat(descriptor) if descriptor is not None else path.lstat()
     if (
         current.st_uid == node.uid
@@ -1357,22 +1357,22 @@ def _set_protocol_identity(path: Path, node: _ProtocolNode, descriptor: int | No
             if descriptor is None:
                 os.chmod(path, node.mode)
             else:
-                os.fchmod(descriptor, node.mode)  # type: ignore[attr-defined]
+                os.fchmod(descriptor, node.mode)  # type: ignore[attr-defined, unused-ignore]
         except OSError as error:
             raise RetentionFilesystemError("could not set retention identity") from error
         return
-    allowed_gids = {*os.getgroups(), os.getgid()}  # type: ignore[attr-defined]
-    if os.geteuid() != 0 and (  # type: ignore[attr-defined]
+    allowed_gids = {*os.getgroups(), os.getgid()}  # type: ignore[attr-defined, unused-ignore]
+    if os.geteuid() != 0 and (  # type: ignore[attr-defined, unused-ignore]
         node.uid != current_uid or node.gid not in allowed_gids
     ):
         raise RetentionFilesystemError("not authorized to set retention identity")
     try:
         if descriptor is None:
-            os.chown(path, node.uid, node.gid)  # type: ignore[attr-defined]
+            os.chown(path, node.uid, node.gid)  # type: ignore[attr-defined, unused-ignore]
             os.chmod(path, node.mode)
         else:
-            os.fchown(descriptor, node.uid, node.gid)  # type: ignore[attr-defined]
-            os.fchmod(descriptor, node.mode)  # type: ignore[attr-defined]
+            os.fchown(descriptor, node.uid, node.gid)  # type: ignore[attr-defined, unused-ignore]
+            os.fchmod(descriptor, node.mode)  # type: ignore[attr-defined, unused-ignore]
     except OSError as error:
         raise RetentionFilesystemError("could not set retention identity") from error
 
@@ -1999,7 +1999,7 @@ def _job_locks(
             if os.name != "nt":
                 import fcntl
 
-                fcntl.flock(descriptor, fcntl.LOCK_EX)  # type: ignore[attr-defined]
+                fcntl.flock(descriptor, fcntl.LOCK_EX)  # type: ignore[attr-defined, unused-ignore]
             descriptors.append(descriptor)
         yield
     finally:
@@ -2007,7 +2007,7 @@ def _job_locks(
             if os.name != "nt":
                 import fcntl
 
-                fcntl.flock(descriptor, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                fcntl.flock(descriptor, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
             os.close(descriptor)
 
 
@@ -2116,7 +2116,7 @@ def _publication_locks(
             if os.name != "nt":
                 import fcntl
 
-                fcntl.flock(descriptor, fcntl.LOCK_EX)  # type: ignore[attr-defined]
+                fcntl.flock(descriptor, fcntl.LOCK_EX)  # type: ignore[attr-defined, unused-ignore]
             descriptors.append(descriptor)
         for root, node, descriptor in directories:
             _verify_directory_descriptor(root, node, descriptor)
@@ -2126,7 +2126,7 @@ def _publication_locks(
             if os.name != "nt":
                 import fcntl
 
-                fcntl.flock(descriptor, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                fcntl.flock(descriptor, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
             os.close(descriptor)
         for _root, _node, descriptor in reversed(directories):
             os.close(descriptor)
