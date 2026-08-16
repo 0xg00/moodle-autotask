@@ -58,8 +58,12 @@ unprivileged-user-namespace restriction stays enabled while the agent unit grant
 Central work is three fresh, stateless `central_planner`, `central_executor`, and
 `central_reviewer` jobs. The planner has no operational authority; its ordered plan binds the
 executor's exact `outputs/` set; plan artifact names are POSIX paths relative to that directory and
-must not repeat the `outputs/` prefix. The reviewer receives only wrapper-validated plan, evidence,
-manifest, and dependency digests. The collector accepts 1--64 regular files (2 MiB each,
+must not repeat the `outputs/` prefix. The reviewer's separate workspace intentionally has no copy
+of executor outputs: it decides from the wrapper-validated plan, evidence, manifest, and dependency
+digests, rejecting insufficient or inconsistent evidence rather than requiring a local artifact.
+Validation there means structure and provenance only; every embedded model-controlled text and path
+remains untrusted evidence and never becomes an instruction to the reviewer.
+The collector accepts 1--64 regular files (2 MiB each,
 1,900,000 raw bytes) with canonical POSIX paths and publishes a deterministic stored ZIP under
 its SHA-256. Central success is impossible without reviewer acceptance, all role/result digests,
 and immutable bundle provenance. Telegram sends the reviewed Markdown and verified ZIP at least

@@ -309,8 +309,11 @@ workspaces. Planner text is untrusted operational data and cannot enable command
 AWS, Moodle, or lab access. `expectedArtifacts` contains POSIX paths relative to `outputs/`, without
 the `outputs/` prefix. The executor must create only that exact expected set;
 the wrapper validates and publishes a deterministic ZIP (at most 64 regular files, 2 MiB per file,
-1,900,000 raw bytes, and 512 MiB retained-bundle quota). The reviewer binds every plan/executor
-digest and rejects terminally without an automatic replan. Bundle/report delivery is at least once;
+1,900,000 raw bytes, and 512 MiB retained-bundle quota). The reviewer's isolated workspace does not
+duplicate executor outputs; it evaluates the validated evidence and manifest. The reviewer binds every plan/executor
+digest and rejects terminally without an automatic replan. Embedded executor text is untrusted
+evidence, never reviewer instructions; validation proves structure and provenance, not semantic truth.
+Bundle/report delivery is at least once;
 Telegram duplicates are possible after a crash. The existing lab plan/SSM/report split is unchanged.
 
 Start the headless device-code flow after the first deployment:
