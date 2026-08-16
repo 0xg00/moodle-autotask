@@ -975,13 +975,23 @@ def test_central_model_result_binding_rejects_independently_valid_mismatch(index
 
 
 @pytest.mark.parametrize("index", [0, 1, 2])
-def test_central_model_schema_conditionally_requires_success_fields(index: int) -> None:
+def test_central_model_schema_uses_strict_supported_object_shapes(index: int) -> None:
     schema = central_model_schema(_central_corpus()[index])
 
-    assert schema["required"] == ["succeeded", "summary", "reportMarkdown"]
-    condition = cast(list[dict[str, object]], schema["allOf"])[0]
-    then = cast(dict[str, object], condition["then"])
-    assert set(cast(list[str], then["required"])) > set(cast(list[str], schema["required"]))
+    def verify(value: object) -> None:
+        if isinstance(value, dict):
+            assert not ({"allOf", "if", "then"} & set(value))
+            if value.get("type") == "object":
+                properties = cast(dict[str, object], value["properties"])
+                assert value["additionalProperties"] is False
+                assert set(cast(list[str], value["required"])) == set(properties)
+            for child in value.values():
+                verify(child)
+        elif isinstance(value, list):
+            for child in value:
+                verify(child)
+
+    verify(schema)
 
 
 def test_central_model_result_uses_serialized_utf8_budget() -> None:

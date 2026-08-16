@@ -415,27 +415,87 @@ def central_model_schema(job: dict[str, object]) -> dict[str, object]:
         },
     }
     if role == "central_planner":
-        success: dict[str, dict[str, object]] = {"plan": {"type": "object"}}
+        success: dict[str, dict[str, object]] = {
+            "plan": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["steps", "acceptanceCriteria", "expectedArtifacts"],
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "acceptanceCriteria": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["id", "text"],
+                            "properties": {
+                                "id": {"type": "string", "minLength": 1},
+                                "text": {"type": "string", "minLength": 1},
+                            },
+                        },
+                    },
+                    "expectedArtifacts": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_CENTRAL_ARTIFACT_FILES,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                },
+            }
+        }
     elif role == "central_executor":
-        success = {"evidence": {"type": "object"}}
+        plan = central_plan(job.get("plan"))
+        criterion_ids = [
+            cast(str, item["id"])
+            for item in cast(list[dict[str, object]], plan["acceptanceCriteria"])
+        ]
+        success = {
+            "evidence": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": criterion_ids,
+                "properties": {
+                    criterion_id: {"type": "string", "minLength": 1}
+                    for criterion_id in criterion_ids
+                },
+            }
+        }
     else:
+        plan = central_plan(job.get("plan"))
+        criterion_ids = [
+            cast(str, item["id"])
+            for item in cast(list[dict[str, object]], plan["acceptanceCriteria"])
+        ]
         success = {
             "accepted": {"type": "boolean"},
-            "decisions": {"type": "object"},
-            "findings": {"type": "array", "items": {"type": "string"}},
+            "decisions": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": criterion_ids,
+                "properties": {
+                    criterion_id: {"type": "string", "enum": ["accepted", "rejected"]}
+                    for criterion_id in criterion_ids
+                },
+            },
+            "findings": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {"type": "string", "maxLength": 4096},
+            },
         }
+    properties = common | success
     return {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": False,
-        "required": list(common),
-        "properties": common | success,
-        "allOf": [
-            {
-                "if": {"properties": {"succeeded": {"const": True}}},
-                "then": {"required": [*common, *success]},
-            }
-        ],
+        "required": list(properties),
+        "properties": properties,
     }
 
 
@@ -453,16 +513,17 @@ def validate_central_model_result(value: object, role: str) -> dict[str, object]
         or not isinstance(value.get("reportMarkdown"), str)
     ):
         raise CentralProtocolError("Codex returned invalid central result")
+    common = {"succeeded", "summary", "reportMarkdown"}
+    role_fields = {
+        "central_planner": {"plan"},
+        "central_executor": {"evidence"},
+        "central_reviewer": {"accepted", "decisions", "findings"},
+    }[role]
     if not value["succeeded"]:
-        if set(value) != {"succeeded", "summary", "reportMarkdown"}:
+        if frozenset(value) not in {frozenset(common), frozenset(common | role_fields)}:
             raise CentralProtocolError("Codex returned invalid central failure")
         return cast(dict[str, object], value)
-    if role == "central_planner":
-        required = {"succeeded", "summary", "reportMarkdown", "plan"}
-    elif role == "central_executor":
-        required = {"succeeded", "summary", "reportMarkdown", "evidence"}
-    else:
-        required = {"succeeded", "summary", "reportMarkdown", "accepted", "decisions", "findings"}
+    required = common | role_fields
     if set(value) != required:
         raise CentralProtocolError("Codex returned invalid central result")
     return cast(dict[str, object], value)
