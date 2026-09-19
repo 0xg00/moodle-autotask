@@ -2358,14 +2358,28 @@ def _validate_central_workspace(
     except central_protocol.CentralProtocolError as error:
         raise RetentionFilesystemError("central scratch provenance is invalid") from error
     root_entries = cast(list[str], contract["rootEntries"])
-    _require_exact_entries(workspace, set(root_entries))
+    model_path = workspace / "last-message.json"
+    missing_failed_model = (
+        result is not None
+        and result.get("succeeded") is False
+        and not _exists_no_follow(model_path)
+    )
+    expected_entries = set(root_entries)
+    if missing_failed_model:
+        expected_entries.remove("last-message.json")
+    _require_exact_entries(workspace, expected_entries)
     prepared_inputs = cast(list[dict[str, object]], contract["preparedInputs"])
     expected_inputs = {Path(cast(str, item["path"])).name: item for item in prepared_inputs}
     _validate_exact_input_directory(workspace / "inputs", expected_inputs, uid)
     schema = cast(str, contract["resultSchemaJson"]).encode("utf-8")
     if _read_verified_regular(workspace / "result-schema.json", uid, _MAX_CENTRAL_JSON) != schema:
         raise RetentionFilesystemError("central scratch provenance is invalid")
-    model = _read_workspace_model(workspace / "last-message.json", uid)
+    if missing_failed_model:
+        # Codex can fail before writing a model response. The already validated
+        # terminal failure still binds this exact initialized workspace.
+        _validate_tree(workspace, uid, ownership)
+        return
+    model = _read_workspace_model(model_path, uid)
     try:
         role = cast(str, job["role"])
         central_protocol.validate_central_model_result(model, role)

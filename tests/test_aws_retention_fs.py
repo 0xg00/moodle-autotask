@@ -1488,6 +1488,49 @@ def test_terminal_v3_prefixes_reclaim_exact_targets_and_preserve_neighbors(
 
 
 @_POSIX_ONLY
+@pytest.mark.parametrize("prefix", [1, 2, 3])
+def test_failed_codex_without_model_response_is_reclaimable(tmp_path: Path, prefix: int) -> None:
+    engine = _engine(tmp_path)
+    prepared = _terminal_prepared(prefix, terminal="failed")
+    _seed_targets(engine, prepared, terminal="failed")
+    workspace = engine.roots.agent_workspaces / prepared.job_ids[-1]
+    (workspace / "last-message.json").unlink()
+
+    engine.commit(prepared, committed_at=1)
+    engine.agent_consume(prepared.tombstone_id, acknowledged_at=2, now=2)
+    engine.controller_consume_ack(prepared.tombstone_id)
+    assert engine.is_completed(prepared)
+    assert not workspace.exists()
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("tamper", ["schema", "extra", "symlink", "hardlink", "success"])
+def test_missing_failed_model_preserves_workspace_validation(tmp_path: Path, tamper: str) -> None:
+    engine = _engine(tmp_path)
+    prepared = _terminal_prepared(2, terminal="failed")
+    _seed_targets(engine, prepared, terminal="failed")
+    workspace = engine.roots.agent_workspaces / prepared.job_ids[-1]
+    (workspace / "last-message.json").unlink()
+    if tamper == "schema":
+        (workspace / "result-schema.json").write_bytes(b"{}")
+    elif tamper == "extra":
+        (workspace / "unexpected").write_bytes(b"keep")
+    elif tamper == "symlink":
+        (workspace / "outputs/link").symlink_to(tmp_path / "outside")
+    elif tamper == "hardlink":
+        os.link(workspace / "result-schema.json", workspace / "outputs/link")
+    else:
+        # The successful planner must still have its model response.
+        (engine.roots.agent_workspaces / prepared.job_ids[0] / "last-message.json").unlink()
+
+    engine.commit(prepared, committed_at=1)
+    with pytest.raises(RetentionFilesystemError):
+        engine.agent_consume(prepared.tombstone_id, acknowledged_at=2, now=2)
+    assert workspace.exists()
+    assert not (engine._intents / f"{prepared.tombstone_id}.json").exists()
+
+
+@_POSIX_ONLY
 def test_legacy_prefixed_plan_with_wrapper_failure_remains_reclaimable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
