@@ -24,6 +24,17 @@ def test_https_is_accepted() -> None:
     assert MoodleConnectionConfig("https://example.test", "x").base_url == "https://example.test"
 
 
+def test_explicit_context_environment_applies_with_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "token.json"
+    path.write_text('{"baseUrl":"https://example.test","token":"opaque"}', encoding="utf-8")
+    path.chmod(0o600)
+    context = tmp_path / "context.json"
+    monkeypatch.setenv("MOODLE_AUTOTASK_ASSIGNMENT_CONTEXT_FILE", str(context))
+    assert MoodleConnectionConfig.load(path).assignment_context_file == context
+
+
 def test_config_repr_never_contains_token() -> None:
     sentinel = "SENTINEL_SECRET_DO_NOT_LOG"
     assert sentinel not in repr(MoodleConnectionConfig("https://example.test", sentinel))

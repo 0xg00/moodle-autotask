@@ -89,7 +89,7 @@ class _StatusClient:
                             ],
                         }
                     ],
-                }
+                },
             },
         }
 
@@ -118,6 +118,27 @@ class _Site:
 
     def assignments(self) -> tuple[object, ...]:
         return self._assignments
+
+
+def test_archive_context_never_offers_or_uploads_markdown(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    assignment = SimpleNamespace(
+        assignment_id=manifest.event.assignment_id,
+        task_key=manifest.event.task_key,
+        revision_digest=manifest.event.revision_digest,
+        submission_format="archive",
+    )
+    client = MoodleSubmissionClient(
+        MoodleConnectionConfig("https://moodle.test", "token"),
+        _StatusClient(manifest.report_digest),
+        _Site((assignment,)),
+    )
+    for operation in (
+        lambda: client.can_offer_submission(manifest.event),
+        lambda: client.upload(manifest),
+    ):
+        with pytest.raises(PermanentSubmissionOfferError, match="requires an archive"):
+            operation()
 
 
 @pytest.mark.parametrize(

@@ -83,6 +83,7 @@ class MoodleAssignmentSnapshot:
     file_submission_max_files: int = 1
     file_submission_max_bytes: int = 2 * 1024 * 1024
     file_submission_filetypes: str = ".md"
+    submission_format: str = "markdown"
 
 
 def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentSnapshot, ...]:

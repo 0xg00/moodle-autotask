@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+from .assignment_context import apply_assignment_context
 from .client import MoodleClient, MoodleClientError
 from .config import MoodleConnectionConfig
 from .models import MoodleAssignmentSnapshot, MoodlePayloadError, parse_assignments
@@ -106,7 +107,9 @@ class MoodleService:
         site_url = self.verified_site_url()
         try:
             response = self.client.call("mod_assign_get_assignments")
-            return parse_assignments(response, site_url)
+            return apply_assignment_context(
+                parse_assignments(response, site_url), site_url, self.config.assignment_context_file
+            )
         except (MoodleClientError, MoodlePayloadError) as error:
             raise MoodleServiceError("could not enumerate Moodle assignments") from error
 
