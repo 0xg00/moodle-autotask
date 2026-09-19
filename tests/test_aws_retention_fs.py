@@ -1057,6 +1057,29 @@ def test_bounded_metadata_scan_rejects_conflicting_stage_and_final_for_one_id(
 
 
 @_POSIX_ONLY
+def test_runtime_preserves_commit_across_later_cycles_and_restart(tmp_path: Path) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    engine = _engine(tmp_path)
+    specification = _complete_terminal_state(tmp_path, state, "a", now=1)
+    plan = plan_retention(state.retention_records(100, 1, 1, 1), now=100, limit=1)[0]
+    _seed_targets(engine, plan, terminal="rejected", specification_digest=specification)
+    coordinator = ControllerRetentionCoordinator(state, engine, scratch_ttl=1, evidence_ttl=1)
+
+    assert coordinator.cycle(now=100) == "committed"
+    committed_path = engine._committed / f"{plan.tombstone_id}.json"
+    original = committed_path.read_bytes()
+    assert coordinator.cycle(now=115) == "awaiting-ack"
+    restarted = ControllerRetentionCoordinator(
+        ApprovalState(state.path), RetentionFilesystem(engine.roots), scratch_ttl=1, evidence_ttl=1
+    )
+    assert restarted.cycle(now=130) == "awaiting-ack"
+    assert committed_path.read_bytes() == original
+    engine.agent_consume(plan.tombstone_id, acknowledged_at=140, now=140)
+    assert restarted.cycle(now=145) == "ack-consumed"
+    assert engine.is_completed(plan)
+
+
+@_POSIX_ONLY
 def test_runtime_reconciles_completed_prefix_in_one_batch_then_commits_later_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

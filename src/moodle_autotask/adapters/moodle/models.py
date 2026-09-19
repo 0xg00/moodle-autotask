@@ -88,8 +88,25 @@ class MoodleAssignmentSnapshot:
 def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentSnapshot, ...]:
     if not isinstance(payload, dict) or not isinstance(payload.get("courses"), list):
         raise MoodlePayloadError("assignments response is malformed")
-    if not isinstance(payload.get("warnings", []), list) or payload.get("warnings"):
+    warnings = payload.get("warnings", [])
+    if not isinstance(warnings, list):
         raise MoodlePayloadError("assignments response contains warnings")
+    inaccessible_modules: set[int] = set()
+    for warning in warnings:
+        # Moodle omits inaccessible activities and reports this exact warning for
+        # each one. It must not prevent discovery of the remaining visible tasks.
+        if (
+            not isinstance(warning, dict)
+            or set(warning) != {"item", "itemid", "warningcode", "message"}
+            or warning["item"] != "module"
+            or warning["warningcode"] != "1"
+            or warning["message"] != "No access rights in module context"
+            or type(warning["itemid"]) is not int
+            or warning["itemid"] <= 0
+            or warning["itemid"] in inaccessible_modules
+        ):
+            raise MoodlePayloadError("assignments response contains warnings")
+        inaccessible_modules.add(warning["itemid"])
     snapshots: list[MoodleAssignmentSnapshot] = []
     assignment_ids: set[int] = set()
     attachment_keys: set[str] = set()
@@ -107,6 +124,8 @@ def parse_assignments(payload: object, site_url: str) -> tuple[MoodleAssignmentS
                 raise MoodlePayloadError("assignment must be an object")
             assignment_id = _int(assignment.get("id"), "assignment id")
             cmid = _int(assignment.get("cmid"), "course module id")
+            if cmid in inaccessible_modules:
+                raise MoodlePayloadError("assignment references an inaccessible module")
             if assignment_id <= 0 or cmid <= 0 or assignment_id in assignment_ids:
                 raise MoodlePayloadError("duplicate or invalid assignment identity")
             assignment_ids.add(assignment_id)

@@ -245,7 +245,14 @@ def test_scan_acknowledgement_lifecycle_reports_updated(tmp_path: Path) -> None:
                     ],
                 }
             return {
-                "warnings": [],
+                "warnings": [
+                    {
+                        "item": "module",
+                        "itemid": 99,
+                        "warningcode": "1",
+                        "message": "No access rights in module context",
+                    }
+                ],
                 "courses": [
                     {
                         "id": 1,

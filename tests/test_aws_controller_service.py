@@ -112,6 +112,8 @@ def test_installer_writes_exact_hardened_services_and_refresh_script(tmp_path: P
     assert "mkfs.ext4 -F -E nodiscard -N 100000 -m 6" in workspace_setup_text
     assert 'tune2fs -r $(((formatted_blocks * 6 + 99) / 100))' in workspace_setup_text
     assert "loop,nodev,nosuid" in workspace_setup_text
+    assert "loop,nodev,nosuid,X-fstrim.notrim 0 2" in workspace_setup_text
+    assert "ensure_fstab existing" in workspace_setup_text
     assert 'staging=/run/moodle-autotask-workspace-migration' in workspace_setup_text
     assert 'values="$(findmnt -rn -o "$column" --target "$target"' in workspace_setup_text
     assert "| sort -u)" in workspace_setup_text

@@ -113,6 +113,10 @@ class ControllerRetentionCoordinator:
         if acknowledgements:
             self.engine.controller_consume_ack(acknowledgements[0])
             return "ack-consumed"
+        # Keep the immutable commit timestamp while the agent is still consuming
+        # it; publishing the same plan with this cycle's time would conflict.
+        if self.engine.actionable_committed(limit=1, scan_limit=self.scan_limit):
+            return "awaiting-ack"
         records = self.state.retention_records(
             moment, self.scratch_ttl, self.evidence_ttl, self.candidate_limit
         )

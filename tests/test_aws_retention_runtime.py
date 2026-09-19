@@ -137,6 +137,22 @@ def test_controller_commits_one_plan_at_cycle_time(monkeypatch: pytest.MonkeyPat
     assert engine.calls[-1] == ("commit", prepared, 23)
 
 
+def test_controller_waits_for_agent_without_republishing_commit() -> None:
+    engine = _Engine(committed=("a" * 64,))
+    state = _State()
+    coordinator = ControllerRetentionCoordinator(
+        cast(ApprovalState, state), cast(RetentionFilesystem, engine)
+    )
+
+    assert coordinator.cycle(now=23) == "awaiting-ack"
+    assert coordinator.cycle(now=42) == "awaiting-ack"
+    assert state.calls == []
+    assert not any(call[0] == "commit" for call in engine.calls)
+
+    engine.acks = engine.committed
+    assert coordinator.cycle(now=43) == "ack-consumed"
+
+
 def test_controller_treats_new_chain_capacity_closure_as_transient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

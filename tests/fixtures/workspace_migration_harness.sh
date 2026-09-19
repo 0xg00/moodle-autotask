@@ -109,6 +109,29 @@ run_case during-cleanup \
 
 run_concurrent_case
 
+# An already-active installation must upgrade its old fstab entry in place.
+sed -i 's/,X-fstrim.notrim//g' /etc/fstab
+bash /harness/setup.sh
+grep -Fxq '/data/root/agent-workspaces.img /data/agent/workspaces ext4 loop,nodev,nosuid,X-fstrim.notrim 0 2' /etc/fstab
+before="$(stat -c %b /data/root/agent-workspaces.img)"
+fstrim --listed-in /etc/fstab --verbose --quiet-unsupported
+test "$(stat -c %b /data/root/agent-workspaces.img)" = "$before"
+grep -Fxq legacy-data /data/agent/workspaces/legacy-job/result-schema.json
+
+# Do not silently repair missing, duplicated or unexpected active entries.
+cp /etc/fstab /tmp/fstab.valid
+for variant in missing duplicate unsafe; do
+  cp /tmp/fstab.valid /etc/fstab
+  case "$variant" in
+    missing) sed -i '\|/data/agent/workspaces|d' /etc/fstab ;;
+    duplicate) cat /tmp/fstab.valid >>/etc/fstab ;;
+    unsafe) sed -i 's/loop,nodev,nosuid,X-fstrim.notrim/loop/' /etc/fstab ;;
+  esac
+  if bash /harness/setup.sh; then exit 1; fi
+done
+cp /tmp/fstab.valid /etc/fstab
+bash /harness/setup.sh
+
 export FAKE_FINDMNT_DIVERGENT_OPTIONS=1
 set +e
 bash /harness/setup.sh
