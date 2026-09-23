@@ -1481,7 +1481,15 @@ def _central_prompt(job: dict[str, object]) -> str:
         return (
             base + f"Plan validado e inmutable:\n{json.dumps(job['plan'], ensure_ascii=False)}\n\n"
             "Crea exactamente los archivos previstos bajo outputs/ y devuelve "
-            "evidencia estructurada para cada criterio."
+            "evidencia estructurada para cada criterio. El revisor no tendrá acceso a "
+            "tus archivos: una afirmación de cumplimiento o un hash no demuestra su contenido. "
+            "Incluye en los valores de evidence los datos observados que permiten comprobar "
+            "cada criterio: contenido textual pertinente leído de los archivos finales, "
+            "resultados concretos de validación y recuentos. Para documentos pequeños incluye "
+            "su contenido completo. Para archivos ZIP incluye el inventario real de entradas "
+            "con tamaño y SHA-256 de sus bytes descomprimidos, y el resultado de comparar esos "
+            "bytes con los archivos finales. Puedes usar JSON serializado dentro de cada "
+            "valor string de evidence. No inventes resultados ni añadas archivos fuera del plan."
         )
     return (
         base + f"Plan inmutable:\n{json.dumps(job['plan'], ensure_ascii=False)}\n\n"

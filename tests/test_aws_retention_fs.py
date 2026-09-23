@@ -1057,6 +1057,29 @@ def test_bounded_metadata_scan_rejects_conflicting_stage_and_final_for_one_id(
 
 
 @_POSIX_ONLY
+def test_runtime_preserves_commit_across_later_cycles_and_restart(tmp_path: Path) -> None:
+    state = ApprovalState(tmp_path / "approval.sqlite3")
+    engine = _engine(tmp_path)
+    specification = _complete_terminal_state(tmp_path, state, "a", now=1)
+    plan = plan_retention(state.retention_records(100, 1, 1, 1), now=100, limit=1)[0]
+    _seed_targets(engine, plan, terminal="rejected", specification_digest=specification)
+    coordinator = ControllerRetentionCoordinator(state, engine, scratch_ttl=1, evidence_ttl=1)
+
+    assert coordinator.cycle(now=100) == "committed"
+    committed_path = engine._committed / f"{plan.tombstone_id}.json"
+    original = committed_path.read_bytes()
+    assert coordinator.cycle(now=115) == "awaiting-ack"
+    restarted = ControllerRetentionCoordinator(
+        ApprovalState(state.path), RetentionFilesystem(engine.roots), scratch_ttl=1, evidence_ttl=1
+    )
+    assert restarted.cycle(now=130) == "awaiting-ack"
+    assert committed_path.read_bytes() == original
+    engine.agent_consume(plan.tombstone_id, acknowledged_at=140, now=140)
+    assert restarted.cycle(now=145) == "ack-consumed"
+    assert engine.is_completed(plan)
+
+
+@_POSIX_ONLY
 def test_runtime_reconciles_completed_prefix_in_one_batch_then_commits_later_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1462,6 +1485,49 @@ def test_terminal_v3_prefixes_reclaim_exact_targets_and_preserve_neighbors(
         bundle_digest = hashlib.sha256(b"bundle").hexdigest()
         assert (engine.roots.agent_bundles / f"{bundle_digest}.zip").exists()
     assert engine.is_completed(prepared)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("prefix", [1, 2, 3])
+def test_failed_codex_without_model_response_is_reclaimable(tmp_path: Path, prefix: int) -> None:
+    engine = _engine(tmp_path)
+    prepared = _terminal_prepared(prefix, terminal="failed")
+    _seed_targets(engine, prepared, terminal="failed")
+    workspace = engine.roots.agent_workspaces / prepared.job_ids[-1]
+    (workspace / "last-message.json").unlink()
+
+    engine.commit(prepared, committed_at=1)
+    engine.agent_consume(prepared.tombstone_id, acknowledged_at=2, now=2)
+    engine.controller_consume_ack(prepared.tombstone_id)
+    assert engine.is_completed(prepared)
+    assert not workspace.exists()
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("tamper", ["schema", "extra", "symlink", "hardlink", "success"])
+def test_missing_failed_model_preserves_workspace_validation(tmp_path: Path, tamper: str) -> None:
+    engine = _engine(tmp_path)
+    prepared = _terminal_prepared(2, terminal="failed")
+    _seed_targets(engine, prepared, terminal="failed")
+    workspace = engine.roots.agent_workspaces / prepared.job_ids[-1]
+    (workspace / "last-message.json").unlink()
+    if tamper == "schema":
+        (workspace / "result-schema.json").write_bytes(b"{}")
+    elif tamper == "extra":
+        (workspace / "unexpected").write_bytes(b"keep")
+    elif tamper == "symlink":
+        (workspace / "outputs/link").symlink_to(tmp_path / "outside")
+    elif tamper == "hardlink":
+        os.link(workspace / "result-schema.json", workspace / "outputs/link")
+    else:
+        # The successful planner must still have its model response.
+        (engine.roots.agent_workspaces / prepared.job_ids[0] / "last-message.json").unlink()
+
+    engine.commit(prepared, committed_at=1)
+    with pytest.raises(RetentionFilesystemError):
+        engine.agent_consume(prepared.tombstone_id, acknowledged_at=2, now=2)
+    assert workspace.exists()
+    assert not (engine._intents / f"{prepared.tombstone_id}.json").exists()
 
 
 @_POSIX_ONLY

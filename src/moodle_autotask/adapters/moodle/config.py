@@ -95,6 +95,7 @@ class MoodleConnectionConfig:
     timeout_seconds: float = 15.0
     max_response_bytes: int = 2 * 1024 * 1024
     max_download_bytes: int = 16 * 1024 * 1024 * 1024
+    assignment_context_file: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _canonical_url(self.base_url))
@@ -120,6 +121,8 @@ class MoodleConnectionConfig:
 
     @classmethod
     def load(cls, token_file: Path | None = None) -> MoodleConnectionConfig:
+        context_path = os.environ.get("MOODLE_AUTOTASK_ASSIGNMENT_CONTEXT_FILE")
+        context_file = Path(context_path) if context_path else None
         if token_file is not None:
             try:
                 assert_no_indirection(token_file)
@@ -147,14 +150,14 @@ class MoodleConnectionConfig:
                 raise MoodleConfigurationError(
                     "token file must contain only baseUrl and token strings"
                 )
-            return cls(raw["baseUrl"], raw["token"])
+            return cls(raw["baseUrl"], raw["token"], assignment_context_file=context_file)
         base_url = os.environ.get("MOODLE_AUTOTASK_BASE_URL")
         token = os.environ.get("MOODLE_AUTOTASK_TOKEN")
         if base_url is None or token is None:
             raise MoodleConfigurationError(
                 "set Moodle token-file or MOODLE_AUTOTASK_BASE_URL and MOODLE_AUTOTASK_TOKEN"
             )
-        return cls(base_url, token)
+        return cls(base_url, token, assignment_context_file=context_file)
 
     @classmethod
     def from_token_file(cls, path: Path) -> MoodleConnectionConfig:

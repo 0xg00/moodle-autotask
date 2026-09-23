@@ -24,6 +24,10 @@ the official mobile REST API only: it verifies `core_webservice_get_site_info`, 
 only after Moodle returns exactly the canonical configured URL and advertises the required mobile
 functions. Task, attachment, and revision identifiers are versioned SHA-256 values; revision input
 uses canonical JSON metadata, never tokens or stateful URLs.
+Moodle's exact module-access warning (`item=module`, `warningcode=1`, and
+`No access rights in module context`) is accepted only for omitted activities with positive,
+unique module IDs. A returned assignment cannot reference any of those IDs. Other warnings and
+malformed warnings still reject the entire response; inaccessible activities never become tasks.
 
 SQLite acknowledgement state is intentionally at-least-once. A scan reports NEW until a task has
 ever been acknowledged, UPDATED for a later revision, and omits the exact acknowledged revision.
@@ -47,7 +51,9 @@ only the approved assignment snapshot and verified non-appliance attachments to 
 directory is synced and renamed; startup revalidates prior inputs and replaces an incomplete stale
 directory before Codex can run. The agent workspace is an independently mounted, root-owned 16 GiB
 ext4 image under the dedicated `root:root` mode `0700` `/var/lib/moodle-autotask-root` parent,
-with `nodev,nosuid`; the agent cannot start unless that exact filesystem is mounted. Each runner
+with `nodev,nosuid`; the agent cannot start unless that exact filesystem is mounted.
+Its fstab entry includes `X-fstrim.notrim` to preserve the backing file's reserved blocks during
+scheduled trim. The installer upgrades only the exact entry from earlier releases. Each runner
 holds its job-retention lock before the shared workspace admission lock, through materialization,
 Codex execution, validation, and result publication, preventing concurrent capacity admission.
 A root-owned Codex policy denies sandboxed commands access to the authentication
@@ -75,7 +81,8 @@ targets, deletes only its owner's trees, and leaves terminal receipts/barriers d
 engine itself can suppress identical completed replays. The continuously running worker and agent
 each perform at most one bounded retention action before their ordinary work in every cycle: scratch
 data has a 24-hour TTL, evidence has a seven-day TTL, and each candidate/scan pass is capped at
-1,024 entries. Terminal metadata is intentionally immutable and is not automatically swept.
+1,024 entries. The worker waits for an outstanding agent acknowledgement without republishing
+the immutable commit with a new timestamp. Terminal metadata is not automatically swept.
 Periodic wiring and installer directories remain outside this engine boundary. Lab work first returns bounded PowerShell
 commands; the worker validates the opaque handle and ownership tags, executes the plan with the
 official Systems Manager document, and sends the transcript back for an evidence-based final report.

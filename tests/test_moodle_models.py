@@ -141,6 +141,67 @@ def test_warnings_rejected() -> None:
         parse_assignments(payload, "https://example.test")
 
 
+def _inaccessible_module_warning(module_id: int = 99) -> dict[str, object]:
+    return {
+        "item": "module",
+        "itemid": module_id,
+        "warningcode": "1",
+        "message": "No access rights in module context",
+    }
+
+
+def test_inaccessible_modules_do_not_hide_visible_assignments_or_change_revisions() -> None:
+    payload = _valid()
+    expected = parse_assignments(payload, "https://example.test")
+    payload["warnings"] = [_inaccessible_module_warning(99), _inaccessible_module_warning(100)]
+
+    assert parse_assignments(payload, "https://example.test") == expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("item", "course"),
+        ("warningcode", "2"),
+        ("warningcode", 1),
+        ("message", "Unexpected failure"),
+        ("itemid", True),
+        ("itemid", "99"),
+        ("itemid", 0),
+        ("itemid", -1),
+        ("unknown", "value"),
+    ],
+)
+def test_only_exact_inaccessible_module_warnings_are_accepted(field: str, value: object) -> None:
+    payload = _valid()
+    warning = _inaccessible_module_warning()
+    warning[field] = value
+    payload["warnings"] = [warning]
+
+    with pytest.raises(MoodlePayloadError, match="warnings"):
+        parse_assignments(payload, "https://example.test")
+
+
+def test_inaccessible_module_warning_cannot_authorize_returned_assignment() -> None:
+    payload = _valid()
+    payload["warnings"] = [_inaccessible_module_warning(3)]
+
+    with pytest.raises(MoodlePayloadError, match="inaccessible module"):
+        parse_assignments(payload, "https://example.test")
+
+
+def test_duplicate_or_incomplete_inaccessible_module_warnings_are_rejected() -> None:
+    payload = _valid()
+    warning = _inaccessible_module_warning()
+    payload["warnings"] = [warning, warning.copy()]
+    with pytest.raises(MoodlePayloadError, match="warnings"):
+        parse_assignments(payload, "https://example.test")
+    warning.pop("itemid")
+    payload["warnings"] = [warning]
+    with pytest.raises(MoodlePayloadError, match="warnings"):
+        parse_assignments(payload, "https://example.test")
+
+
 def test_assignment_without_file_submission_configs_is_safely_unsupported() -> None:
     payload = _valid()
     assignment = payload["courses"][0]["assignments"][0]  # type: ignore[index]

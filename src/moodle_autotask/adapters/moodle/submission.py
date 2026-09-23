@@ -233,6 +233,10 @@ class MoodleSubmissionClient:
         if len(matches) != 1:
             raise PermanentSubmissionOfferError("approved Moodle assignment no longer exists")
         current = matches[0]
+        if getattr(current, "submission_format", "markdown") != "markdown":
+            raise PermanentSubmissionOfferError(
+                "assignment requires an archive; Markdown submission is disabled"
+            )
         if (
             getattr(current, "task_key", None) != getattr(event, "task_key", None)
             or getattr(current, "revision_digest", None) != getattr(event, "revision_digest", None)

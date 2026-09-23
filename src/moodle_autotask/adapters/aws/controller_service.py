@@ -1122,7 +1122,7 @@ safe_image() {
 }
 validate_fstab() {
   safe_fstab
-  expected="$image $workspace ext4 loop,nodev,nosuid 0 2"
+  expected="$image $workspace ext4 loop,nodev,nosuid,X-fstrim.notrim 0 2"
   entries="$(awk -v target="$workspace" '$1 !~ /^#/ && $2 == target {print}' "$fstab")"
   [ "$entries" = "$expected" ]
 }
@@ -1289,18 +1289,30 @@ cleanup_backup() {
 }
 ensure_fstab() {
   safe_fstab
-  if awk -v target="$workspace" '$1 !~ /^#/ && $2 == target {found=1} END {exit !found}' \
-    "$fstab"; then
-    validate_fstab
-  else
-    temporary="$(mktemp /etc/.fstab.moodle-autotask.XXXXXX)"
-    trap 'rm -f "$temporary"' EXIT
-    cat "$fstab" >"$temporary"
-    printf '%s %s ext4 loop,nodev,nosuid 0 2\n' "$image" "$workspace" >>"$temporary"
-    chown root:root "$temporary"; chmod 0644 "$temporary"; mv -f "$temporary" "$fstab"
-    trap - EXIT
-    validate_fstab
+  expected="$image $workspace ext4 loop,nodev,nosuid,X-fstrim.notrim 0 2"
+  entries="$(awk -v target="$workspace" '$1 !~ /^#/ && $2 == target {print}' "$fstab")"
+  if [ "$entries" = "$expected" ]; then
+    return 0
   fi
+  if [ -n "$entries" ]; then
+    # Upgrade only the exact entry installed by earlier releases.
+    [ "$entries" = "$image $workspace ext4 loop,nodev,nosuid 0 2" ]
+  else
+    [ "${1:-}" != existing ]
+  fi
+  temporary="$(mktemp /etc/.fstab.moodle-autotask.XXXXXX)"
+  trap 'rm -f "$temporary"' EXIT
+  awk -v target="$workspace" -v replacement="$expected" \
+    '$1 !~ /^#/ && $2 == target {print replacement; next} {print}' "$fstab" >"$temporary"
+  if [ -z "$entries" ]; then
+    printf '%s\n' "$expected" >>"$temporary"
+  fi
+  chown root:root "$temporary"; chmod 0644 "$temporary"
+  sync -f "$temporary"
+  mv -f "$temporary" "$fstab"
+  sync -f /etc
+  trap - EXIT
+  validate_fstab
 }
 
 if [ -e "$image_root" ] || [ -L "$image_root" ]; then
@@ -1370,6 +1382,7 @@ if [ "$workspace_mounted" = true ]; then
     write_state active "$migration_digest"
   else
     [ "$migration_phase" = active ]
+    ensure_fstab existing
     validate_mount
   fi
   cleanup_backup
